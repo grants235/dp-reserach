@@ -31,6 +31,43 @@ def _compute_features(model: nn.Module, loader: DataLoader, device: torch.device
     return np.concatenate(feats, axis=0)
 
 
+def _acquire_grad_sample_module(model: nn.Module):
+    """
+    Safely return a (GradSampleModule, owned) pair.
+
+    owned=True  → we created the module; caller must call module.remove_hooks()
+                  after use to restore the underlying model to a clean state.
+    owned=False → model was already a GradSampleModule; do NOT remove hooks,
+                  as that would break the caller's training loop.
+
+    Handles three cases:
+      A. model is already a GradSampleModule (e.g. from PrivacyEngine.make_private)
+      B. model._module chain contains a GradSampleModule
+      C. plain model – strip any stale hooks (autograd_grad_sample_hooks) and wrap
+    """
+    from opacus.grad_sample import GradSampleModule
+
+    # Case A
+    if isinstance(model, GradSampleModule):
+        return model, False
+
+    # Case B – traverse _module chain
+    probe = model
+    while hasattr(probe, "_module"):
+        probe = probe._module
+        if isinstance(probe, GradSampleModule):
+            return probe, False
+
+    # Case C – probe is now the deepest raw model
+    # Remove stale hooks if a previous GradSampleModule was discarded without cleanup
+    if hasattr(probe, "autograd_grad_sample_hooks"):
+        for handle in probe.autograd_grad_sample_hooks:
+            handle.remove()
+        del probe.autograd_grad_sample_hooks
+
+    return GradSampleModule(probe), True
+
+
 def compute_per_sample_gradient_norms(
     model: nn.Module,
     loader: DataLoader,
@@ -40,58 +77,68 @@ def compute_per_sample_gradient_norms(
     """
     Compute the L2 gradient norm ||∇ℓ(θ, z_i)|| for each sample z_i.
 
-    Uses per-sample gradient computation via Opacus GradSampleModule.
-    The model is evaluated in eval mode (no dropout).
+    Accepts:
+    - A plain nn.Module (will be wrapped temporarily).
+    - A GradSampleModule already wrapped by PrivacyEngine (reused as-is).
+
+    The model is placed in eval mode during computation and restored afterward.
 
     Returns:
         norms: array of shape (n,) – unclipped per-sample gradient norms
     """
-    from opacus.grad_sample import GradSampleModule
+    model_gs, owned = _acquire_grad_sample_module(model)
+    model_gs = model_gs.to(device)
 
-    model_gs = GradSampleModule(model)
-    model_gs.eval().to(device)
+    was_training = model_gs.training
+    model_gs.eval()
 
     all_norms = []
     n_batches = 0
 
-    for batch in loader:
-        if max_batches and n_batches >= max_batches:
-            break
+    try:
+        for batch in loader:
+            if max_batches and n_batches >= max_batches:
+                break
 
-        # Support both (x, y) and (x, y, idx) batches
-        x, y = batch[0].to(device), batch[1].to(device)
+            x, y = batch[0].to(device), batch[1].to(device)
 
-        # Zero accumulated grad_sample
-        for p in model_gs.parameters():
-            p.grad = None
-            if hasattr(p, "grad_sample"):
-                del p.grad_sample
+            # Clear any accumulated grad_sample from a previous step
+            for p in model_gs.parameters():
+                p.grad = None
+                if hasattr(p, "grad_sample"):
+                    del p.grad_sample
 
-        # Forward + backward (sum reduction so grad_sample[i] = ∇ℓ_i)
-        outputs = model_gs(x)
-        loss = F.cross_entropy(outputs, y, reduction="sum")
-        loss.backward()
+            # sum reduction → grad_sample[i] = ∇ℓ_i (per-sample, not averaged)
+            outputs = model_gs(x)
+            loss = F.cross_entropy(outputs, y, reduction="sum")
+            loss.backward()
 
-        # Collect per-sample gradients: each p.grad_sample has shape (B, *p.shape)
-        batch_size = x.shape[0]
-        grad_flat = []
-        for p in model_gs.parameters():
-            if p.requires_grad and hasattr(p, "grad_sample"):
-                grad_flat.append(p.grad_sample.reshape(batch_size, -1))
+            batch_size = x.shape[0]
+            grad_flat = []
+            for p in model_gs.parameters():
+                if p.requires_grad and hasattr(p, "grad_sample"):
+                    grad_flat.append(p.grad_sample.reshape(batch_size, -1))
 
-        # (B, D) – concatenated per-sample gradient vector
-        per_sample = torch.cat(grad_flat, dim=1)
-        norms = per_sample.norm(dim=1).detach().cpu().numpy()
-        all_norms.append(norms)
+            per_sample = torch.cat(grad_flat, dim=1)  # (B, D)
+            norms = per_sample.norm(dim=1).detach().cpu().numpy()
+            all_norms.append(norms)
 
-        # Free memory
-        for p in model_gs.parameters():
-            if hasattr(p, "grad_sample"):
-                del p.grad_sample
+            # Free per-sample gradient memory immediately
+            for p in model_gs.parameters():
+                p.grad = None
+                if hasattr(p, "grad_sample"):
+                    del p.grad_sample
 
-        n_batches += 1
+            n_batches += 1
 
-    # Unwrap GradSampleModule to avoid side-effects on caller's model
+    finally:
+        # Restore training mode
+        if was_training:
+            model_gs.train()
+        # Remove hooks only if we own the module
+        if owned:
+            model_gs.remove_hooks()
+
     return np.concatenate(all_norms)
 
 

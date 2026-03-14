@@ -166,12 +166,10 @@ def run_exp1(
 
         if epoch in CHECKPOINT_EPOCHS:
             print(f"[Exp1] {tag}: epoch {epoch}, computing gradient norms...")
-            # Get the underlying model (unwrap Opacus wrapper)
-            base_model = trainer.model._module if hasattr(trainer.model, "_module") else trainer.model
-
-            # Compute per-sample gradient norms
+            # Pass trainer.model directly – it is already a GradSampleModule
+            # (from make_private). _acquire_grad_sample_module will reuse it.
             unclipped_norms = compute_per_sample_gradient_norms(
-                base_model, private_loader, device
+                trainer.model, private_loader, device
             )
             clipped_norms = compute_per_sample_clipped_norms(unclipped_norms, C)
 
@@ -192,7 +190,7 @@ def run_exp1(
         "labels": labels,
         "predictions": preds,
         "confidences": confs,
-        "correctly_classified": (preds == labels),
+        "correctly_classified": (preds == labels).astype(bool),
     }
 
     # Final test accuracy
