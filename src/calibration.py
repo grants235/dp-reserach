@@ -31,16 +31,21 @@ def _compute_features(model: nn.Module, loader: DataLoader, device: torch.device
     return np.concatenate(feats, axis=0)
 
 
-def _get_raw_model(model: nn.Module) -> nn.Module:
+def _get_raw_model(model: nn.Module):
     """
-    Strip any GradSampleModule wrappers to get the underlying raw model.
-    Does NOT modify the model or touch its hooks.
+    Strip GradSampleModule wrappers.
+    Returns (raw_nn_module, gsm_or_None) without modifying any hooks.
     """
     from opacus.grad_sample import GradSampleModule
-    raw = model
-    while isinstance(raw, GradSampleModule):
-        raw = raw._module
-    return raw
+    if isinstance(model, GradSampleModule):
+        return model._module, model
+    probe = model
+    while hasattr(probe, "_module"):
+        inner = probe._module
+        if isinstance(inner, GradSampleModule):
+            return inner._module, inner
+        probe = inner
+    return model, None
 
 
 def compute_per_sample_gradient_norms(
@@ -52,46 +57,57 @@ def compute_per_sample_gradient_norms(
     """
     Compute the L2 gradient norm ||∇ℓ(θ, z_i)|| for each sample z_i.
 
-    Uses torch.func (vmap + grad + functional_call) — zero hook registration,
-    zero interaction with the training-loop GradSampleModule.  Works regardless
-    of whether `model` is a plain nn.Module or an Opacus-wrapped module.
+    Uses torch.func (vmap + grad + functional_call) for hook-free per-sample
+    gradient computation.  Calls gsm.disable_hooks() / gsm.enable_hooks()
+    around the computation so that Opacus's capture_activations_hook returns
+    early and never touches the functional_call replacement tensors (which lack
+    the _forward_counter attribute Opacus expects on real parameters).
 
-    Returns:
-        norms: array of shape (n,) – unclipped per-sample gradient norms
+    Works for both plain nn.Module and Opacus-wrapped GradSampleModule.
     """
     from torch.func import vmap, grad, functional_call
 
-    raw = _get_raw_model(model).to(device)
+    raw, gsm = _get_raw_model(model)
+    raw = raw.to(device)
 
     # Detached snapshots — not tied to the training graph
     params  = {n: p.detach() for n, p in raw.named_parameters()}
     buffers = {n: b.detach() for n, b in raw.named_buffers()}
 
     def loss_single(params, x_i, y_i):
-        # x_i: (C, H, W); y_i: scalar → (1,) for cross_entropy
+        # x_i: (C, H, W); y_i: scalar → unsqueeze to (1,) for cross_entropy
         out = functional_call(raw, {**params, **buffers}, (x_i.unsqueeze(0),))
         return F.cross_entropy(out, y_i.unsqueeze(0))
 
-    # vmap batches over the sample dimension; grad differentiates w.r.t. params
     per_sample_grad_fn = vmap(grad(loss_single), in_dims=(None, 0, 0))
 
     all_norms = []
     n_batches = 0
 
-    for batch in loader:
-        if max_batches and n_batches >= max_batches:
-            break
+    # Suspend Opacus hooks so capture_activations_hook / capture_backprops_hook
+    # return immediately without accessing _forward_counter on our detached tensors.
+    if gsm is not None:
+        gsm.disable_hooks()
 
-        x, y = batch[0].to(device), batch[1].to(device)
-        B = x.shape[0]
+    try:
+        for batch in loader:
+            if max_batches and n_batches >= max_batches:
+                break
 
-        # per_sample_grads: dict {param_name: (B, *param_shape)}
-        per_sample_grads = per_sample_grad_fn(params, x, y)
+            x, y = batch[0].to(device), batch[1].to(device)
+            B = x.shape[0]
 
-        flat  = torch.cat([g.reshape(B, -1) for g in per_sample_grads.values()], dim=1)
-        norms = flat.norm(dim=1).detach().cpu().numpy()
-        all_norms.append(norms)
-        n_batches += 1
+            # per_sample_grads: dict {param_name: (B, *param_shape)}
+            per_sample_grads = per_sample_grad_fn(params, x, y)
+
+            flat  = torch.cat([g.reshape(B, -1) for g in per_sample_grads.values()], dim=1)
+            norms = flat.norm(dim=1).detach().cpu().numpy()
+            all_norms.append(norms)
+            n_batches += 1
+
+    finally:
+        if gsm is not None:
+            gsm.enable_hooks()
 
     return np.concatenate(all_norms)
 
