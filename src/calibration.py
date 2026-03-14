@@ -57,11 +57,22 @@ def compute_per_sample_gradient_norms(
     """
     Compute the L2 gradient norm ||∇ℓ(θ, z_i)|| for each sample z_i.
 
-    Uses torch.func (vmap + grad + functional_call) for hook-free per-sample
-    gradient computation.  Calls gsm.disable_hooks() / gsm.enable_hooks()
-    around the computation so that Opacus's capture_activations_hook returns
-    early and never touches the functional_call replacement tensors (which lack
-    the _forward_counter attribute Opacus expects on real parameters).
+    Uses torch.func (vmap + grad + functional_call).  Two hook issues must both
+    be suppressed before vmap is called:
+
+      1. Opacus *forward* hook (capture_activations_hook): accesses
+         p._forward_counter on the module's parameters.  Under functional_call
+         those are replaced with plain detached tensors that lack the attribute.
+         Fix: gsm.disable_hooks() makes the Python callback return immediately.
+
+      2. Opacus *backward* hook (capture_backprops_hook): registered via
+         register_full_backward_hook.  PyTorch injects a BackwardHookFunction
+         wrapper into the forward graph whenever _backward_hooks is non-empty,
+         and BackwardHookFunction does not implement setup_context, so vmap
+         raises RuntimeError.  gsm.disable_hooks() only silences the Python
+         callback — it does NOT prevent the wrapper from being inserted.
+         Fix: temporarily empty _backward_hooks (and _backward_pre_hooks) on
+         every submodule of raw, then restore in the finally block.
 
     Works for both plain nn.Module and Opacus-wrapped GradSampleModule.
     """
@@ -70,24 +81,34 @@ def compute_per_sample_gradient_norms(
     raw, gsm = _get_raw_model(model)
     raw = raw.to(device)
 
-    # Detached snapshots — not tied to the training graph
     params  = {n: p.detach() for n, p in raw.named_parameters()}
     buffers = {n: b.detach() for n, b in raw.named_buffers()}
 
     def loss_single(params, x_i, y_i):
-        # x_i: (C, H, W); y_i: scalar → unsqueeze to (1,) for cross_entropy
+        # x_i: (C, H, W); y_i: scalar → (1,) for cross_entropy
         out = functional_call(raw, {**params, **buffers}, (x_i.unsqueeze(0),))
         return F.cross_entropy(out, y_i.unsqueeze(0))
 
     per_sample_grad_fn = vmap(grad(loss_single), in_dims=(None, 0, 0))
 
-    all_norms = []
-    n_batches = 0
-
-    # Suspend Opacus hooks so capture_activations_hook / capture_backprops_hook
-    # return immediately without accessing _forward_counter on our detached tensors.
+    # --- Fix 1: silence Opacus forward-hook _forward_counter access ---
     if gsm is not None:
         gsm.disable_hooks()
+
+    # --- Fix 2: remove backward hooks so BackwardHookFunction is never injected ---
+    saved_bw     = {}
+    saved_bw_pre = {}
+    for name, m in raw.named_modules():
+        if m._backward_hooks:
+            saved_bw[name] = dict(m._backward_hooks)
+            m._backward_hooks.clear()
+        bwp = getattr(m, "_backward_pre_hooks", None)
+        if bwp:
+            saved_bw_pre[name] = dict(bwp)
+            bwp.clear()
+
+    all_norms = []
+    n_batches  = 0
 
     try:
         for batch in loader:
@@ -97,15 +118,20 @@ def compute_per_sample_gradient_norms(
             x, y = batch[0].to(device), batch[1].to(device)
             B = x.shape[0]
 
-            # per_sample_grads: dict {param_name: (B, *param_shape)}
             per_sample_grads = per_sample_grad_fn(params, x, y)
-
             flat  = torch.cat([g.reshape(B, -1) for g in per_sample_grads.values()], dim=1)
             norms = flat.norm(dim=1).detach().cpu().numpy()
             all_norms.append(norms)
             n_batches += 1
 
     finally:
+        # Restore backward hooks before resuming training
+        for name, m in raw.named_modules():
+            if name in saved_bw:
+                m._backward_hooks.update(saved_bw[name])
+            bwp = getattr(m, "_backward_pre_hooks", None)
+            if bwp is not None and name in saved_bw_pre:
+                bwp.update(saved_bw_pre[name])
         if gsm is not None:
             gsm.enable_hooks()
 
