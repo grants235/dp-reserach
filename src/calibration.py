@@ -33,8 +33,8 @@ def _compute_features(model: nn.Module, loader: DataLoader, device: torch.device
 
 def _get_raw_model(model: nn.Module) -> nn.Module:
     """
-    Extract the deepest raw nn.Module, stripping any GradSampleModule wrappers.
-    Does NOT modify the model or its hooks.
+    Strip any GradSampleModule wrappers to get the underlying raw model.
+    Does NOT modify the model or touch its hooks.
     """
     from opacus.grad_sample import GradSampleModule
     raw = model
@@ -52,64 +52,46 @@ def compute_per_sample_gradient_norms(
     """
     Compute the L2 gradient norm ||∇ℓ(θ, z_i)|| for each sample z_i.
 
-    Accepts a plain nn.Module or a GradSampleModule (e.g. from PrivacyEngine).
-    Always deep-copies the raw model and creates a fresh GradSampleModule in
-    train mode — this avoids Opacus activation-capture failures that occur when
-    reusing a training-loop GradSampleModule in eval mode under PyTorch ≥ 2.0.
+    Uses torch.func (vmap + grad + functional_call) — zero hook registration,
+    zero interaction with the training-loop GradSampleModule.  Works regardless
+    of whether `model` is a plain nn.Module or an Opacus-wrapped module.
 
     Returns:
         norms: array of shape (n,) – unclipped per-sample gradient norms
     """
-    import copy
-    from opacus.grad_sample import GradSampleModule
+    from torch.func import vmap, grad, functional_call
 
-    raw = _get_raw_model(model)
-    raw_copy = copy.deepcopy(raw).to(device)
-    model_gs = GradSampleModule(raw_copy)
-    model_gs.train()  # must be train mode; eval mode breaks activation capture in PyTorch ≥ 2.0
+    raw = _get_raw_model(model).to(device)
+
+    # Detached snapshots — not tied to the training graph
+    params  = {n: p.detach() for n, p in raw.named_parameters()}
+    buffers = {n: b.detach() for n, b in raw.named_buffers()}
+
+    def loss_single(params, x_i, y_i):
+        # x_i: (C, H, W); y_i: scalar → (1,) for cross_entropy
+        out = functional_call(raw, {**params, **buffers}, (x_i.unsqueeze(0),))
+        return F.cross_entropy(out, y_i.unsqueeze(0))
+
+    # vmap batches over the sample dimension; grad differentiates w.r.t. params
+    per_sample_grad_fn = vmap(grad(loss_single), in_dims=(None, 0, 0))
 
     all_norms = []
     n_batches = 0
 
-    try:
-        for batch in loader:
-            if max_batches and n_batches >= max_batches:
-                break
+    for batch in loader:
+        if max_batches and n_batches >= max_batches:
+            break
 
-            x, y = batch[0].to(device), batch[1].to(device)
+        x, y = batch[0].to(device), batch[1].to(device)
+        B = x.shape[0]
 
-            # Clear any accumulated grad_sample from a previous step
-            for p in model_gs.parameters():
-                p.grad = None
-                if hasattr(p, "grad_sample"):
-                    del p.grad_sample
+        # per_sample_grads: dict {param_name: (B, *param_shape)}
+        per_sample_grads = per_sample_grad_fn(params, x, y)
 
-            # sum reduction → grad_sample[i] = ∇ℓ_i (per-sample, not averaged)
-            outputs = model_gs(x)
-            loss = F.cross_entropy(outputs, y, reduction="sum")
-            loss.backward()
-
-            batch_size = x.shape[0]
-            grad_flat = []
-            for p in model_gs.parameters():
-                if p.requires_grad and hasattr(p, "grad_sample"):
-                    grad_flat.append(p.grad_sample.reshape(batch_size, -1))
-
-            per_sample = torch.cat(grad_flat, dim=1)  # (B, D)
-            norms = per_sample.norm(dim=1).detach().cpu().numpy()
-            all_norms.append(norms)
-
-            # Free per-sample gradient memory immediately
-            for p in model_gs.parameters():
-                p.grad = None
-                if hasattr(p, "grad_sample"):
-                    del p.grad_sample
-
-            n_batches += 1
-
-    finally:
-        model_gs.remove_hooks()
-        del raw_copy, model_gs
+        flat  = torch.cat([g.reshape(B, -1) for g in per_sample_grads.values()], dim=1)
+        norms = flat.norm(dim=1).detach().cpu().numpy()
+        all_norms.append(norms)
+        n_batches += 1
 
     return np.concatenate(all_norms)
 
