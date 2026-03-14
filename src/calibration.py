@@ -31,41 +31,16 @@ def _compute_features(model: nn.Module, loader: DataLoader, device: torch.device
     return np.concatenate(feats, axis=0)
 
 
-def _acquire_grad_sample_module(model: nn.Module):
+def _get_raw_model(model: nn.Module) -> nn.Module:
     """
-    Safely return a (GradSampleModule, owned) pair.
-
-    owned=True  → we created the module; caller must call module.remove_hooks()
-                  after use to restore the underlying model to a clean state.
-    owned=False → model was already a GradSampleModule; do NOT remove hooks,
-                  as that would break the caller's training loop.
-
-    Handles three cases:
-      A. model is already a GradSampleModule (e.g. from PrivacyEngine.make_private)
-      B. model._module chain contains a GradSampleModule
-      C. plain model – strip any stale hooks (autograd_grad_sample_hooks) and wrap
+    Extract the deepest raw nn.Module, stripping any GradSampleModule wrappers.
+    Does NOT modify the model or its hooks.
     """
     from opacus.grad_sample import GradSampleModule
-
-    # Case A
-    if isinstance(model, GradSampleModule):
-        return model, False
-
-    # Case B – traverse _module chain
-    probe = model
-    while hasattr(probe, "_module"):
-        probe = probe._module
-        if isinstance(probe, GradSampleModule):
-            return probe, False
-
-    # Case C – probe is now the deepest raw model
-    # Remove stale hooks if a previous GradSampleModule was discarded without cleanup
-    if hasattr(probe, "autograd_grad_sample_hooks"):
-        for handle in probe.autograd_grad_sample_hooks:
-            handle.remove()
-        del probe.autograd_grad_sample_hooks
-
-    return GradSampleModule(probe), True
+    raw = model
+    while isinstance(raw, GradSampleModule):
+        raw = raw._module
+    return raw
 
 
 def compute_per_sample_gradient_norms(
@@ -77,20 +52,21 @@ def compute_per_sample_gradient_norms(
     """
     Compute the L2 gradient norm ||∇ℓ(θ, z_i)|| for each sample z_i.
 
-    Accepts:
-    - A plain nn.Module (will be wrapped temporarily).
-    - A GradSampleModule already wrapped by PrivacyEngine (reused as-is).
-
-    The model is placed in eval mode during computation and restored afterward.
+    Accepts a plain nn.Module or a GradSampleModule (e.g. from PrivacyEngine).
+    Always deep-copies the raw model and creates a fresh GradSampleModule in
+    train mode — this avoids Opacus activation-capture failures that occur when
+    reusing a training-loop GradSampleModule in eval mode under PyTorch ≥ 2.0.
 
     Returns:
         norms: array of shape (n,) – unclipped per-sample gradient norms
     """
-    model_gs, owned = _acquire_grad_sample_module(model)
-    model_gs = model_gs.to(device)
+    import copy
+    from opacus.grad_sample import GradSampleModule
 
-    was_training = model_gs.training
-    model_gs.eval()
+    raw = _get_raw_model(model)
+    raw_copy = copy.deepcopy(raw).to(device)
+    model_gs = GradSampleModule(raw_copy)
+    model_gs.train()  # must be train mode; eval mode breaks activation capture in PyTorch ≥ 2.0
 
     all_norms = []
     n_batches = 0
@@ -132,12 +108,8 @@ def compute_per_sample_gradient_norms(
             n_batches += 1
 
     finally:
-        # Restore training mode
-        if was_training:
-            model_gs.train()
-        # Remove hooks only if we own the module
-        if owned:
-            model_gs.remove_hooks()
+        model_gs.remove_hooks()
+        del raw_copy, model_gs
 
     return np.concatenate(all_norms)
 
