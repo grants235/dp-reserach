@@ -179,7 +179,7 @@ def load_datasets(
     """
     os.makedirs(data_root, exist_ok=True)
 
-    if dataset_name.startswith("cifar10"):
+    if dataset_name.startswith("cifar10") and not dataset_name.startswith("cifar100"):
         train_tf_aug, test_tf = get_transforms(augment=True)
         train_tf_noaug, _ = get_transforms(augment=False)
 

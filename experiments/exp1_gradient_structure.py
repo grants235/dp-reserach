@@ -142,6 +142,7 @@ def run_exp1(
         n_train=n_train,
         batch_size=BATCH_SIZE,
         epochs=EPOCHS,
+        lr=0.05,  # 0.1 is too aggressive for DP-SGD at batch=256; 0.05 matches typical published settings
         device=device,
         delta=DELTA,
     )
