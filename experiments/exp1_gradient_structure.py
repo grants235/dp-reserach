@@ -94,6 +94,19 @@ def run_exp1(
         data, batch_size=BATCH_SIZE
     )
 
+    # Non-shuffled, no-augmentation loader for gradient norm evaluation.
+    # CRITICAL: must match the order of private_targets / tiers_A / tiers_B
+    # so that norms[i] corresponds to sample i in private_dataset.
+    from torch.utils.data import DataLoader as _DataLoader
+    eval_loader = _DataLoader(
+        data["private_dataset_noaug"],
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=False,
+    )
+
     # Private targets (for tier assignment)
     private_targets = np.array(data["private_dataset"].targets)
 
@@ -142,7 +155,7 @@ def run_exp1(
         n_train=n_train,
         batch_size=BATCH_SIZE,
         epochs=EPOCHS,
-        lr=0.05,  # 0.1 is too aggressive for DP-SGD at batch=256; 0.05 matches typical published settings
+        lr=0.1,  # spec §3.2: initial LR 0.1 with cosine annealing
         device=device,
         delta=DELTA,
     )
@@ -167,10 +180,10 @@ def run_exp1(
 
         if epoch in CHECKPOINT_EPOCHS:
             print(f"[Exp1] {tag}: epoch {epoch}, computing gradient norms...")
-            # Pass trainer.model directly – it is already a GradSampleModule
-            # (from make_private). _acquire_grad_sample_module will reuse it.
+            # Use eval_loader (shuffle=False, no-aug) so that norms[i]
+            # aligns with private_targets[i] / tiers_A[i] / tiers_B[i].
             unclipped_norms = compute_per_sample_gradient_norms(
-                trainer.model, private_loader, device
+                trainer.model, eval_loader, device
             )
             clipped_norms = compute_per_sample_clipped_norms(unclipped_norms, C)
 
@@ -182,9 +195,10 @@ def run_exp1(
                 "labels": private_targets,
             }
 
-    # Per-sample loss and prediction at convergence (epoch 100)
+    # Per-sample loss and prediction at convergence (epoch 100).
+    # Use eval_loader to keep alignment with tiers_A / tiers_B.
     losses, labels, preds, confs = compute_per_sample_losses(
-        trainer.model, private_loader, device
+        trainer.model, eval_loader, device
     )
     checkpoint_data["convergence"] = {
         "losses": losses,

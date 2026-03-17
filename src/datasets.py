@@ -243,10 +243,12 @@ def load_datasets(
     # Build IndexedDatasets
     public_dataset = IndexedDataset(full_train_noaug, public_indices)
     private_dataset = IndexedDataset(full_train, private_indices)
+    private_dataset_noaug = IndexedDataset(full_train_noaug, private_indices)
 
     return dict(
         public_dataset=public_dataset,
         private_dataset=private_dataset,
+        private_dataset_noaug=private_dataset_noaug,
         test_dataset=test_dataset,
         public_indices=public_indices,
         private_indices=private_indices,
