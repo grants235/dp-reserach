@@ -342,10 +342,6 @@ CONFIGS = {
     ),
 }
 
-# Print the resolved LR values for transparency
-for k, v in CONFIGS.items():
-    if "lr" in v:
-        v.setdefault("_lr_resolved", f"{v['lr']:.4f}")
 
 
 # ---------------------------------------------------------------------------
