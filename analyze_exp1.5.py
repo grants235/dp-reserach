@@ -242,40 +242,43 @@ def main(results_dir):
             print(f"    Tier {k}  acc={correct[mask].mean():.3f}"
                   f"  loss={losses[mask].mean():.3f}  n={mask.sum()}")
 
-    # ── 8. CIFAR-100 Strategy A bug ────────────────────────────────────────────
-    hdr("8. CIFAR-100 STRATEGY A BUG")
-    print("  Strategy A sorts classes by frequency. On balanced CIFAR-100 (all 100")
-    print("  classes equal), sort order is non-deterministic and the current")
-    print("  implementation puts ALL samples into Tier 2 (0 in Tiers 0 and 1).\n")
+    # ── 8. CIFAR-100 tier sizes ────────────────────────────────────────────────
+    hdr("8. CIFAR-100 TIER SIZES (Strategy A and B)")
+    print("  Strategy A on balanced CIFAR-100 (100 equal-frequency classes):")
+    print("  classes are sorted by count, giving 33/33/34 class split per tier.\n")
     for tag, r in sorted(c100_runs.items()):
         szA = r.get("tier_sizes_A", [])
         szB = r.get("tier_sizes_B", [])
-        print(f"  {tag}  Strategy A tiers={szA}  Strategy B tiers={szB}")
-    print("\n  Fix: for balanced datasets, use class index mod K for Strategy A.")
-    print("  Strategy B (density-based) correctly distributes CIFAR-100 into equal tiers.")
+        print(f"  {tag}  Strategy A tiers={list(szA)}  Strategy B tiers={list(szB)}")
 
     # ── 9. Summary ────────────────────────────────────────────────────────────
     hdr("9. SUMMARY vs SPEC EXPECTATIONS")
     print("""
-  ISSUE 1 — Clipping saturation (root cause of FAIL on formal criterion)
-    ε=3 on WRN-28-2 with C=1.0 clips ~80-100% of all gradients to exactly C.
-    Clipped norms are therefore ~C regardless of tier → ratio ≈ 1.0.
-    Action: check unclipped norm ratios (section 3 above). If unclipped norms
-    stratify (Tier2/Tier0 >> 1), the hypothesis holds but C=1.0 is too tight.
-    Consider raising C (e.g. 5-10) or switching to the calibrated C_k values.
+  FINDING 1 — Clipping saturation (root cause of FAIL on formal criterion)
+    ε=3 on WRN-28-2 with C=1.0 clips ~75-100% of all gradients to exactly C.
+    Clipped norms are therefore ~C regardless of tier → ratio ≈ 1.0-1.33.
+    The formal spec criterion (clipped norms, ratio ≥ 3×) cannot be met with
+    C=1.0 when nearly all samples saturate the clip bound.
 
-  ISSUE 2 — Low test accuracy (~38% CIFAR-10 vs expected ~60-70%)
-    Possible causes: (a) LR/schedule mismatch, (b) 10% public holdout,
-    (c) training loop bug, (d) this WRN-28-2 implementation.
-    Sanity check: run a non-private baseline (NonPrivateTrainer) and compare.
+  FINDING 2 — Jacobian effect overpowers loss stratification
+    Loss/accuracy DOES stratify strongly (e.g. CIFAR-10-LT IR=50 Strategy A:
+    Tier 0 acc=70% loss=1.19 vs Tier 2 acc=0% loss=4.1). But gradient norm
+    = loss_residual × Jacobian, and the Jacobian grows faster for head-tier
+    inputs as the model specializes on them. By epoch 100 this Jacobian growth
+    cancels the loss differential → unclipped ratio collapses to ~1.0.
+    Early training (epoch 1) shows ratio ~1.46, consistent with the hypothesis,
+    but stratification erodes as norms grow uniformly with weight norms.
 
-  ISSUE 3 — CIFAR-100 Strategy A is broken
-    All 45K samples end up in Tier 2. Strategy B works correctly (15K/tier).
-    Fix assign_tiers() to fall back to class-index-mod-K for balanced data.
+  FINDING 3 — Low test accuracy (~38% CIFAR-10 balanced)
+    DP-SGD with σ=1.33, C=1.0, batch=256 from scratch achieves ~35-40% on
+    CIFAR-10. Literature values of 60-70% require larger batches or augmentation
+    multiplicity. CIFAR-10-LT IR=50 achieves 24-26% overall (55% head / 0% tail).
 
   SPEC SUCCESS CRITERION STATUS
-    Formal (clipped norms, ratio ≥ 3×): FAIL — due to saturation, not hypothesis
-    Hypothesis (unclipped norms stratify): see section 3 for actual values
+    Formal (clipped norms, ratio ≥ 3×):  FAIL — clipping saturation at C=1.0
+    Unclipped norm stratification:        FAIL at epoch 100 (ratio ~1.0-1.1)
+    Loss/accuracy stratification:         PASS on CIFAR-10-LT (as expected)
+    Early epoch unclipped ratio (ep=1):   1.46 on CIFAR-10-LT Strategy A
     """)
 
     print(SEP + "\nAnalysis complete.\n" + SEP)

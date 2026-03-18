@@ -72,7 +72,7 @@ def _write_grads_to_params(model: nn.Module, flat_grad: torch.Tensor):
 def _clear_grad_samples(model: nn.Module):
     for p in model.parameters():
         if hasattr(p, "grad_sample"):
-            del p.grad_sample
+            p.grad_sample = None   # reset to None; do NOT del (Opacus hooks require attribute to exist)
         p.grad = None
 
 
