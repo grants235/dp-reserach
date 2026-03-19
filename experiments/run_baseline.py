@@ -177,33 +177,23 @@ def _dp_aug_mult_step(
     sample's gradient, exactly as in Tramèr & Boneh (2021).
     """
     B = x_clean.shape[0]
+
+    # Build B*aug_mult batch with independent augmentations
+    x_views = torch.cat([augment_batch(x_clean) for _ in range(aug_mult)], dim=0)
+    y_views = y.repeat(aug_mult)
+
+    _clear_grad_samples(gsm)
     gsm.train()
+    out = gsm(x_views)
+    F.cross_entropy(out, y_views, reduction='sum').backward()
 
-    flat = None
-    out_first = None
-
-    for v in range(aug_mult):
-        # Build B-sized batch with independent augmentations
-        x_v = augment_batch(x_clean)
-        
-        _clear_grad_samples(gsm)
-        out_v = gsm(x_v)
-        F.cross_entropy(out_v, y, reduction='sum').backward()
-
-        grad_list_v = []
-        for p in gsm.parameters():
-            if p.requires_grad and hasattr(p, "grad_sample") and p.grad_sample is not None:
-                grad_list_v.append(p.grad_sample.reshape(B, -1))
-        
-        flat_v = torch.cat(grad_list_v, dim=1)  # (B, D)
-
-        if flat is None:
-            flat = flat_v
-            out_first = out_v.detach()
-        else:
-            flat += flat_v
-
-    flat = flat / aug_mult
+    # Efficient per-sample grads: average aug_mult views per parameter to save massive memory
+    grad_list = []
+    for p in gsm.parameters():
+        if p.requires_grad and hasattr(p, "grad_sample") and p.grad_sample is not None:
+            # p.grad_sample is (B * aug_mult, ...)
+            grad_list.append(p.grad_sample.reshape(B, aug_mult, -1).mean(dim=1))
+    flat = torch.cat(grad_list, dim=1)  # (B, D)
 
     # Per-sample clip
     norms = flat.norm(dim=1, keepdim=True)
@@ -219,7 +209,7 @@ def _dp_aug_mult_step(
     optimizer.step()
     optimizer.zero_grad()
 
-    return out_first, y               # first-view predictions for logging
+    return out[:B].detach(), y[:B]               # first-view predictions for logging
 
 
 # ---------------------------------------------------------------------------
