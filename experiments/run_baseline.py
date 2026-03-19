@@ -187,10 +187,13 @@ def _dp_aug_mult_step(
     out = gsm(x_views)
     F.cross_entropy(out, y_views, reduction='sum').backward()
 
-    # per-sample grads: (B*aug_mult, D)
-    flat = _collect_per_sample_grads(gsm, B * aug_mult, device)
-    # average aug_mult views → (B, D)
-    flat = flat.view(B, aug_mult, -1).mean(dim=1)
+    # Efficient per-sample grads: average aug_mult views per parameter to save massive memory
+    grad_list = []
+    for p in gsm.parameters():
+        if p.requires_grad and hasattr(p, "grad_sample") and p.grad_sample is not None:
+            # p.grad_sample is (B * aug_mult, ...)
+            grad_list.append(p.grad_sample.reshape(B, aug_mult, -1).mean(dim=1))
+    flat = torch.cat(grad_list, dim=1)  # (B, D)
 
     # Per-sample clip
     norms = flat.norm(dim=1, keepdim=True)
