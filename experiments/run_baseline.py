@@ -139,6 +139,13 @@ def train_nonprivate(
     with open(result_path, "wb") as f:
         pickle.dump(results, f)
     print(f"  [nonprivate {tag}] DONE  test_acc={test_acc:.4f}")
+
+    # Explicit memory cleanup
+    del model, optimizer, scheduler, train_loader, test_loader
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
     return results
 
 
@@ -306,6 +313,13 @@ def train_dp(
     with open(result_path, "wb") as f:
         pickle.dump(results, f)
     print(f"  [{tag}] DONE  test_acc={test_acc:.4f}  ε={eps_achieved:.3f}")
+
+    # Explicit memory cleanup
+    del raw, gsm, model, optimizer, scheduler, train_loader, test_loader
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
     return results
 
 
