@@ -61,6 +61,7 @@ def augment_batch(x: torch.Tensor) -> torch.Tensor:
 
     Works on CPU or CUDA.  Each sample in the batch gets an independent
     random transform, so repeated calls produce different augmented views.
+    Fully vectorized — no Python loop over batch elements.
     """
     B, C, H, W = x.shape
     # Reflect-pad by 4 on each spatial side → (B, C, H+8, W+8)
@@ -68,7 +69,14 @@ def augment_batch(x: torch.Tensor) -> torch.Tensor:
     # Random crop offsets per sample
     oi = torch.randint(0, 8, (B,), device=x.device)
     oj = torch.randint(0, 8, (B,), device=x.device)
-    crops = torch.stack([xp[b, :, oi[b]:oi[b]+H, oj[b]:oj[b]+W] for b in range(B)])
+    # Vectorized crop: build row/col index tensors and gather in one shot
+    rows = oi[:, None] + torch.arange(H, device=x.device)   # (B, H)
+    cols = oj[:, None] + torch.arange(W, device=x.device)   # (B, W)
+    b_idx = torch.arange(B, device=x.device)[:, None, None]  # (B, 1, 1)
+    # Permute to (B, H+8, W+8, C) so channels come along for free
+    xp_t = xp.permute(0, 2, 3, 1)                           # (B, H+8, W+8, C)
+    crops = xp_t[b_idx, rows[:, :, None], cols[:, None, :]]  # (B, H, W, C)
+    crops = crops.permute(0, 3, 1, 2).contiguous()           # (B, C, H, W)
     # Random horizontal flip
     flip = torch.rand(B, device=x.device) > 0.5
     crops[flip] = crops[flip].flip(-1)
@@ -187,25 +195,35 @@ def _dp_aug_mult_step(
     out = gsm(x_views)
     F.cross_entropy(out, y_views, reduction='sum').backward()
 
-    # Efficient per-sample grads: average aug_mult views per parameter to save massive memory
-    grad_list = []
+    # Two-pass clipping: avoids materialising the full (B, D_total) flat tensor.
+    # Pass 1 — accumulate per-sample squared norms across parameters.
+    sq_norms = torch.zeros(B, device=x_clean.device)
     for p in gsm.parameters():
         if p.requires_grad and hasattr(p, "grad_sample") and p.grad_sample is not None:
-            # p.grad_sample is (B * aug_mult, ...)
-            grad_list.append(p.grad_sample.reshape(B, aug_mult, -1).mean(dim=1))
-    flat = torch.cat(grad_list, dim=1)  # (B, D)
+            gs = p.grad_sample.reshape(B, aug_mult, -1).mean(dim=1)  # (B, d_p)
+            sq_norms += gs.pow(2).sum(dim=1)
+    scale = torch.clamp(C / sq_norms.sqrt_().clamp_(min=1e-8), max=1.0)  # (B,)
 
-    # Per-sample clip
-    norms = flat.norm(dim=1, keepdim=True)
-    scale = torch.clamp(C / norms.clamp(min=1e-8), max=1.0)
-    clipped = (flat * scale).sum(dim=0)          # (D,)
-
-    # Gaussian noise + normalise
-    noise  = torch.randn_like(clipped) * (sigma * C)
-    update = (clipped + noise) / (q * n_train)
+    # Pass 2 — clip, aggregate, and write noise directly per parameter.
+    update_parts = []
+    for p in gsm.parameters():
+        if not p.requires_grad:
+            continue
+        if hasattr(p, "grad_sample") and p.grad_sample is not None:
+            gs = p.grad_sample.reshape(B, aug_mult, -1).mean(dim=1)  # (B, d_p)
+            clipped_p = (gs * scale[:, None]).sum(dim=0)              # (d_p,)
+        else:
+            clipped_p = torch.zeros(p.numel(), device=x_clean.device)
+        noise_p = torch.randn_like(clipped_p) * (sigma * C)
+        update_parts.append((clipped_p + noise_p).reshape(p.shape))
 
     _clear_grad_samples(gsm)
-    _write_grads_to_params(gsm, update)
+
+    # Write updates into .grad
+    param_iter = (p for p in gsm.parameters() if p.requires_grad)
+    for p, upd in zip(param_iter, update_parts):
+        p.grad = upd / (q * n_train)
+
     optimizer.step()
     optimizer.zero_grad()
 
