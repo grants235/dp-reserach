@@ -172,6 +172,7 @@ def _dp_aug_mult_step(
     q: float,
     n_train: int,
     device: torch.device,
+    chunk_size: int = None,         # split batch into chunks to cap Opacus grad_sample memory
 ):
     """One DP-SGD step with augmentation multiplicity.
 
@@ -183,51 +184,73 @@ def _dp_aug_mult_step(
     Privacy analysis: averaging over aug_mult views of the SAME sample does
     not change privacy cost — it is variance reduction within a single
     sample's gradient, exactly as in Tramèr & Boneh (2021).
+
+    Memory: Opacus stores grad_samples of shape (chunk * aug_mult, *p_shape)
+    per parameter.  chunk_size caps this at chunk_size * aug_mult samples per
+    backward pass.  Clipped sums are accumulated across chunks; noise is added
+    ONCE at the end, so privacy accounting is unchanged.
     """
     B = x_clean.shape[0]
+    eff_chunk = B if (chunk_size is None or chunk_size >= B) else chunk_size
 
-    # Build B*aug_mult batch with independent augmentations
-    x_views = torch.cat([augment_batch(x_clean) for _ in range(aug_mult)], dim=0)
-    y_views = y.repeat(aug_mult)
+    agg_parts = None   # list of per-param clipped-sum tensors (D_p,)
+    first_preds = None
 
-    _clear_grad_samples(gsm)
-    gsm.train()
-    out = gsm(x_views)
-    F.cross_entropy(out, y_views, reduction='sum').backward()
+    for start in range(0, B, eff_chunk):
+        end = min(start + eff_chunk, B)
+        Bc = end - start
+        xc = x_clean[start:end]
+        yc = y[start:end]
 
-    # Two-pass clipping: avoids materialising the full (B, D_total) flat tensor.
-    # Pass 1 — accumulate per-sample squared norms across parameters.
-    sq_norms = torch.zeros(B, device=x_clean.device)
-    for p in gsm.parameters():
-        if p.requires_grad and hasattr(p, "grad_sample") and p.grad_sample is not None:
-            gs = p.grad_sample.reshape(B, aug_mult, -1).mean(dim=1)  # (B, d_p)
-            sq_norms += gs.pow(2).sum(dim=1)
-    scale = torch.clamp(C / sq_norms.sqrt_().clamp_(min=1e-8), max=1.0)  # (B,)
+        x_views = torch.cat([augment_batch(xc) for _ in range(aug_mult)], dim=0)
+        y_views = yc.repeat(aug_mult)
 
-    # Pass 2 — clip, aggregate, and write noise directly per parameter.
-    update_parts = []
-    for p in gsm.parameters():
-        if not p.requires_grad:
-            continue
-        if hasattr(p, "grad_sample") and p.grad_sample is not None:
-            gs = p.grad_sample.reshape(B, aug_mult, -1).mean(dim=1)  # (B, d_p)
-            clipped_p = (gs * scale[:, None]).sum(dim=0)              # (d_p,)
+        _clear_grad_samples(gsm)
+        gsm.train()
+        out = gsm(x_views)
+        F.cross_entropy(out, y_views, reduction='sum').backward()
+
+        if first_preds is None:
+            first_preds = (out[:Bc].detach(), yc)
+
+        # Pass 1 — per-sample squared norms for this chunk
+        sq_norms = torch.zeros(Bc, device=xc.device)
+        for p in gsm.parameters():
+            if p.requires_grad and hasattr(p, "grad_sample") and p.grad_sample is not None:
+                gs = p.grad_sample.reshape(Bc, aug_mult, -1).mean(dim=1)  # (Bc, d_p)
+                sq_norms += gs.pow(2).sum(dim=1)
+        scale = torch.clamp(C / sq_norms.sqrt_().clamp_(min=1e-8), max=1.0)  # (Bc,)
+
+        # Pass 2 — clip and accumulate into agg_parts (no noise yet)
+        chunk_parts = []
+        for p in gsm.parameters():
+            if not p.requires_grad:
+                continue
+            if hasattr(p, "grad_sample") and p.grad_sample is not None:
+                gs = p.grad_sample.reshape(Bc, aug_mult, -1).mean(dim=1)  # (Bc, d_p)
+                clipped_p = (gs * scale[:, None]).sum(dim=0)               # (d_p,)
+            else:
+                clipped_p = torch.zeros(p.numel(), device=xc.device)
+            chunk_parts.append(clipped_p.reshape(p.shape))
+
+        _clear_grad_samples(gsm)
+
+        if agg_parts is None:
+            agg_parts = chunk_parts
         else:
-            clipped_p = torch.zeros(p.numel(), device=x_clean.device)
-        noise_p = torch.randn_like(clipped_p) * (sigma * C)
-        update_parts.append((clipped_p + noise_p).reshape(p.shape))
+            for i in range(len(agg_parts)):
+                agg_parts[i] = agg_parts[i] + chunk_parts[i]
 
-    _clear_grad_samples(gsm)
-
-    # Write updates into .grad
+    # Add noise ONCE over the full aggregated clipped gradient
     param_iter = (p for p in gsm.parameters() if p.requires_grad)
-    for p, upd in zip(param_iter, update_parts):
-        p.grad = upd / (q * n_train)
+    for p, agg in zip(param_iter, agg_parts):
+        noise = torch.randn_like(agg) * (sigma * C)
+        p.grad = (agg + noise) / (q * n_train)
 
     optimizer.step()
     optimizer.zero_grad()
 
-    return out[:B].detach(), y[:B]               # first-view predictions for logging
+    return first_preds   # (out[:Bc], yc) from first chunk — for train-acc logging
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +273,7 @@ def train_dp(
     momentum: float = 0.9,
     weight_decay: float = 5e-4,
     mode_label: str = "dp_standard",
+    chunk_size: int = None,   # max samples per Opacus backward; None = full batch
 ):
     tag = f"{mode_label}_{dataset_name}_IR{imbalance_ratio:.0f}_seed{seed}"
     out_dir = os.path.join(results_dir, tag)
@@ -299,6 +323,7 @@ def train_dp(
                 gsm, optimizer, x_clean, y,
                 aug_mult=aug_mult, C=C, sigma=sigma,
                 q=q, n_train=n_train, device=device,
+                chunk_size=chunk_size,
             )
             correct += (preds.argmax(1) == yt).sum().item()
             total   += yt.shape[0]
@@ -322,7 +347,7 @@ def train_dp(
         seed=seed, batch_size=batch_size, aug_mult=aug_mult, lr=lr,
         epochs=epochs, C=C, momentum=momentum, weight_decay=weight_decay,
         sigma=sigma, eps_target=EPS_TARGET, eps_achieved=eps_achieved,
-        delta=DELTA, q=q, T=T,
+        delta=DELTA, q=q, T=T, chunk_size=chunk_size,
     )
     results = dict(tag=tag, test_acc=test_acc, config=config)
 
@@ -371,9 +396,11 @@ CONFIGS = {
     ),
     # ── larger batch + aug-mult (recommended for best accuracy) ──────────
     # batch_size ∈ {512, 1024, 2048}; lr ∈ [0.5, 4.0]
-    # Requires ~6-8 GB GPU; reduce batch_size if OOM.
+    # chunk_size=512: processes 512*4=2048 aug views per backward pass,
+    # matching dp_augmult8's memory footprint (256*8=2048). 2 chunks/step.
     "dp_opt": dict(
         batch_size=1024, aug_mult=4, lr=_dp_lr(1024, 4), epochs=200, C=1.0,
+        chunk_size=512,
     ),
 }
 
