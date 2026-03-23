@@ -1,0 +1,19 @@
+{
+  "mode": "dp_standard",
+  "dataset": "cifar10",
+  "imbalance_ratio": 1.0,
+  "seed": 1,
+  "batch_size": 256,
+  "aug_mult": 1,
+  "lr": 0.1,
+  "epochs": 100,
+  "C": 1.0,
+  "momentum": 0.9,
+  "weight_decay": 0.0005,
+  "sigma": 1.32568359375,
+  "eps_target": 3.0,
+  "eps_achieved": 2.996473185998921,
+  "delta": 1e-05,
+  "q": 0.005688888888888889,
+  "T": 17500
+}

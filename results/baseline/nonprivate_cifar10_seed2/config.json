@@ -1,0 +1,10 @@
+{
+  "mode": "nonprivate",
+  "dataset": "cifar10",
+  "seed": 2,
+  "lr": 0.1,
+  "batch_size": 128,
+  "epochs": 200,
+  "momentum": 0.9,
+  "weight_decay": 0.0005
+}
