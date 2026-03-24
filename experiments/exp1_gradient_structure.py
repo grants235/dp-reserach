@@ -364,6 +364,7 @@ def run_exp1(
     }
 
     save_results(results, result_path)
+    torch.save(gsm._module.state_dict(), os.path.join(out_dir, "model_final.pt"))
 
     # Free GPU memory before next run
     del gsm, model, optimizer, scheduler
