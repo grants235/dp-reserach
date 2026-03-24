@@ -647,69 +647,180 @@ def run_exp_h1(
 
     set_seed(seed)
 
-    # ── 1. Data & tiers ───────────────────────────────────────────────────
-    data = load_datasets(
-        dataset_name=dataset_name, data_root=data_root,
-        imbalance_ratio=imbalance_ratio,
-        public_frac=0.1, split_seed=42,
-    )
-    num_classes     = data["num_classes"]
-    private_targets = np.array(data["private_dataset"].targets)
-    class_counts    = data["class_counts"]
-
-    _, public_loader, _ = make_data_loaders(data, batch_size=256)
-    eval_loader = DataLoader(
-        data["private_dataset_noaug"], batch_size=256,
-        shuffle=False, num_workers=4, pin_memory=True, drop_last=False,
+    meta_path = os.path.join(ckpt_dir, "meta.pkl")
+    all_ckpts_present = all(
+        os.path.exists(os.path.join(ckpt_dir, f"epoch_{e}.pt"))
+        for e in CHECKPOINT_EPOCHS
     )
 
-    public_model = make_model(ARCH, num_classes)
-    public_model = train_public_model(
-        public_model, public_loader, device, epochs=50, verbose=False
-    )
+    if all_ckpts_present and os.path.exists(meta_path):
+        # ── Fast path: checkpoints + meta already on disk ─────────────────
+        print(f"[H1] {tag}: all checkpoints + meta present — skipping training.")
+        with open(meta_path, "rb") as f:
+            meta = pickle.load(f)
+        selected    = meta["selected"]
+        labels_sel  = meta["labels_sel"]
+        tiers_sel   = meta["tiers_sel"]
+        num_classes = meta["num_classes"]
 
-    if tier_strategy == "A":
-        tiers = assign_tiers("A", private_targets, class_counts, K=K)
+        data = load_datasets(
+            dataset_name=dataset_name, data_root=data_root,
+            imbalance_ratio=imbalance_ratio,
+            public_frac=0.1, split_seed=42,
+        )
+        use_pin = device.type == "cuda"
+        subset_loader = DataLoader(
+            Subset(data["private_dataset_noaug"], selected),
+            batch_size=GRAD_BATCH, shuffle=False,
+            num_workers=2, pin_memory=use_pin, drop_last=False,
+        )
+
+        d_total = sum(p.numel() for p in make_model(ARCH, num_classes).parameters()
+                      if p.requires_grad)
+        gen_coord = torch.Generator(); gen_coord.manual_seed(COORD_SEED)
+        coord_subset = torch.randperm(d_total, generator=gen_coord)[:COORD_DIM]
+
+    elif all_ckpts_present:
+        # ── Checkpoints exist but meta was not saved (older run) ──────────
+        # Reconstruct meta from data + tier assignment (no training needed).
+        print(f"[H1] {tag}: checkpoints present but meta missing — reconstructing meta.")
+        data = load_datasets(
+            dataset_name=dataset_name, data_root=data_root,
+            imbalance_ratio=imbalance_ratio,
+            public_frac=0.1, split_seed=42,
+        )
+        num_classes     = data["num_classes"]
+        private_targets = np.array(data["private_dataset"].targets)
+        class_counts    = data["class_counts"]
+
+        use_pin = device.type == "cuda"
+        _, public_loader, _ = make_data_loaders(data, batch_size=256)
+        eval_loader = DataLoader(
+            data["private_dataset_noaug"], batch_size=256,
+            shuffle=False, num_workers=4, pin_memory=use_pin, drop_last=False,
+        )
+
+        public_model = make_model(ARCH, num_classes)
+        public_model = train_public_model(
+            public_model, public_loader, device, epochs=50, verbose=False
+        )
+
+        if tier_strategy == "A":
+            tiers = assign_tiers("A", private_targets, class_counts, K=K)
+        else:
+            feats_pub, _ = extract_features(public_model, public_loader, device)
+            feats_prv, _ = extract_features(public_model, eval_loader, device)
+            tiers = assign_tiers("B", private_targets, class_counts, K=K,
+                                 features_public=feats_pub, features_all=feats_prv)
+
+        rng        = np.random.default_rng(seed + 200)
+        n_per_tier = N_SAMPLES // K
+        selected   = []
+        for k in range(K):
+            idx_k  = np.where(tiers == k)[0]
+            chosen = rng.choice(idx_k, size=min(n_per_tier, len(idx_k)), replace=False)
+            selected.extend(chosen.tolist())
+        selected = np.array(selected)
+        labels_sel = private_targets[selected]
+        tiers_sel  = tiers[selected]
+
+        os.makedirs(ckpt_dir, exist_ok=True)
+        with open(meta_path, "wb") as f:
+            pickle.dump({
+                "selected":    selected,
+                "labels_sel":  labels_sel,
+                "tiers_sel":   tiers_sel,
+                "num_classes": num_classes,
+            }, f)
+        print(f"[H1] {tag}: meta reconstructed and saved to {meta_path}")
+
+        subset_loader = DataLoader(
+            Subset(data["private_dataset_noaug"], selected),
+            batch_size=GRAD_BATCH, shuffle=False,
+            num_workers=2, pin_memory=use_pin, drop_last=False,
+        )
+        d_total = sum(p.numel() for p in make_model(ARCH, num_classes).parameters()
+                      if p.requires_grad)
+        gen_coord = torch.Generator(); gen_coord.manual_seed(COORD_SEED)
+        coord_subset = torch.randperm(d_total, generator=gen_coord)[:COORD_DIM]
+
     else:
-        feats_pub, _ = extract_features(public_model, public_loader, device)
-        feats_prv, _ = extract_features(public_model, eval_loader, device)
-        tiers = assign_tiers("B", private_targets, class_counts, K=K,
-                             features_public=feats_pub, features_all=feats_prv)
+        # ── Full path: setup, tier assignment, training ───────────────────
+        # ── 1. Data & tiers ───────────────────────────────────────────────
+        data = load_datasets(
+            dataset_name=dataset_name, data_root=data_root,
+            imbalance_ratio=imbalance_ratio,
+            public_frac=0.1, split_seed=42,
+        )
+        num_classes     = data["num_classes"]
+        private_targets = np.array(data["private_dataset"].targets)
+        class_counts    = data["class_counts"]
 
-    tier_sizes = get_tier_sizes(tiers, K)
-    print(f"[H1] {tag}: Strategy {tier_strategy} tier sizes: {tier_sizes}")
+        use_pin = device.type == "cuda"
+        _, public_loader, _ = make_data_loaders(data, batch_size=256)
+        eval_loader = DataLoader(
+            data["private_dataset_noaug"], batch_size=256,
+            shuffle=False, num_workers=4, pin_memory=use_pin, drop_last=False,
+        )
 
-    # ── 2. Stratified sample selection (same 2000 for all checkpoints) ────
-    rng         = np.random.default_rng(seed + 200)
-    n_per_tier  = N_SAMPLES // K
-    selected    = []
-    for k in range(K):
-        idx_k  = np.where(tiers == k)[0]
-        chosen = rng.choice(idx_k, size=min(n_per_tier, len(idx_k)), replace=False)
-        selected.extend(chosen.tolist())
-    selected = np.array(selected)
-    labels_sel = private_targets[selected]
-    tiers_sel  = tiers[selected]
-    print(f"[H1] {tag}: {len(selected)} samples selected "
-          f"({n_per_tier}/tier), tier distribution: "
-          f"{[(tiers_sel==k).sum() for k in range(K)]}")
+        public_model = make_model(ARCH, num_classes)
+        public_model = train_public_model(
+            public_model, public_loader, device, epochs=50, verbose=False
+        )
 
-    subset_loader = DataLoader(
-        Subset(data["private_dataset_noaug"], selected),
-        batch_size=GRAD_BATCH, shuffle=False,
-        num_workers=2, pin_memory=True, drop_last=False,
-    )
+        if tier_strategy == "A":
+            tiers = assign_tiers("A", private_targets, class_counts, K=K)
+        else:
+            feats_pub, _ = extract_features(public_model, public_loader, device)
+            feats_prv, _ = extract_features(public_model, eval_loader, device)
+            tiers = assign_tiers("B", private_targets, class_counts, K=K,
+                                 features_public=feats_pub, features_all=feats_prv)
 
-    # ── 3. Fixed coordinate subset for M6 (same across all checkpoints) ──
-    d_total = sum(p.numel() for p in make_model(ARCH, num_classes).parameters()
-                  if p.requires_grad)
-    gen_coord = torch.Generator(); gen_coord.manual_seed(COORD_SEED)
-    coord_subset = torch.randperm(d_total, generator=gen_coord)[:COORD_DIM]
+        tier_sizes = get_tier_sizes(tiers, K)
+        print(f"[H1] {tag}: Strategy {tier_strategy} tier sizes: {tier_sizes}")
 
-    # ── 4. Train / load checkpoints ───────────────────────────────────────
-    _train_with_checkpoints(
-        dataset_name, imbalance_ratio, seed, data, device, ckpt_dir
-    )
+        # ── 2. Stratified sample selection (same 2000 for all checkpoints) ─
+        rng        = np.random.default_rng(seed + 200)
+        n_per_tier = N_SAMPLES // K
+        selected   = []
+        for k in range(K):
+            idx_k  = np.where(tiers == k)[0]
+            chosen = rng.choice(idx_k, size=min(n_per_tier, len(idx_k)), replace=False)
+            selected.extend(chosen.tolist())
+        selected = np.array(selected)
+        labels_sel = private_targets[selected]
+        tiers_sel  = tiers[selected]
+        print(f"[H1] {tag}: {len(selected)} samples selected "
+              f"({n_per_tier}/tier), tier distribution: "
+              f"{[(tiers_sel==k).sum() for k in range(K)]}")
+
+        subset_loader = DataLoader(
+            Subset(data["private_dataset_noaug"], selected),
+            batch_size=GRAD_BATCH, shuffle=False,
+            num_workers=2, pin_memory=use_pin, drop_last=False,
+        )
+
+        # ── 3. Fixed coordinate subset for M6 (same across all checkpoints) ─
+        d_total = sum(p.numel() for p in make_model(ARCH, num_classes).parameters()
+                      if p.requires_grad)
+        gen_coord = torch.Generator(); gen_coord.manual_seed(COORD_SEED)
+        coord_subset = torch.randperm(d_total, generator=gen_coord)[:COORD_DIM]
+
+        # Save meta so restarts can skip all of the above
+        os.makedirs(ckpt_dir, exist_ok=True)
+        with open(meta_path, "wb") as f:
+            pickle.dump({
+                "selected":    selected,
+                "labels_sel":  labels_sel,
+                "tiers_sel":   tiers_sel,
+                "num_classes": num_classes,
+            }, f)
+        print(f"[H1] {tag}: meta saved to {meta_path}")
+
+        # ── 4. Train / load checkpoints ───────────────────────────────────
+        _train_with_checkpoints(
+            dataset_name, imbalance_ratio, seed, data, device, ckpt_dir
+        )
 
     # ── 5. Compute M1-M6 at each checkpoint ──────────────────────────────
     all_ckpt_measures = {}
