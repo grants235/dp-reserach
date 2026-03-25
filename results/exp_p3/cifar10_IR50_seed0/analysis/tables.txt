@@ -1,0 +1,27 @@
+=== Tab P3-1: Spearman ρ vs LiRA score ===
+Predictor                     rho    p-value note
+-------------------------------------------------------
+  M1 (global coherence)    -0.063     0.3777
+  M3 (Chatterjee f_i)      -0.060     0.3980
+  grad_norm_clip           +0.144     0.0419 *
+  grad_norm_raw            +0.050     0.4830
+  loss                     +0.126     0.0757
+
+  S1 |ρ(M1)| > |ρ(norm)| by ≥0.15:  Δρ = +0.013  [FAIL]
+  S2 |ρ(M1)| > 0.3:                  |ρ| = 0.063   [FAIL]
+
+=== Tab P3-2: R² analysis ===
+  loss only:       R² = 0.006
+  M1 only:         R² = 0.001
+  norm only:       R² = 0.000
+  loss + M1:       R² = 0.006   (ΔR² = +0.000)
+  loss + norm:     R² = 0.009   (ΔR² = +0.003)
+  S4 M1 adds power beyond loss: [PASS]
+
+=== Per-tier LiRA statistics ===
+Tier             n     mean   median      std
+---------------------------------------------
+  T0 (head)    100    0.024    0.000    0.540
+  T1 (mid)      60    0.092    0.170    0.600
+  T2 (tail)     40    0.095    0.204    0.494
+  S3 T2 median > T0 median: 0.204 > 0.000  [PASS]
