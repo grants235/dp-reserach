@@ -1,0 +1,34 @@
+=== Tab P3b-1: Spearman ρ vs LiRA score  (n=200, mean_AUROC=0.739) ===
+Predictor                   rho    p-value
+---------------------------------------------
+  M1                     -0.556     0.0000 ***
+  M3                     -0.200     0.0045 **
+  grad_norm_raw          +0.313     0.0000 ***
+  loss                   +0.210     0.0029 **
+
+  S0 mean AUROC > 0.6:              0.739  [PASS]
+  S1 |ρ(M1)| > |ρ(norm)| by ≥0.10: Δρ = +0.243  [PASS]
+  S2 |ρ(M1)| > 0.2:                0.556  [PASS]
+
+=== Tab P3b-2: R² analysis ===
+  loss only:      R² = 0.016
+  M1 only:        R² = 0.181
+  norm only:      R² = 0.056
+  loss + M1:      R² = 0.199   (ΔR² = +0.183)
+  loss + norm:    R² = 0.132   (ΔR² = +0.116)
+  S4 M1 adds beyond loss: [PASS]
+
+=== Per-tier LiRA statistics ===
+Tier             n     mean   median      std
+---------------------------------------------
+  T0 (head)    100    0.703    0.385    1.463
+  T1 (mid)      60    2.573    1.929    2.547
+  T2 (tail)     40    4.250    2.473    5.870
+  S3 T2 median > T0 median: 2.473 > 0.385  [PASS]
+
+=== Per-tier gradient norm (raw, unclipped) ===
+Tier               mean     median        p25        p75
+--------------------------------------------------
+  T0 (head)       0.060      0.009      0.004      0.035
+  T1 (mid)        0.046      0.015      0.005      0.046
+  T2 (tail)       0.083      0.017      0.004      0.054
