@@ -57,8 +57,9 @@ TIER_TARGETS  = {0: 100, 1: 60, 2: 40}   # total = 200
 N_TARGETS     = sum(TIER_TARGETS.values())
 EPOCHS        = 100
 BATCH_SIZE    = 256
+AUG_MULT      = 8      # augmentation multiplicity (matches Phase-0 best config)
 C_TRAIN       = 1.0
-LR            = 0.1
+LR            = 0.5 * (BATCH_SIZE * AUG_MULT / 256) ** 0.5   # ≈1.4142
 EPS_TARGET    = 3.0
 DELTA         = 1e-5
 GRAD_BATCH    = 16     # vmap batch size for per-sample gradient computation
@@ -69,43 +70,66 @@ EXP1_DIR      = "./results/exp1_p1"   # Phase-1 models
 
 
 # ---------------------------------------------------------------------------
-# Standard DP-SGD step (no augmult)
+# Augmentation + DP-SGD step (aug_mult=8, matches Phase-0 best config)
 # ---------------------------------------------------------------------------
 
-def _dp_step(gsm, optimizer, x, y, sigma, C, q, n_train, device):
+def _augment_batch(x):
+    """Vectorised random crop + horizontal flip augmentation."""
+    B, C_, H, W = x.shape
+    xp    = F.pad(x, (4, 4, 4, 4), mode="reflect")
+    oi    = torch.randint(0, 8, (B,), device=x.device)
+    oj    = torch.randint(0, 8, (B,), device=x.device)
+    rows  = oi[:, None] + torch.arange(H, device=x.device)
+    cols  = oj[:, None] + torch.arange(W, device=x.device)
+    b_idx = torch.arange(B, device=x.device)[:, None, None]
+    crops = (
+        xp.permute(0, 2, 3, 1)[b_idx, rows[:, :, None], cols[:, None, :]]
+        .permute(0, 3, 1, 2)
+        .contiguous()
+    )
+    flip = torch.rand(B, device=x.device) > 0.5
+    crops[flip] = crops[flip].flip(-1)
+    return crops
+
+
+def _aug_mult_dp_step(gsm, optimizer, x_clean, y, sigma, C, q, n_train, aug_mult):
     """
-    One standard DP-SGD gradient update.
-    Clips per-sample gradients to C, adds Gaussian noise, divides by q*n_train.
+    DP-SGD step with augmentation multiplicity.
+    Each sample's gradient = mean over aug_mult augmented views, then clipped.
+    Privacy accounting is unchanged — augmult does not increase ε.
     """
-    B = x.shape[0]
+    B       = x_clean.shape[0]
+    x_views = torch.cat([_augment_batch(x_clean) for _ in range(aug_mult)], dim=0)
+    y_views = y.repeat(aug_mult)
+
     _clear_grad_samples(gsm)
     gsm.train()
+    out = gsm(x_views)
+    F.cross_entropy(out, y_views, reduction="sum").backward()
 
-    out = gsm(x)
-    F.cross_entropy(out, y, reduction="sum").backward()
-
-    # Per-sample gradient norms
-    sq_norms = torch.zeros(B, device=device)
+    # Per-sample norm: average grad over aug views first, then norm
+    sq_norms = torch.zeros(B, device=x_clean.device)
     for p in gsm.parameters():
         if p.requires_grad and hasattr(p, "grad_sample") and p.grad_sample is not None:
-            sq_norms += p.grad_sample.reshape(B, -1).pow(2).sum(1)
+            gs = p.grad_sample.reshape(B, aug_mult, -1).mean(1)   # (B, dim)
+            sq_norms += gs.pow(2).sum(1)
     scale = torch.clamp(C / sq_norms.sqrt_().clamp_(min=1e-8), max=1.0)
 
-    # Clipped sum + noise → p.grad
-    with torch.no_grad():
-        for p in gsm.parameters():
-            if not p.requires_grad:
-                continue
-            if hasattr(p, "grad_sample") and p.grad_sample is not None:
-                clipped_sum = (
-                    p.grad_sample.reshape(B, -1) * scale[:, None]
-                ).sum(0).reshape(p.shape)
-                noise = torch.randn_like(p) * (sigma * C)
-                p.grad = (clipped_sum + noise) / (q * n_train)
-            else:
-                p.grad = torch.zeros_like(p)
+    agg = []
+    for p in gsm.parameters():
+        if not p.requires_grad:
+            continue
+        if hasattr(p, "grad_sample") and p.grad_sample is not None:
+            gs = p.grad_sample.reshape(B, aug_mult, -1).mean(1)
+            agg.append((gs * scale[:, None]).sum(0).reshape(p.shape))
+        else:
+            agg.append(torch.zeros_like(p))
 
     _clear_grad_samples(gsm)
+    param_iter = (p for p in gsm.parameters() if p.requires_grad)
+    for p, a in zip(param_iter, agg):
+        p.grad = (a + torch.randn_like(a) * (sigma * C)) / (q * n_train)
+
     optimizer.step()
     optimizer.zero_grad()
 
@@ -180,8 +204,8 @@ def _train_shadow(m, data, target_indices, device, shadow_dir):
     n_train    = len(train_idxs)
     q          = BATCH_SIZE / n_train
 
-    # Use augmented dataset for training
-    subset = Subset(data["private_dataset"], train_idxs)
+    # Use noaug dataset — _augment_batch handles all augmentation in the step
+    subset = Subset(data["private_dataset_noaug"], train_idxs)
     use_pin = device.type == "cuda"
     loader = DataLoader(
         subset, batch_size=BATCH_SIZE, shuffle=True,
@@ -191,8 +215,8 @@ def _train_shadow(m, data, target_indices, device, shadow_dir):
     T     = EPOCHS * len(loader)
     sigma = compute_sigma(EPS_TARGET, DELTA, q, T)
     print(
-        f"[P3] shadow {m:02d}: n_train={n_train}, q={q:.4f}, "
-        f"T={T}, sigma={sigma:.4f}, mem_in={membership.sum()}"
+        f"[P3] shadow {m:02d}: n_train={n_train}, q={q:.4f}, T={T}, "
+        f"sigma={sigma:.4f}, aug_mult={AUG_MULT}, mem_in={membership.sum()}"
     )
 
     set_seed(2000 + m)
@@ -207,7 +231,7 @@ def _train_shadow(m, data, target_indices, device, shadow_dir):
     for epoch in range(1, EPOCHS + 1):
         for batch in loader:
             x, y = batch[0].to(device), batch[1].to(device)
-            _dp_step(gsm, opt, x, y, sigma, C_TRAIN, q, n_train, device)
+            _aug_mult_dp_step(gsm, opt, x, y, sigma, C_TRAIN, q, n_train, AUG_MULT)
         sch.step()
         if epoch % 25 == 0 or epoch == EPOCHS:
             acc = evaluate(gsm._module, test_loader, device)
@@ -256,11 +280,11 @@ def _get_or_train_reference(data, device, ref_path):
     from opacus.grad_sample import GradSampleModule
     print("[P3] training fresh reference model (all targets included)...")
 
-    n_train = len(data["private_dataset"])
+    n_train = len(data["private_dataset_noaug"])
     q       = BATCH_SIZE / n_train
     use_pin = device.type == "cuda"
     loader  = DataLoader(
-        data["private_dataset"], batch_size=BATCH_SIZE, shuffle=True,
+        data["private_dataset_noaug"], batch_size=BATCH_SIZE, shuffle=True,
         num_workers=4, pin_memory=use_pin, drop_last=True,
     )
     T     = EPOCHS * len(loader)
@@ -276,7 +300,7 @@ def _get_or_train_reference(data, device, ref_path):
     for epoch in range(1, EPOCHS + 1):
         for batch in loader:
             x, y = batch[0].to(device), batch[1].to(device)
-            _dp_step(gsm, opt, x, y, sigma, C_TRAIN, q, n_train, device)
+            _aug_mult_dp_step(gsm, opt, x, y, sigma, C_TRAIN, q, n_train, AUG_MULT)
         sch.step()
         if epoch % 25 == 0 or epoch == EPOCHS:
             acc = evaluate(gsm._module, test_loader, device)
