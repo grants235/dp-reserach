@@ -298,8 +298,13 @@ def _compute_gradient_matrix(ref_state, data, indices, device, out_dir):
 
 def _run_svd(G_fp32, device, out_dir):
     """
-    Truncated SVD of the centered gradient matrix.
-    Uses torch.linalg.svd on GPU (fast for small n, large d).
+    Truncated SVD of the centered gradient matrix via the Gram matrix trick.
+
+    Since N=2000 << d=1.47M we compute M = G_c G_c^T (2000x2000, ~16 MB) on
+    CPU, eigendecompose it, then recover the right singular vectors:
+        Vt = U_top^T @ G_c / S[:, None]
+    This never allocates a large matrix on GPU, keeping peak CPU RAM ~20 GB.
+
     Returns S (SVD_COMPONENTS,), Vt (SVD_COMPONENTS, d) as float32 numpy arrays.
     """
     S_path  = os.path.join(out_dir, "svd_S.npy")
@@ -308,27 +313,48 @@ def _run_svd(G_fp32, device, out_dir):
         print("[P4] SVD results loaded from disk.")
         return np.load(S_path), np.load(Vt_path).astype(np.float32)
 
-    print(f"[P4] running SVD on ({G_fp32.shape[0]}, {G_fp32.shape[1]}) matrix...")
+    print(f"[P4] running SVD on ({G_fp32.shape[0]}, {G_fp32.shape[1]}) matrix (CPU, Gram trick)...")
     N, d = G_fp32.shape
 
-    # Center
-    G_mean   = G_fp32.mean(axis=0, keepdims=True)           # (1, d)
-    G_c      = G_fp32 - G_mean                              # (N, d) fp32
+    # --- Step 1: centered Gram matrix without forming G_c explicitly ---
+    # G_c G_c^T = G G^T - v 1^T - 1 v^T + mu·mu  (scalar)
+    # where v = G @ mu, mu = col-mean of G
+    print("[P4]   computing Gram matrix...")
+    g_mean = G_fp32.mean(axis=0)                  # (d,)  ~6 MB
+    M      = G_fp32 @ G_fp32.T                    # (N, N) = (2000, 2000)  16 MB
+    v      = G_fp32 @ g_mean                      # (N,)
+    M     -= v[:, None] + v[None, :]
+    M     += float(np.dot(g_mean, g_mean))        # scalar correction
+    # M is now G_c G_c^T (symmetric PSD)
 
-    # Move to GPU for fast SVD (N << d, so full_matrices=False gives min(N,d) = N singular values)
-    G_c_t = torch.from_numpy(G_c).to(device)                # (N, d) fp32 on GPU
-    print(f"[P4] SVD on GPU ({G_c_t.element_size() * G_c_t.numel() / 1e9:.1f} GB)...")
-    _, S_t, Vh_t = torch.linalg.svd(G_c_t, full_matrices=False)
-    # S_t: (N,), Vh_t: (N, d)  — singular values are in descending order
+    # --- Step 2: eigendecompose small (N, N) matrix ---
+    print("[P4]   eigendecomposition of Gram matrix...")
+    eigenvalues, U = np.linalg.eigh(M.astype(np.float64))  # ascending order
+    del M; gc.collect()
 
-    S  = S_t[:SVD_COMPONENTS].cpu().float().numpy()
-    Vt = Vh_t[:SVD_COMPONENTS].cpu().half().numpy()   # (1000, d) fp16 for storage
+    k   = min(SVD_COMPONENTS, N)
+    idx = np.argsort(eigenvalues)[::-1][:k]       # sort descending
+    eigenvalues_top = eigenvalues[idx].clip(0)
+    U_top = U[:, idx].astype(np.float32)          # (N, k)
+    S     = np.sqrt(eigenvalues_top).astype(np.float32)  # (k,)
+    del eigenvalues, U; gc.collect()
+    print(f"[P4]   top-5 singular values: {S[:5]}")
 
-    del G_c_t, S_t, Vh_t
-    if device.type == "cuda": torch.cuda.empty_cache()
+    # --- Step 3: right singular vectors Vt = U_top^T @ G_c / S ---
+    # G_c = G - g_mean, so:
+    # U_top^T @ G_c = U_top^T @ G - (U_top.sum(axis=0))[:, None] * g_mean[None, :]
+    print("[P4]   computing Vt = U^T @ G_c  (~6 GB)...")
+    Vt = U_top.T @ G_fp32                         # (k, d)  ~5.88 GB
+    col_sums = U_top.sum(axis=0)                  # (k,)
+    Vt -= col_sums[:, None] * g_mean[None, :]     # centering correction
+    del g_mean, col_sums, U_top; gc.collect()
 
+    S_safe = np.where(S > 1e-12, S, 1.0)
+    Vt    /= S_safe[:, None]
+
+    Vt16 = Vt.astype(np.float16)
     np.save(S_path, S)
-    np.save(Vt_path, Vt)
+    np.save(Vt_path, Vt16)
     print(f"[P4] SVD saved. Top-5 singular values: {S[:5]}")
     return S, Vt.astype(np.float32)
 
