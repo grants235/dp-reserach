@@ -1,0 +1,8 @@
+=== Tab B-1: Part B Final Test Accuracy ===
+Config           Final acc   Rel. to baseline
+----------------------------------------------
+  Baseline          0.7920        1.000
+  Proj-50           0.1000        0.126
+  Proj-100          0.1000        0.126
+  Proj-500          0.1465        0.185
+  Proj-1000         0.1765        0.223
