@@ -102,9 +102,10 @@ ARMS = {
 # ---------------------------------------------------------------------------
 
 def _cifar10_full(data_root, train=True, augment=False):
-    transforms = get_transforms(augment=augment)
+    train_tf, test_tf = get_transforms(augment=augment)
+    tf = train_tf if train else test_tf
     return torchvision.datasets.CIFAR10(
-        root=data_root, train=train, download=True, transform=transforms
+        root=data_root, train=train, download=True, transform=tf
     )
 
 
