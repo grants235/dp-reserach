@@ -289,31 +289,39 @@ def _gep_sigmas(sigma_van, r, d, opt_split):
     """
     Compute GEP noise multipliers (σ_par, σ_perp) for the two channels.
 
-    Default GEP: σ_par = σ_perp = σ_gep where σ_gep is scaled so that
-    total RDP of both channels equals vanilla RDP:
-        α*(clip0²+clip1²)/(2σ_gep²) = α*1/(2σ_van²)
-        → σ_gep = σ_van * C_MAX
+    The noise multiplier for a channel is std/sensitivity.  In _gep_step:
+      - parallel  channel: std = σ_par * CLIP0, sensitivity = CLIP0  → multiplier = σ_par
+      - perpendicular channel: std = σ_perp * CLIP1, sensitivity = CLIP1 → multiplier = σ_perp
 
-    For optimal split: reallocate the per-channel ε budget according to
-        frac_par = clip0*sqrt(r) / (clip0*sqrt(r) + clip1*sqrt(d-r))
-    while keeping total ε identical, yielding independent σ_par, σ_perp.
+    RDP for two independent Gaussian mechanisms with multipliers σ_par, σ_perp:
+        RDP_total(α) = α/(2σ_par²) + α/(2σ_perp²)
+
+    Default GEP (σ_par = σ_perp = σ_gep), matching vanilla RDP = α/(2σ_van²):
+        α/(2σ_gep²) + α/(2σ_gep²) = α/(2σ_van²)
+        2/σ_gep² = 1/σ_van²
+        → σ_gep = σ_van * sqrt(2)
+
+    For optimal split: budget fractions frac_par, frac_perp (sum to 1) chosen
+    to minimize total gradient noise variance.  The privacy constraint becomes:
+        1/σ_par² + 1/σ_perp² = 1/σ_van²
+    Satisfied by: σ_par = σ_van / sqrt(frac_par),  σ_perp = σ_van / sqrt(frac_perp).
     """
-    sigma_gep = sigma_van * C_MAX   # scalar multiplier for both channels
+    # Default: equal noise multiplier for both channels, matched to vanilla budget
+    sigma_gep = sigma_van * math.sqrt(2)
 
     if not opt_split:
         return sigma_gep, sigma_gep
 
-    # Fractions from the spec's "noise power" formula
+    # Optimal budget fractions (minimise noise variance in gradient space)
     w_par  = CLIP0 * math.sqrt(r)
     w_perp = CLIP1 * math.sqrt(d - r)
     frac_par  = w_par  / (w_par + w_perp)
     frac_perp = w_perp / (w_par + w_perp)
 
-    # From: eps_ch = alpha*clip_ch^2 / (2*sigma_ch^2) = frac_ch * eps_total
-    # and   eps_total = alpha*C_MAX^2 / (2*sigma_gep^2)
-    # → sigma_ch^2 = sigma_gep^2 * clip_ch^2 / (frac_ch * C_MAX^2)
-    sigma_par  = sigma_gep * math.sqrt(CLIP0 ** 2 / (frac_par  * C_MAX_SQ))
-    sigma_perp = sigma_gep * math.sqrt(CLIP1 ** 2 / (frac_perp * C_MAX_SQ))
+    # Privacy constraint: 1/σ_par² + 1/σ_perp² = 1/σ_van²
+    # → σ_par = σ_van/sqrt(frac_par),  σ_perp = σ_van/sqrt(frac_perp)
+    sigma_par  = sigma_van / math.sqrt(frac_par)
+    sigma_perp = sigma_van / math.sqrt(frac_perp)
     return sigma_par, sigma_perp
 
 
@@ -390,9 +398,15 @@ def _gep_step(model, x, y, V, sigma_par, sigma_perp, device):
         del g, c, g_par, g_perp
         torch.cuda.empty_cache()
 
-    # Add Gaussian noise to each channel
-    sum_c    += torch.randn(r, device=device) * (sigma_par  * CLIP0)
-    sum_perp += torch.randn(d, device=device) * (sigma_perp * CLIP1)
+    # Add Gaussian noise to each channel.
+    # Parallel: noise lives in R^r, projected back to d-space via V.
+    sum_c += torch.randn(r, device=device) * (sigma_par * CLIP0)
+    # Perpendicular: sum_perp is already orthogonal to V (g_perp = g - V V^T g).
+    # Project d-dim noise onto the orthogonal complement of V so it doesn't
+    # contaminate the parallel channel when we reconstruct V @ sum_c + sum_perp.
+    noise_perp = torch.randn(d, device=device) * (sigma_perp * CLIP1)
+    noise_perp = noise_perp - V_dev @ (V_dev.T @ noise_perp)
+    sum_perp  += noise_perp
 
     # Reconstruct full gradient
     return (V_dev @ sum_c + sum_perp) / B               # [d]
