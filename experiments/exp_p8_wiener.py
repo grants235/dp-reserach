@@ -322,22 +322,24 @@ def wiener_denoise(noised_grad, basis, N_par, N_perp, wmode="adaptive"):
     g_par  = basis @ coeffs           # [d] — parallel component
     g_perp = noised_grad - g_par      # [d] — perpendicular component
 
-    # Estimated signal power (clamp negative to 0)
-    S_par  = max(0.0, coeffs.norm().item() ** 2 - N_par)
-    S_perp = max(0.0, g_perp.norm().item()  ** 2 - N_perp)
+    # Coherent channel: always keep as-is (w_par = 1 always)
+    w_par = 1.0
+
+    # Incoherent channel: Wiener shrinkage on the perp component only
+    S_perp = max(0.0, g_perp.norm().item() ** 2 - N_perp)
 
     if wmode == "proj":
-        w_par, w_perp = 1.0, 0.0
+        w_perp = 0.0
     elif wmode == "fixed50":
-        w_par, w_perp = 1.0, 0.5
+        w_perp = 0.5
     else:  # adaptive Wiener
-        denom_par  = S_par  + N_par
         denom_perp = S_perp + N_perp
-        w_par  = S_par  / denom_par  if denom_par  > 0 else 0.0
         w_perp = S_perp / denom_perp if denom_perp > 0 else 0.0
 
-    denoised = w_par * g_par + w_perp * g_perp
+    denoised = g_par + w_perp * g_perp
 
+    # S_par kept for diagnostic logging (not used for weight)
+    S_par = max(0.0, coeffs.norm().item() ** 2 - N_par)
     diag = {"S_par": S_par, "S_perp": S_perp,
             "N_par": N_par, "N_perp": N_perp}
     return denoised, w_par, w_perp, diag
@@ -447,28 +449,30 @@ def _gep_step(model, x, y, V, sigma_par, sigma_perp, device, wiener=False,
         result = (V_dev @ sum_c_noisy + sum_perp_noisy) / B
         return result, {}
 
-    # GEP + Wiener: apply shrinkage to each channel separately
+    # GEP + Wiener: coherent channel always kept (w_par=1),
+    # Wiener shrinkage applied to incoherent channel only.
     # Parallel channel: the noised coefficients live in R^r
     N_par_gep  = (sigma_par  * CLIP0) ** 2 * r
     # Perpendicular channel: noise projected onto (d-r)-dim complement
     N_perp_gep = (sigma_perp * CLIP1) ** 2 * (d - r)
 
-    S_par  = max(0.0, sum_c_noisy.norm().item() ** 2 - N_par_gep)
+    w_par = 1.0  # always keep coherent channel
     S_perp = max(0.0, sum_perp_noisy.norm().item() ** 2 - N_perp_gep)
 
     if wmode == "proj":
-        w_par, w_perp = 1.0, 0.0
+        w_perp = 0.0
     elif wmode == "fixed50":
-        w_par, w_perp = 1.0, 0.5
+        w_perp = 0.5
     else:
-        denom_par  = S_par  + N_par_gep
         denom_perp = S_perp + N_perp_gep
-        w_par  = S_par  / denom_par  if denom_par  > 0 else 0.0
         w_perp = S_perp / denom_perp if denom_perp > 0 else 0.0
 
     g_par_noised  = V_dev @ sum_c_noisy    # [d]
     g_perp_noised = sum_perp_noisy         # [d]
-    denoised_sum  = w_par * g_par_noised + w_perp * g_perp_noised
+    denoised_sum  = g_par_noised + w_perp * g_perp_noised
+
+    # S_par kept for diagnostics only
+    S_par = max(0.0, sum_c_noisy.norm().item() ** 2 - N_par_gep)
 
     noised_full = V_dev @ sum_c_noisy + sum_perp_noisy
     shrink = denoised_sum.norm().item() / max(noised_full.norm().item(), 1e-12)
