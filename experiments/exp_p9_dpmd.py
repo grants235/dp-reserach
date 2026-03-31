@@ -129,7 +129,7 @@ ALPHA_SEARCH        = [0.99, 0.95, 0.9, 0.8]
 I_FACTOR_DEFAULT    = 8.0     # Amid et al. i=8: alpha barely decays during 60 epochs
 I_SEARCH            = [2.0, 3.0, 4.0, 5.0, 8.0]
 BETA_DEFAULT        = 1.0     # class-conditional weight (tune with --tune_beta)
-BETA_SEARCH         = [0.1, 0.5, 1.0, 2.0]
+BETA_SEARCH         = [0.5, 1.0, 2.0]
 
 # Experiment subsets
 EXP_A_ARMS = ["vanilla", "vanilla_warm", "gep", "pda_dpmd"]
@@ -383,21 +383,40 @@ def _pretrain_on_public(model, pub_x, pub_y, device, epochs=PRETRAIN_EPOCHS,
 
 
 # ---------------------------------------------------------------------------
-# Compute CW weights from pretrained model (Exp B)
+# Per-step coherence-weighted public gradient (Exp B)
 # ---------------------------------------------------------------------------
 
-def _compute_cw_weights(model, pub_x, pub_y, device):
+def _pub_grad_cw_flat(model, pub_x, pub_y, device, batch_size=PUB_BATCH_SIZE):
     """
-    w_i = 1 / (‖∇ℓ(θ₀; zᵢ)‖ + 1e-6), normalized so mean(w)=1.
-    Computed once from the pretrained model.
-    Returns w: FloatTensor [N_pub].
+    Per-step coherence-weighted public gradient.
+
+    At each call, draw a mini-batch from public data, compute per-sample
+    gradients, weight each by w_i = 1/(‖g_i‖ + 1e-6), return weighted mean.
+
+    Using current model weights (not static pretrained) so the weighting
+    adapts as the model trains — coherent examples (low gradient norm)
+    stay coherent relative to the current loss landscape.
+
+    Returns flat [d] tensor on CPU.
     """
-    print("[P9] Computing CW weights from pretrained model...")
-    grads = _per_sample_grads_all(model, pub_x, pub_y, device)  # [N_pub, d]
-    norms = grads.norm(dim=1)                                     # [N_pub]
-    w = 1.0 / (norms + 1e-6)
-    w = w / w.mean()
-    return w  # [N_pub] on CPU
+    model.eval()
+    N = pub_x.shape[0]
+    # Random mini-batch from public data (no replacement)
+    idx = torch.randperm(N)[:batch_size]
+    xb  = pub_x[idx]   # [B, ...]
+    yb  = pub_y[idx]   # [B]
+
+    grads = _per_sample_grads_chunk(model, xb, yb, device)  # [B, d] on device
+    grads_cpu = grads.cpu()
+    del grads
+    torch.cuda.empty_cache()
+
+    norms = grads_cpu.norm(dim=1)         # [B]
+    w     = 1.0 / (norms + 1e-6)         # [B], high weight for low-norm (coherent)
+    w     = w / w.sum()                   # normalize to sum=1
+
+    g_pub = (w.unsqueeze(1) * grads_cpu).sum(0)  # [d]
+    return g_pub  # [d] on CPU
 
 
 # ---------------------------------------------------------------------------
@@ -405,14 +424,21 @@ def _compute_cw_weights(model, pub_x, pub_y, device):
 # ---------------------------------------------------------------------------
 
 def _vanilla_priv_step(model, x, y, sigma, device):
-    """Clip-sum-noise per-sample DP-SGD. Returns flat [d] / B on CPU."""
+    """
+    Clip-sum-noise per-sample DP-SGD.
+    Returns (noised_grad/B, signal_grad/B) — both flat [d] CPU.
+    signal_grad is the clipped sum (no noise), used for cosine-similarity
+    diagnostics against the public gradient direction.
+    """
     B = x.shape[0]
     grads   = _per_sample_grads_all(model, x, y, device)  # [B, d] CPU
     norms   = grads.norm(dim=1, keepdim=True).clamp(min=1e-8)
     clipped = grads * (CLIP_VAN / norms).clamp(max=1.0)
     sum_g   = clipped.sum(dim=0)                           # [d] CPU
     noise   = torch.randn_like(sum_g) * (sigma * CLIP_VAN)
-    return (sum_g + noise) / B                             # [d] CPU
+    signal  = sum_g / B                                    # noiseless signal estimate
+    noised  = (sum_g + noise) / B
+    return noised, signal                                  # both [d] CPU
 
 
 def _gep_priv_step(model, x, y, V, sigma_par, sigma_perp, device):
@@ -604,11 +630,10 @@ def _train_run(arm_name, ir, eps, seed,
         pretrained_state = {k: v.cpu().clone()
                             for k, v in model.state_dict().items()}
 
-    # Compute CW weights from pretrained model (once)
+    # pda_cw: per-step CW weights computed inside training loop from current model
+    # pda_uniform_w: random weights fixed at initialization (ablation)
     cw_weights = None
-    if arm_cfg["kind"] == "pda" and arm_cfg["pub_mode"] == "cw":
-        cw_weights = _compute_cw_weights(model, pub_x, pub_y, device)
-    elif arm_cfg["kind"] == "pda" and arm_cfg["pub_mode"] == "uniform_w":
+    if arm_cfg["kind"] == "pda" and arm_cfg["pub_mode"] == "uniform_w":
         rng_np = np.random.default_rng(seed)
         w_raw  = torch.from_numpy(rng_np.exponential(1.0, size=len(pub_x))).float()
         cw_weights = w_raw / w_raw.mean()
@@ -647,7 +672,7 @@ def _train_run(arm_name, ir, eps, seed,
 
     fieldnames = ["epoch", "train_loss", "test_acc", "lr"]
     if is_pda:
-        fieldnames += ["alpha_mean"]
+        fieldnames += ["alpha_mean", "cos_pub_priv"]
     if log_per_class:
         fieldnames += [f"acc_c{k}" for k in range(10)]
 
@@ -666,12 +691,13 @@ def _train_run(arm_name, ir, eps, seed,
             V = _build_subspace(model, pub_dataset, R_DIM, device, seed=seed)
 
         alpha_accum = []
+        cos_accum   = []
 
         for x, y in priv_loader:
             optimizer.zero_grad(set_to_none=True)
 
             if arm_cfg["kind"] in ("vanilla", "warm"):
-                flat_priv = _vanilla_priv_step(model, x, y, sigma_van, device)
+                flat_priv, _ = _vanilla_priv_step(model, x, y, sigma_van, device)
                 _set_grads(model, flat_priv.to(device))
 
             elif arm_cfg["kind"] == "gep":
@@ -680,18 +706,18 @@ def _train_run(arm_name, ir, eps, seed,
                 _set_grads(model, flat_grad.to(device))
 
             elif arm_cfg["kind"] == "pda":
-                # Private gradient
-                flat_priv = _vanilla_priv_step(model, x, y, sigma_van, device)
+                # Private gradient (noised) + signal (clipped-only, no noise)
+                flat_priv, priv_signal = _vanilla_priv_step(model, x, y, sigma_van, device)
 
                 # Public gradient (zero privacy cost)
-                pub_mode    = arm_cfg["pub_mode"]
-                class_cond  = arm_cfg["class_cond"]
+                pub_mode   = arm_cfg["pub_mode"]
+                class_cond = arm_cfg["class_cond"]
 
                 if pub_mode == "global":
                     g_pub = _pub_grad_flat(model, pub_x, pub_y, device)
                 elif pub_mode == "cw":
-                    g_pub = _pub_grad_flat(model, pub_x, pub_y, device,
-                                           weights=cw_weights)
+                    # Per-step coherence weighting from current model (not static pretrained)
+                    g_pub = _pub_grad_cw_flat(model, pub_x, pub_y, device)
                 elif pub_mode == "uniform_w":
                     g_pub = _pub_grad_flat(model, pub_x, pub_y, device,
                                            weights=cw_weights)
@@ -704,12 +730,18 @@ def _train_run(arm_name, ir, eps, seed,
                     g_class = _class_grad_flat(model, pub_x, pub_y, device)
                     g_pub   = g_pub + beta * g_class
 
+                # Cosine similarity: direction of public gradient vs private signal
+                # (before norm-matching, so we measure angle not magnitude)
+                g_pub_norm    = g_pub.norm().clamp(min=1e-8)
+                signal_norm   = priv_signal.norm().clamp(min=1e-8)
+                cos_sim = (g_pub @ priv_signal / (g_pub_norm * signal_norm)).item()
+                cos_accum.append(cos_sim)
+
                 # Normalize g_pub to match private gradient scale so alpha controls
                 # direction weight, not magnitude. Without this, the public gradient
                 # (~1000 norm) swamps the private signal (~50 norm) even at alpha=0.9.
                 priv_norm = flat_priv.norm()
-                pub_norm  = g_pub.norm().clamp(min=1e-8)
-                g_pub = g_pub * (priv_norm / pub_norm)
+                g_pub = g_pub * (priv_norm / g_pub_norm)
 
                 # Alpha schedule (three modes, checked in priority order):
                 #   1. fixed:  constant alpha_fixed every step
@@ -746,7 +778,8 @@ def _train_run(arm_name, ir, eps, seed,
             "lr":         f"{cur_lr:.6f}",
         }
         if is_pda and alpha_accum:
-            row["alpha_mean"] = f"{np.mean(alpha_accum):.4f}"
+            row["alpha_mean"]  = f"{np.mean(alpha_accum):.4f}"
+            row["cos_pub_priv"] = f"{np.mean(cos_accum):.4f}" if cos_accum else "nan"
         if log_per_class:
             per_cls = _evaluate_per_class(model, test_loader, device)
             for k in range(10):
@@ -761,8 +794,9 @@ def _train_run(arm_name, ir, eps, seed,
                        os.path.join(out_dir, f"{tag}_best.pt"))
 
         alpha_str = f"  α={np.mean(alpha_accum):.3f}" if alpha_accum else ""
+        cos_str   = f"  cos={np.mean(cos_accum):.3f}"  if cos_accum   else ""
         print(f"  epoch {epoch:3d}/{EPOCHS}  loss={train_loss:.4f}  "
-              f"acc={test_acc:.4f}  best={best_acc:.4f}{alpha_str}")
+              f"acc={test_acc:.4f}  best={best_acc:.4f}{alpha_str}{cos_str}")
 
     csv_file.close()
     torch.save(model.state_dict(), os.path.join(out_dir, f"{tag}_final.pt"))
@@ -846,12 +880,12 @@ def _tune_beta(pub_dataset, priv_dataset, test_dataset,
     Run pda_class at all beta values (IR=50, eps=4, seed=0).
     Saves a CSV summary and returns the best beta.
     """
-    print("\n[P9] === β-tuning for pda_class (IR=50, eps=4, seed=0) ===")
+    print("\n[P9] === β-tuning for pda_class (IR=50, eps=2, seed=0) ===")
     results = {}
     for beta in BETA_SEARCH:
         print(f"\n[P9] β={beta}")
         acc = _train_run(
-            "pda_class", ir=50.0, eps=4.0, seed=0,
+            "pda_class", ir=50.0, eps=2.0, seed=0,
             pub_dataset=pub_dataset, priv_dataset=priv_dataset,
             test_dataset=test_dataset, pub_x=pub_x, pub_y=pub_y,
             device=device, out_dir=out_dir,
@@ -1110,6 +1144,58 @@ def _plot_per_class(arm_names, ir, eps, seed, out_dir):
     print(f"[P9] Saved {path}")
 
 
+def _plot_cos_sim(arm_names, ir, eps, n_seeds, out_dir):
+    """Plot epoch-mean cosine similarity between g_pub and g_priv signal."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    colors = plt.cm.tab10(np.linspace(0, 1, len(arm_names)))
+
+    any_data = False
+    for arm, color in zip(arm_names, colors):
+        runs = []
+        for s in range(n_seeds):
+            rows = _load_csv(arm, ir, eps, s, out_dir)
+            if rows is None or "cos_pub_priv" not in rows[0]:
+                continue
+            try:
+                runs.append([float(r["cos_pub_priv"]) for r in rows])
+            except (KeyError, ValueError):
+                continue
+        if not runs:
+            continue
+        arr = np.array(runs)
+        ep  = np.arange(1, arr.shape[1] + 1)
+        mu  = arr.mean(0)
+        sd  = arr.std(0)
+        ax.plot(ep, mu, label=arm, color=color, lw=1.5)
+        ax.fill_between(ep, mu - sd, mu + sd, alpha=0.15, color=color)
+        any_data = True
+
+    if not any_data:
+        plt.close(fig)
+        return
+
+    ax.axhline(0, color="gray", ls="--", lw=0.8, alpha=0.5)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("cos(g_pub, g_priv signal)")
+    ax.set_title(f"Public–private gradient alignment — IR={ir:.0f}, ε={eps:.0f}")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    stem = "_".join(arm_names[:4]) if len(arm_names) > 4 else "_".join(arm_names)
+    path = os.path.join(out_dir, f"cos_sim_{stem}_ir{ir:.0f}_eps{eps:.0f}.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"[P9] Saved {path}")
+
+
 def _run_analysis(out_dir, n_seeds=N_SEEDS):
     arm_names_A = EXP_A_ARMS
     arm_names_B = EXP_B_ARMS
@@ -1135,14 +1221,18 @@ def _run_analysis(out_dir, n_seeds=N_SEEDS):
 
     # Figures
     _plot_alpha_schedule(out_dir)
+    pda_arms = ["pda_dpmd", "pda_cw", "pda_uniform_w", "pda_class", "pda_class_only"]
     for ir in IR_LIST:
         for eps in EPS_LIST:
             _plot_curves(arm_names_A, ir, eps, n_seeds, out_dir, "Exp A: ")
+            _plot_cos_sim([a for a in arm_names_A if a in pda_arms], ir, eps, n_seeds, out_dir)
         for eps in EXP_B_EPS:
             _plot_curves(arm_names_B, ir, eps, n_seeds, out_dir, "Exp B: ")
+            _plot_cos_sim(arm_names_B, ir, eps, n_seeds, out_dir)
         for eps in EXP_C_EPS:
             _plot_curves(arm_names_C, ir, eps, n_seeds, out_dir, "Exp C: ")
             _plot_per_class(arm_names_C, ir, eps, 0, out_dir)
+            _plot_cos_sim([a for a in arm_names_C if a in pda_arms], ir, eps, n_seeds, out_dir)
 
 
 # ---------------------------------------------------------------------------
