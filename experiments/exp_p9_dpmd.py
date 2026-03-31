@@ -20,10 +20,16 @@ Three experiments testing coherence-informed mirror descent components:
 
 Usage
 -----
-  # K-tuning (run first, Exp A gate):
-  python experiments/exp_p9_dpmd.py --tune_K --gpu 0
+  # Step 1: quick fixed-alpha test (20 min, tells you if mechanism works):
+  python experiments/exp_p9_dpmd.py --arm pda_dpmd --ir 1 --eps 2 --seed 0 --alpha_fixed 0.9 --gpu 0
 
-  # β-tuning (Exp C):
+  # Step 2: search fixed alpha ∈ {0.99, 0.95, 0.9, 0.8} (IR=1, eps=2, seed=0):
+  python experiments/exp_p9_dpmd.py --tune_alpha --gpu 0
+
+  # Step 3: search Amid i-factor ∈ {2,3,4,5,8} (IR=1, eps=2, seed=0):
+  python experiments/exp_p9_dpmd.py --tune_i --gpu 0
+
+  # β-tuning (Exp C, after Exp A is validated):
   python experiments/exp_p9_dpmd.py --tune_beta --gpu 0
 
   # Single arm (parallel dispatch):
@@ -42,10 +48,19 @@ Usage
 
 PDA-DPMD algorithm (Amid et al. 2022, first-order approx)
 ----------------------------------------------------------
-  alpha_t = clamp(cos(π * t / (2K)), 0, 1)
   g_priv  = clip-and-noise(per_sample_grads, C, σ) / B   ← standard DP-SGD
   g_pub   = ∇L_pub(θ_t)                                  ← public, no privacy cost
   θ_{t+1} = θ_t − lr · (alpha_t · g_priv + (1−alpha_t) · g_pub)
+
+Alpha schedule — three modes:
+  1. Fixed (--alpha_fixed 0.9):   alpha_t = const          [fastest to test]
+  2. Amid cosine (--i_factor 8):  alpha_t = cos(π·t / (2·i·T)),  i ∈ {2,3,4,5,8}
+                                  i=8 → alpha barely moves (cos(π/8)≈0.92 at epoch 60)
+                                  i=2 → alpha=0 at t=T (cosine to zero over full run)
+  3. Legacy K (--i_factor as K/T): expressed as multiple of T_steps
+
+Diagnostic: the old K_DEFAULT=1000 with T≈3240 steps was i≈0.3 (alpha→0 by epoch ~19).
+            i_factor=8 (default) keeps alpha ≥ 0.92 throughout all 60 epochs.
 """
 
 import os
@@ -100,10 +115,18 @@ P7_DIR         = "./results/exp_p7"
 PRETRAIN_EPOCHS = 50       # public pretraining epochs (vanilla_warm + pda arms)
 PUB_BATCH_SIZE  = 256      # mini-batch size for public gradient computation
 
-K_DEFAULT      = 1000      # PDA cosine decay steps (tune with --tune_K)
-K_SEARCH       = [100, 200, 500, 1000, 2000]
-BETA_DEFAULT   = 1.0       # class-conditional weight (tune with --tune_beta)
-BETA_SEARCH    = [0.1, 0.5, 1.0, 2.0]
+# Alpha schedule for PDA-DPMD:
+#   Fixed alpha: ALPHA_FIXED_DEFAULT >= 0 uses a constant alpha every step.
+#   Amid schedule: alpha_t = cos(pi * t / (2 * i_factor * T_steps))
+#     i_factor=8 → alpha stays in [cos(π/8), 1] ≈ [0.92, 1.0] across all 60 epochs.
+#     i_factor=2 → alpha cosines to 0 exactly at the last step.
+#   Old K-based formula: K = i_factor * T_steps, so K_old=1000 ≈ i=0.3 (badly too small).
+ALPHA_FIXED_DEFAULT = -1.0    # < 0  → use cosine schedule; >= 0 → fixed constant alpha
+ALPHA_SEARCH        = [0.99, 0.95, 0.9, 0.8]
+I_FACTOR_DEFAULT    = 8.0     # Amid et al. i=8: alpha barely decays during 60 epochs
+I_SEARCH            = [2.0, 3.0, 4.0, 5.0, 8.0]
+BETA_DEFAULT        = 1.0     # class-conditional weight (tune with --tune_beta)
+BETA_SEARCH         = [0.1, 0.5, 1.0, 2.0]
 
 # Experiment subsets
 EXP_A_ARMS = ["vanilla", "vanilla_warm", "gep", "pda_dpmd"]
@@ -513,7 +536,10 @@ def _transfer_baselines(out_dir, p7_dir):
 def _train_run(arm_name, ir, eps, seed,
                pub_dataset, priv_dataset, test_dataset,
                pub_x, pub_y, device, out_dir,
-               p7_dir=P7_DIR, K=K_DEFAULT, beta=BETA_DEFAULT,
+               p7_dir=P7_DIR,
+               alpha_fixed=ALPHA_FIXED_DEFAULT,
+               i_factor=I_FACTOR_DEFAULT,
+               beta=BETA_DEFAULT,
                tag_suffix=""):
     """
     Full training run for (arm, IR, eps, seed).
@@ -549,8 +575,12 @@ def _train_run(arm_name, ir, eps, seed,
     q               = BATCH_SIZE / len(priv_dataset)
     del tmp_loader
 
-    sigma_van = _calibrate_sigma(eps, DELTA, q, T_steps)
-    d         = _num_params(_make_model())
+    sigma_van  = _calibrate_sigma(eps, DELTA, q, T_steps)
+    d          = _num_params(_make_model())
+    # K_schedule = half-period for cosine schedule in steps
+    # alpha_t = cos(pi * step / (2 * i * T)) → at step T: cos(pi/(2i))
+    # i=8 → cos(π/16) ≈ 0.981; barely any decay over 60 epochs
+    K_schedule = i_factor * T_steps
 
     if arm_cfg["kind"] == "gep":
         sigma_par, sigma_perp = _gep_sigmas(sigma_van, R_DIM, d)
@@ -668,8 +698,12 @@ def _train_run(arm_name, ir, eps, seed,
                     g_class = _class_grad_flat(model, pub_x, pub_y, device)
                     g_pub   = g_pub + beta * g_class
 
-                # Alpha schedule: cos(π t / (2K)), clamped to [0, 1]
-                alpha_t = max(0.0, min(1.0, math.cos(math.pi * step_global / (2 * K))))
+                # Alpha: fixed constant OR Amid cosine schedule
+                if alpha_fixed >= 0.0:
+                    alpha_t = float(alpha_fixed)
+                else:
+                    alpha_t = max(0.0, min(1.0,
+                        math.cos(math.pi * step_global / (2.0 * K_schedule))))
                 alpha_accum.append(alpha_t)
 
                 flat_update = alpha_t * flat_priv + (1.0 - alpha_t) * g_pub
@@ -719,37 +753,70 @@ def _train_run(arm_name, ir, eps, seed,
 # K and beta tuning
 # ---------------------------------------------------------------------------
 
-def _tune_K(pub_dataset, priv_dataset, test_dataset,
-            pub_x, pub_y, device, out_dir):
+def _tune_alpha(pub_dataset, priv_dataset, test_dataset,
+                pub_x, pub_y, device, out_dir):
     """
-    Run pda_dpmd at all K values (IR=1, eps=4, seed=0).
-    Saves a CSV summary and returns the best K.
+    Quick diagnostic: run pda_dpmd with fixed alpha ∈ ALPHA_SEARCH
+    (IR=1, eps=2, seed=0 — cheapest setting).
+    Returns the best fixed alpha value.
     """
-    print("\n[P9] === K-tuning for pda_dpmd (IR=1, eps=4, seed=0) ===")
+    print("\n[P9] === Fixed-alpha search for pda_dpmd (IR=1, eps=2, seed=0) ===")
     results = {}
-    for K in K_SEARCH:
-        print(f"\n[P9] K={K}")
+    for alpha in ALPHA_SEARCH:
+        print(f"\n[P9] alpha_fixed={alpha}")
         acc = _train_run(
-            "pda_dpmd", ir=1.0, eps=4.0, seed=0,
+            "pda_dpmd", ir=1.0, eps=2.0, seed=0,
             pub_dataset=pub_dataset, priv_dataset=priv_dataset,
             test_dataset=test_dataset, pub_x=pub_x, pub_y=pub_y,
             device=device, out_dir=out_dir,
-            K=K, tag_suffix=f"_K{K}"
+            alpha_fixed=alpha, tag_suffix=f"_af{alpha}"
         )
-        results[K] = acc
-        print(f"[P9] K={K}  →  test_acc={acc:.4f}")
+        results[alpha] = acc
+        print(f"[P9] alpha={alpha}  →  test_acc={acc:.4f}")
 
-    best_K = max(results, key=results.get)
-    print(f"\n[P9] Best K = {best_K}  (acc={results[best_K]:.4f})")
-
-    summary_path = os.path.join(out_dir, "tune_K_results.csv")
+    best_alpha = max(results, key=results.get)
+    print(f"\n[P9] Best fixed alpha = {best_alpha}  (acc={results[best_alpha]:.4f})")
+    summary_path = os.path.join(out_dir, "tune_alpha_results.csv")
     with open(summary_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["K", "test_acc"])
-        for K, acc in sorted(results.items()):
-            w.writerow([K, f"{acc:.4f}"])
-    print(f"[P9] K-tuning summary: {summary_path}")
-    return best_K
+        w.writerow(["alpha_fixed", "test_acc"])
+        for a, acc in sorted(results.items()):
+            w.writerow([a, f"{acc:.4f}"])
+    print(f"[P9] Alpha-tuning summary: {summary_path}")
+    return best_alpha
+
+
+def _tune_i(pub_dataset, priv_dataset, test_dataset,
+            pub_x, pub_y, device, out_dir):
+    """
+    Run pda_dpmd with Amid cosine schedule at i ∈ I_SEARCH
+    (alpha_t = cos(π*t / (2*i*T))), IR=1, eps=2, seed=0.
+    Returns the best i_factor.
+    """
+    print("\n[P9] === i-factor search for pda_dpmd (IR=1, eps=2, seed=0) ===")
+    results = {}
+    for i in I_SEARCH:
+        print(f"\n[P9] i_factor={i}")
+        acc = _train_run(
+            "pda_dpmd", ir=1.0, eps=2.0, seed=0,
+            pub_dataset=pub_dataset, priv_dataset=priv_dataset,
+            test_dataset=test_dataset, pub_x=pub_x, pub_y=pub_y,
+            device=device, out_dir=out_dir,
+            i_factor=i, tag_suffix=f"_i{i}"
+        )
+        results[i] = acc
+        print(f"[P9] i={i}  →  test_acc={acc:.4f}")
+
+    best_i = max(results, key=results.get)
+    print(f"\n[P9] Best i_factor = {best_i}  (acc={results[best_i]:.4f})")
+    summary_path = os.path.join(out_dir, "tune_i_results.csv")
+    with open(summary_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["i_factor", "test_acc"])
+        for i, acc in sorted(results.items()):
+            w.writerow([i, f"{acc:.4f}"])
+    print(f"[P9] i-factor tuning summary: {summary_path}")
+    return best_i
 
 
 def _tune_beta(pub_dataset, priv_dataset, test_dataset,
@@ -926,7 +993,7 @@ def _plot_curves(arm_names, ir, eps, n_seeds, out_dir, title_prefix=""):
 
 
 def _plot_alpha_schedule(out_dir):
-    """Visualize the alpha_t cosine schedule for each K value."""
+    """Visualize alpha_t for each i-factor and fixed-alpha options."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -934,17 +1001,35 @@ def _plot_alpha_schedule(out_dir):
     except ImportError:
         return
 
-    T = EPOCHS * (45000 // BATCH_SIZE)  # approx steps
-    fig, ax = plt.subplots(figsize=(8, 4))
-    for K in K_SEARCH:
-        t = np.arange(T)
-        alpha = np.clip(np.cos(np.pi * t / (2 * K)), 0, 1)
-        ax.plot(t, alpha, label=f"K={K}")
+    T = EPOCHS * (45000 // BATCH_SIZE)  # approx total steps
+    t = np.arange(T)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+
+    # Left: cosine schedule by i-factor
+    ax = axes[0]
+    colors = plt.cm.viridis(np.linspace(0.1, 0.9, len(I_SEARCH)))
+    for i, color in zip(I_SEARCH, colors):
+        alpha = np.clip(np.cos(np.pi * t / (2.0 * i * T)), 0, 1)
+        ax.plot(t, alpha, label=f"i={i}", color=color, lw=1.5)
     ax.set_xlabel("Training step")
-    ax.set_ylabel("α_t (private weight)")
-    ax.set_title("PDA-DPMD cosine schedule by K")
-    ax.legend()
+    ax.set_ylabel("α_t")
+    ax.set_title("Amid cosine schedule by i-factor\nα_t = cos(πt / (2·i·T))")
+    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
+    ax.axvline(T, color="gray", ls="--", lw=0.8, label="end of training")
+
+    # Right: end-of-training alpha value per i-factor
+    ax = axes[1]
+    end_alphas = [float(np.clip(np.cos(np.pi / (2.0 * i)), 0, 1)) for i in I_SEARCH]
+    ax.bar([str(i) for i in I_SEARCH], end_alphas, color=colors)
+    for j, (i, ea) in enumerate(zip(I_SEARCH, end_alphas)):
+        ax.text(j, ea + 0.01, f"{ea:.3f}", ha="center", fontsize=8)
+    ax.set_xlabel("i-factor")
+    ax.set_ylabel("α at end of training")
+    ax.set_title("Final alpha value by i-factor")
+    ax.set_ylim(0, 1.1)
+    ax.grid(True, alpha=0.3, axis="y")
+
     fig.tight_layout()
     path = os.path.join(out_dir, "alpha_schedule.png")
     fig.savefig(path, dpi=150)
@@ -1053,14 +1138,19 @@ def main():
                     help="Run full experiment A, B, or C")
     ap.add_argument("--all",  action="store_true",
                     help="Run all experiments A+B+C sequentially")
-    ap.add_argument("--tune_K",    action="store_true",
-                    help="Search over K values for pda_dpmd (IR=1, eps=4, seed=0)")
+    ap.add_argument("--tune_alpha", action="store_true",
+                    help="Search fixed alpha ∈ {0.99,0.95,0.9,0.8} (IR=1, eps=2, seed=0)")
+    ap.add_argument("--tune_i",    action="store_true",
+                    help="Search i-factor ∈ {2,3,4,5,8} for cosine schedule (IR=1, eps=2, seed=0)")
     ap.add_argument("--tune_beta", action="store_true",
-                    help="Search over β values for pda_class (IR=50, eps=4, seed=0)")
+                    help="Search β values for pda_class (IR=50, eps=4, seed=0)")
     ap.add_argument("--analysis_only", action="store_true")
     ap.add_argument("--transfer_baselines", action="store_true")
-    ap.add_argument("--K",    type=int,   default=K_DEFAULT,
-                    help=f"PDA cosine decay steps (default {K_DEFAULT})")
+    ap.add_argument("--alpha_fixed", type=float, default=ALPHA_FIXED_DEFAULT,
+                    help="Fixed alpha constant (negative = use cosine schedule)")
+    ap.add_argument("--i_factor",    type=float, default=I_FACTOR_DEFAULT,
+                    help=f"Amid cosine i-factor: K = i*T (default {I_FACTOR_DEFAULT}; "
+                         "i=8 keeps alpha≥0.92 throughout)")
     ap.add_argument("--beta", type=float, default=BETA_DEFAULT,
                     help=f"Class-conditional weight β (default {BETA_DEFAULT})")
     ap.add_argument("--gpu",       type=int, default=0)
@@ -1072,7 +1162,9 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     p7_dir = args.p7_dir
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
-    print(f"[P9] Device: {device}  |  K={args.K}  β={args.beta}")
+    alpha_mode = (f"fixed={args.alpha_fixed}" if args.alpha_fixed >= 0
+                  else f"cosine i={args.i_factor}")
+    print(f"[P9] Device: {device}  |  alpha={alpha_mode}  β={args.beta}")
     print(f"[P9] P7 baseline dir: {p7_dir}")
 
     if args.transfer_baselines:
@@ -1084,7 +1176,8 @@ def main():
         return
 
     # Pre-load datasets (shared across all runs for the same IR in a sweep)
-    def _run_arm_grid(arm_list, ir_list, eps_list, n_seeds, K, beta):
+    def _run_arm_grid(arm_list, ir_list, eps_list, n_seeds,
+                      alpha_fixed, i_factor, beta):
         _transfer_baselines(args.out_dir, p7_dir)
         for ir in ir_list:
             pub_ds, priv_ds, test_ds, cs, pub_x, pub_y = \
@@ -1097,14 +1190,25 @@ def main():
                         _train_run(arm, ir, eps, seed,
                                    pub_ds, priv_ds, test_ds,
                                    pub_x, pub_y, device, args.out_dir,
-                                   p7_dir=p7_dir, K=K, beta=beta)
+                                   p7_dir=p7_dir,
+                                   alpha_fixed=alpha_fixed,
+                                   i_factor=i_factor,
+                                   beta=beta)
 
-    if args.tune_K:
+    if args.tune_alpha:
         pub_ds, priv_ds, test_ds, _, pub_x, pub_y = \
             _build_datasets(1.0, args.data_root)
-        best_K = _tune_K(pub_ds, priv_ds, test_ds, pub_x, pub_y,
+        best_alpha = _tune_alpha(pub_ds, priv_ds, test_ds, pub_x, pub_y,
+                                 device, args.out_dir)
+        print(f"[P9] Recommended: --alpha_fixed {best_alpha}")
+        return
+
+    if args.tune_i:
+        pub_ds, priv_ds, test_ds, _, pub_x, pub_y = \
+            _build_datasets(1.0, args.data_root)
+        best_i = _tune_i(pub_ds, priv_ds, test_ds, pub_x, pub_y,
                          device, args.out_dir)
-        print(f"[P9] Recommended: --K {best_K}")
+        print(f"[P9] Recommended: --i_factor {best_i}")
         return
 
     if args.tune_beta:
@@ -1117,19 +1221,19 @@ def main():
 
     if args.exp == "A":
         _run_arm_grid(EXP_A_ARMS, IR_LIST, EPS_LIST, N_SEEDS,
-                      args.K, args.beta)
+                      args.alpha_fixed, args.i_factor, args.beta)
         _run_analysis(args.out_dir)
         return
 
     if args.exp == "B":
         _run_arm_grid(EXP_B_ARMS, IR_LIST, EXP_B_EPS, N_SEEDS,
-                      args.K, args.beta)
+                      args.alpha_fixed, args.i_factor, args.beta)
         _run_analysis(args.out_dir)
         return
 
     if args.exp == "C":
         _run_arm_grid(EXP_C_ARMS, IR_LIST, EXP_C_EPS, N_SEEDS,
-                      args.K, args.beta)
+                      args.alpha_fixed, args.i_factor, args.beta)
         _run_analysis(args.out_dir)
         return
 
@@ -1139,7 +1243,8 @@ def main():
             (EXP_B_ARMS, EXP_B_EPS),
             (EXP_C_ARMS, EXP_C_EPS),
         ]:
-            _run_arm_grid(exp_arms, IR_LIST, eps_l, N_SEEDS, args.K, args.beta)
+            _run_arm_grid(exp_arms, IR_LIST, eps_l, N_SEEDS,
+                          args.alpha_fixed, args.i_factor, args.beta)
         _run_analysis(args.out_dir)
         return
 
@@ -1155,7 +1260,10 @@ def main():
     _train_run(args.arm, args.ir, args.eps, args.seed,
                pub_ds, priv_ds, test_ds, pub_x, pub_y,
                device, args.out_dir,
-               p7_dir=p7_dir, K=args.K, beta=args.beta)
+               p7_dir=p7_dir,
+               alpha_fixed=args.alpha_fixed,
+               i_factor=args.i_factor,
+               beta=args.beta)
 
 
 if __name__ == "__main__":
