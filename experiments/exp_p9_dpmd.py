@@ -116,12 +116,15 @@ PRETRAIN_EPOCHS = 50       # public pretraining epochs (vanilla_warm + pda arms)
 PUB_BATCH_SIZE  = 256      # mini-batch size for public gradient computation
 
 # Alpha schedule for PDA-DPMD:
-#   Fixed alpha: ALPHA_FIXED_DEFAULT >= 0 uses a constant alpha every step.
-#   Amid schedule: alpha_t = cos(pi * t / (2 * i_factor * T_steps))
-#     i_factor=8 → alpha stays in [cos(π/8), 1] ≈ [0.92, 1.0] across all 60 epochs.
-#     i_factor=2 → alpha cosines to 0 exactly at the last step.
-#   Old K-based formula: K = i_factor * T_steps, so K_old=1000 ≈ i=0.3 (badly too small).
-ALPHA_FIXED_DEFAULT = -1.0    # < 0  → use cosine schedule; >= 0 → fixed constant alpha
+#   Ramp (default):  alpha ramps linearly from alpha_start → 1.0 over first ramp_frac*T steps,
+#                    then stays 1.0 (pure DP-SGD) for the rest.
+#                    Gives geometry benefit early; pure convergence late.
+#   Fixed:           alpha_fixed >= 0 → constant alpha every step.
+#   Amid cosine:     alpha_t = cos(pi * t / (2 * i_factor * T_steps))
+ALPHA_RAMP_DEFAULT  = True    # use linear ramp by default
+ALPHA_START_DEFAULT = 0.9     # starting alpha for ramp (10% public at step 0)
+RAMP_FRAC_DEFAULT   = 0.5     # fraction of T_steps over which alpha ramps to 1.0
+ALPHA_FIXED_DEFAULT = -1.0    # < 0  → use ramp/cosine; >= 0 → fixed constant alpha
 ALPHA_SEARCH        = [0.99, 0.95, 0.9, 0.8]
 I_FACTOR_DEFAULT    = 8.0     # Amid et al. i=8: alpha barely decays during 60 epochs
 I_SEARCH            = [2.0, 3.0, 4.0, 5.0, 8.0]
@@ -538,6 +541,9 @@ def _train_run(arm_name, ir, eps, seed,
                pub_x, pub_y, device, out_dir,
                p7_dir=P7_DIR,
                alpha_fixed=ALPHA_FIXED_DEFAULT,
+               alpha_ramp=ALPHA_RAMP_DEFAULT,
+               alpha_start=ALPHA_START_DEFAULT,
+               ramp_frac=RAMP_FRAC_DEFAULT,
                i_factor=I_FACTOR_DEFAULT,
                beta=BETA_DEFAULT,
                tag_suffix=""):
@@ -705,9 +711,17 @@ def _train_run(arm_name, ir, eps, seed,
                 pub_norm  = g_pub.norm().clamp(min=1e-8)
                 g_pub = g_pub * (priv_norm / pub_norm)
 
-                # Alpha: fixed constant OR Amid cosine schedule
+                # Alpha schedule (three modes, checked in priority order):
+                #   1. fixed:  constant alpha_fixed every step
+                #   2. ramp:   linear alpha_start → 1.0 over first ramp_frac*T steps
+                #   3. cosine: Amid et al. cos(π t / (2 i T))
                 if alpha_fixed >= 0.0:
                     alpha_t = float(alpha_fixed)
+                elif alpha_ramp:
+                    ramp_steps = ramp_frac * T_steps
+                    alpha_t = alpha_start + (1.0 - alpha_start) * min(
+                        1.0, step_global / max(ramp_steps, 1.0)
+                    )
                 else:
                     alpha_t = max(0.0, min(1.0,
                         math.cos(math.pi * step_global / (2.0 * K_schedule))))
@@ -776,7 +790,7 @@ def _tune_alpha(pub_dataset, priv_dataset, test_dataset,
             pub_dataset=pub_dataset, priv_dataset=priv_dataset,
             test_dataset=test_dataset, pub_x=pub_x, pub_y=pub_y,
             device=device, out_dir=out_dir,
-            alpha_fixed=alpha, tag_suffix=f"_af{alpha}"
+            alpha_fixed=alpha, alpha_ramp=False, tag_suffix=f"_af{alpha}"
         )
         results[alpha] = acc
         print(f"[P9] alpha={alpha}  →  test_acc={acc:.4f}")
@@ -809,7 +823,7 @@ def _tune_i(pub_dataset, priv_dataset, test_dataset,
             pub_dataset=pub_dataset, priv_dataset=priv_dataset,
             test_dataset=test_dataset, pub_x=pub_x, pub_y=pub_y,
             device=device, out_dir=out_dir,
-            i_factor=i, tag_suffix=f"_i{i}"
+            i_factor=i, alpha_ramp=False, tag_suffix=f"_i{i}"
         )
         results[i] = acc
         print(f"[P9] i={i}  →  test_acc={acc:.4f}")
@@ -1154,10 +1168,17 @@ def main():
     ap.add_argument("--analysis_only", action="store_true")
     ap.add_argument("--transfer_baselines", action="store_true")
     ap.add_argument("--alpha_fixed", type=float, default=ALPHA_FIXED_DEFAULT,
-                    help="Fixed alpha constant (negative = use cosine schedule)")
+                    help="Fixed alpha constant (negative = use ramp or cosine)")
+    ap.add_argument("--no_ramp", action="store_true",
+                    help="Disable linear ramp; fall back to cosine schedule")
+    ap.add_argument("--alpha_start", type=float, default=ALPHA_START_DEFAULT,
+                    help=f"Starting alpha for ramp mode (default {ALPHA_START_DEFAULT})")
+    ap.add_argument("--ramp_frac",   type=float, default=RAMP_FRAC_DEFAULT,
+                    help=f"Fraction of training over which alpha ramps to 1.0 "
+                         f"(default {RAMP_FRAC_DEFAULT})")
     ap.add_argument("--i_factor",    type=float, default=I_FACTOR_DEFAULT,
                     help=f"Amid cosine i-factor: K = i*T (default {I_FACTOR_DEFAULT}; "
-                         "i=8 keeps alpha≥0.92 throughout)")
+                         "only used when --no_ramp and alpha_fixed<0)")
     ap.add_argument("--beta", type=float, default=BETA_DEFAULT,
                     help=f"Class-conditional weight β (default {BETA_DEFAULT})")
     ap.add_argument("--gpu",       type=int, default=0)
@@ -1169,8 +1190,14 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     p7_dir = args.p7_dir
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
-    alpha_mode = (f"fixed={args.alpha_fixed}" if args.alpha_fixed >= 0
-                  else f"cosine i={args.i_factor}")
+    alpha_ramp = not args.no_ramp
+    if args.alpha_fixed >= 0:
+        alpha_mode = f"fixed={args.alpha_fixed}"
+    elif alpha_ramp:
+        alpha_mode = (f"ramp {args.alpha_start}→1.0 "
+                      f"over first {args.ramp_frac*100:.0f}% of steps")
+    else:
+        alpha_mode = f"cosine i={args.i_factor}"
     print(f"[P9] Device: {device}  |  alpha={alpha_mode}  β={args.beta}")
     print(f"[P9] P7 baseline dir: {p7_dir}")
 
@@ -1184,7 +1211,8 @@ def main():
 
     # Pre-load datasets (shared across all runs for the same IR in a sweep)
     def _run_arm_grid(arm_list, ir_list, eps_list, n_seeds,
-                      alpha_fixed, i_factor, beta):
+                      alpha_fixed, alpha_ramp_, alpha_start, ramp_frac,
+                      i_factor, beta):
         _transfer_baselines(args.out_dir, p7_dir)
         for ir in ir_list:
             pub_ds, priv_ds, test_ds, cs, pub_x, pub_y = \
@@ -1199,6 +1227,9 @@ def main():
                                    pub_x, pub_y, device, args.out_dir,
                                    p7_dir=p7_dir,
                                    alpha_fixed=alpha_fixed,
+                                   alpha_ramp=alpha_ramp_,
+                                   alpha_start=alpha_start,
+                                   ramp_frac=ramp_frac,
                                    i_factor=i_factor,
                                    beta=beta)
 
@@ -1226,21 +1257,24 @@ def main():
         print(f"[P9] Recommended: --beta {best_beta}")
         return
 
+    grid_kwargs = dict(
+        alpha_fixed=args.alpha_fixed, alpha_ramp_=alpha_ramp,
+        alpha_start=args.alpha_start, ramp_frac=args.ramp_frac,
+        i_factor=args.i_factor, beta=args.beta,
+    )
+
     if args.exp == "A":
-        _run_arm_grid(EXP_A_ARMS, IR_LIST, EPS_LIST, N_SEEDS,
-                      args.alpha_fixed, args.i_factor, args.beta)
+        _run_arm_grid(EXP_A_ARMS, IR_LIST, EPS_LIST, N_SEEDS, **grid_kwargs)
         _run_analysis(args.out_dir)
         return
 
     if args.exp == "B":
-        _run_arm_grid(EXP_B_ARMS, IR_LIST, EXP_B_EPS, N_SEEDS,
-                      args.alpha_fixed, args.i_factor, args.beta)
+        _run_arm_grid(EXP_B_ARMS, IR_LIST, EXP_B_EPS, N_SEEDS, **grid_kwargs)
         _run_analysis(args.out_dir)
         return
 
     if args.exp == "C":
-        _run_arm_grid(EXP_C_ARMS, IR_LIST, EXP_C_EPS, N_SEEDS,
-                      args.alpha_fixed, args.i_factor, args.beta)
+        _run_arm_grid(EXP_C_ARMS, IR_LIST, EXP_C_EPS, N_SEEDS, **grid_kwargs)
         _run_analysis(args.out_dir)
         return
 
@@ -1250,8 +1284,7 @@ def main():
             (EXP_B_ARMS, EXP_B_EPS),
             (EXP_C_ARMS, EXP_C_EPS),
         ]:
-            _run_arm_grid(exp_arms, IR_LIST, eps_l, N_SEEDS,
-                          args.alpha_fixed, args.i_factor, args.beta)
+            _run_arm_grid(exp_arms, IR_LIST, eps_l, N_SEEDS, **grid_kwargs)
         _run_analysis(args.out_dir)
         return
 
@@ -1269,6 +1302,9 @@ def main():
                device, args.out_dir,
                p7_dir=p7_dir,
                alpha_fixed=args.alpha_fixed,
+               alpha_ramp=alpha_ramp,
+               alpha_start=args.alpha_start,
+               ramp_frac=args.ramp_frac,
                i_factor=args.i_factor,
                beta=args.beta)
 
