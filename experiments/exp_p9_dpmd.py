@@ -698,6 +698,13 @@ def _train_run(arm_name, ir, eps, seed,
                     g_class = _class_grad_flat(model, pub_x, pub_y, device)
                     g_pub   = g_pub + beta * g_class
 
+                # Normalize g_pub to match private gradient scale so alpha controls
+                # direction weight, not magnitude. Without this, the public gradient
+                # (~1000 norm) swamps the private signal (~50 norm) even at alpha=0.9.
+                priv_norm = flat_priv.norm()
+                pub_norm  = g_pub.norm().clamp(min=1e-8)
+                g_pub = g_pub * (priv_norm / pub_norm)
+
                 # Alpha: fixed constant OR Amid cosine schedule
                 if alpha_fixed >= 0.0:
                     alpha_t = float(alpha_fixed)
