@@ -1,13 +1,23 @@
 """
-Phase 10: CIFAR-100 (Experiment D) and Pretrained Feature Extractor (Experiment E)
-=====================================================================================
+Phase 10: EMNIST (Experiment D) and Pretrained Feature Extractor (Experiment E)
+=================================================================================
 
-Experiment D — CIFAR-100 (from-scratch ResNet-20, 100 classes)
+Experiment D — EMNIST-balanced (from-scratch ResNet-20, 47 classes)
   vanilla          DP-SGD cold start
   vanilla_warm     DP-SGD warm start (pretrain on 2000 public images)
   gep              GEP (variance-PCA subspace, split noise)
   pda_dpmd         PDA-DPMD with linear alpha ramp (alpha_0=0.9, ramp_frac=0.5)
   pda_cw           CW-PDA-DPMD (per-step coherence-weighted public gradient)
+
+EMNIST-balanced: 112,800 train / 18,800 test, 47 classes (digits + upper/lower letters),
+~2,400 per class train.  Grayscale 28×28 upsampled to 32×32 and replicated to 3 channels
+so the same ResNet-20 architecture works without modification.
+
+Why EMNIST instead of CIFAR-100:
+  - 47 classes → more fragmented gradient structure than CIFAR-10's 10
+  - Balanced dataset: no long-tail confound (different from the IR experiments)
+  - Simpler image content means the challenge is purely from the number of classes
+    and privacy noise, isolating the effect of our methods from feature difficulty
 
 Experiment E — Linear probe on pretrained backbone (CIFAR-10, feature-space DP)
   vanilla_ft       DP-SGD on linear head (cold-start random head)
@@ -17,8 +27,8 @@ Experiment E — Linear probe on pretrained backbone (CIFAR-10, feature-space DP
 
 Usage
 -----
-  # Experiment D: CIFAR-100 (quick sweep, 1 seed)
-  python experiments/exp_p10_cifar100_ft.py --exp D --quick --gpu 0
+  # Experiment D: EMNIST (quick sweep, 1 seed)
+  python experiments/exp_p10_cifar100_ft.py --exp D --gpu 0
 
   # Experiment E: linear probe (extract features first, then very fast)
   python experiments/exp_p10_cifar100_ft.py --exp E --backbone clip_vitb32 --gpu 0
@@ -37,7 +47,7 @@ Notes
 -----
 - Exp D arms share code with P9; alpha ramp and norm-matching are default.
 - Exp E extracts features once (cached), then trains an nn.Linear under DP.
-  Linear probe d ≈ 5130 (CLIP) or 20490 (ResNet-50), vs 278K for ResNet-20.
+  Linear probe d ≈ 5130 (CLIP) or 20490 (ResNet-50), vs ~278K for ResNet-20.
   Per-run time: ~2 min (E) vs ~20 min (D).
 - Both experiments log cos_pub_priv for PDA arms.
 """
@@ -59,10 +69,7 @@ import torchvision.transforms as T
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.models import ResNet20
-from src.datasets import (
-    get_cifar100_transforms,
-    make_public_private_split,
-)
+from src.datasets import make_public_private_split
 
 # ---------------------------------------------------------------------------
 # Shared hyperparameters
@@ -85,7 +92,7 @@ ALPHA_START  = 0.9
 RAMP_FRAC    = 0.5       # ramp alpha 0.9→1.0 over first 50% of steps
 
 # ---------------------------------------------------------------------------
-# Experiment D — CIFAR-100 constants
+# Experiment D — EMNIST-balanced constants
 # ---------------------------------------------------------------------------
 
 D_EPOCHS       = 60
@@ -93,15 +100,20 @@ D_BATCH_SIZE   = 1000
 D_LR           = 0.1
 D_MOMENTUM     = 0.9
 D_WEIGHT_DECAY = 5e-4
-D_N_PUB        = 2000      # 20 per class × 100 classes
-D_PUB_FRAC     = 0.04      # 20/500 = 4% per class
-D_R_DIM        = 1000      # GEP subspace rank
+D_N_CLASSES    = 47        # EMNIST balanced: digits 0-9 + upper/lower letters
+D_N_PUB        = 2000      # ~43 per class × 47 classes (cap applied after stratified sample)
+D_PUB_FRAC     = 0.02      # 2% per class → ~48 per class × 47 = 2256, capped to 2000
+D_R_DIM        = 1000      # GEP subspace rank (< D_N_PUB, valid for svd_lowrank)
 D_PUB_BATCH    = 256
 D_EPS_LIST     = [1.0, 2.0, 4.0, 8.0]
 D_N_SEEDS_Q    = 1         # quick sweep
 D_N_SEEDS_F    = 3         # full multi-seed
 D_PRETRAIN_EP  = 50
 D_ARMS         = ["vanilla", "vanilla_warm", "gep", "pda_dpmd", "pda_cw"]
+
+# EMNIST image preprocessing: grayscale 28×28 → 3-channel 32×32 for ResNet-20
+_EMNIST_MEAN = [0.1307, 0.1307, 0.1307]
+_EMNIST_STD  = [0.3081, 0.3081, 0.3081]
 
 # ---------------------------------------------------------------------------
 # Experiment E — linear probe constants
@@ -140,7 +152,7 @@ class LinearProbe(nn.Module):
 
 
 def _make_model_d():
-    return ResNet20(num_classes=100, n_groups=16)
+    return ResNet20(num_classes=D_N_CLASSES, n_groups=16)
 
 
 def _make_model_e(feature_dim: int):
@@ -165,21 +177,23 @@ def _set_grads(model, flat_grad):
 
 def _get_backbone(backbone_name: str, device):
     """
-    Returns (feature_extractor, feature_dim, transform).
-    Tries CLIP → timm → torchvision ResNet-50 in that order.
+    Returns (feature_extractor, feature_dim, transform, actual_name).
+    actual_name is the backbone that was actually loaded (may differ from backbone_name
+    if a fallback occurs, e.g. clip_vitb32 → resnet50 when CLIP is not installed).
     """
     if backbone_name == "clip_vitb32":
         try:
             import clip
             model, preprocess = clip.load("ViT-B/32", device=device)
             model.eval()
-            return model, 512, preprocess
+            return model, 512, preprocess, "clip_vitb32"
         except ImportError:
             print("[P10] CLIP not installed. Falling back to resnet50.")
             backbone_name = "resnet50"
 
     if backbone_name in ("resnet50", "resnet50_torch"):
-        model = torchvision.models.resnet50(pretrained=True)
+        weights = torchvision.models.ResNet50_Weights.DEFAULT
+        model = torchvision.models.resnet50(weights=weights)
         model.fc = nn.Identity()
         model = model.to(device).eval()
         preprocess = T.Compose([
@@ -188,7 +202,7 @@ def _get_backbone(backbone_name: str, device):
             T.ToTensor(),
             T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ])
-        return model, 2048, preprocess
+        return model, 2048, preprocess, "resnet50"
 
     raise ValueError(f"Unknown backbone: {backbone_name!r}. Choose clip_vitb32 or resnet50.")
 
@@ -196,19 +210,20 @@ def _get_backbone(backbone_name: str, device):
 def _extract_or_load(backbone_name: str, data_root: str, cache_dir: str, device):
     """
     Extract CIFAR-10 features from pretrained backbone (L2-normalized) and cache.
-    Returns dict with keys: train_x, train_y, test_x, test_y, feature_dim.
+    Returns dict with keys: train_x, train_y, test_x, test_y, feature_dim, backbone.
     """
     os.makedirs(cache_dir, exist_ok=True)
-    cache_path = os.path.join(cache_dir, f"cifar10_feats_{backbone_name}.pt")
 
+    # Get the actual backbone (may fall back to resnet50 if CLIP not installed)
+    feat_model, feature_dim, preprocess, actual_name = _get_backbone(backbone_name, device)
+
+    cache_path = os.path.join(cache_dir, f"cifar10_feats_{actual_name}.pt")
     if os.path.exists(cache_path):
         print(f"[P10] Loading cached features: {cache_path}")
         return torch.load(cache_path, map_location="cpu")
 
-    print(f"[P10] Extracting CIFAR-10 features with {backbone_name}...")
-    feat_model, feature_dim, preprocess = _get_backbone(backbone_name, device)
-
-    is_clip = backbone_name.startswith("clip")
+    print(f"[P10] Extracting CIFAR-10 features with {actual_name}...")
+    is_clip = actual_name.startswith("clip")
 
     def _do_extract(train: bool):
         ds = torchvision.datasets.CIFAR10(
@@ -224,7 +239,7 @@ def _extract_or_load(backbone_name: str, data_root: str, cache_dir: str, device)
                     f = feat_model.encode_image(x).float()
                 else:
                     f = feat_model(x).float()
-                f = F.normalize(f, dim=1)   # L2-normalize for stable clipping
+                f = F.normalize(f, dim=1)   # L2-normalize for stable per-sample clipping
                 feats.append(f.cpu())
                 labels.append(y)
         return torch.cat(feats, 0), torch.cat(labels, 0)
@@ -234,7 +249,7 @@ def _extract_or_load(backbone_name: str, data_root: str, cache_dir: str, device)
 
     result = dict(train_x=train_x, train_y=train_y,
                   test_x=test_x,   test_y=test_y,
-                  feature_dim=feature_dim, backbone=backbone_name)
+                  feature_dim=feature_dim, backbone=actual_name)
     torch.save(result, cache_path)
     print(f"[P10] Saved: {cache_path}  (dim={feature_dim})")
     return result
@@ -273,19 +288,39 @@ def _build_e_datasets(feats: dict, seed: int = 42):
 
 
 # ---------------------------------------------------------------------------
-# CIFAR-100 datasets (Exp D)
+# EMNIST-balanced datasets (Exp D)
 # ---------------------------------------------------------------------------
+
+def _emnist_transforms(augment: bool):
+    """
+    EMNIST-balanced → ResNet-20 compatible transform.
+    Converts 1-channel 28×28 grayscale to 3-channel 32×32.
+    No horizontal flip (would flip letters/digits meaninglessly).
+    """
+    base = [
+        T.Grayscale(num_output_channels=3),   # 1-ch → 3-ch (replicate)
+        T.Resize(32),                           # 28×28 → 32×32
+    ]
+    if augment:
+        base.append(T.RandomCrop(32, padding=4))
+    base += [
+        T.ToTensor(),
+        T.Normalize(_EMNIST_MEAN, _EMNIST_STD),
+    ]
+    return T.Compose(base)
+
 
 def _build_d_datasets(data_root: str, seed: int = 42):
     """
-    Public (20 per class = 2000 total) + private split for CIFAR-100.
+    Public (~43 per class, capped at 2000 total) + private split for EMNIST-balanced.
     Returns: pub_dataset, priv_dataset, test_dataset, pub_x, pub_y, class_sizes.
     """
-    train_tf_aug,  _     = get_cifar100_transforms(augment=True)
-    train_tf_noaug, test_tf = get_cifar100_transforms(augment=False)
+    tf_noaug = _emnist_transforms(augment=False)
+    tf_aug   = _emnist_transforms(augment=True)
 
-    full_train = torchvision.datasets.CIFAR100(
-        root=data_root, train=True, download=True, transform=train_tf_noaug
+    full_train = torchvision.datasets.EMNIST(
+        root=data_root, split="balanced", train=True,
+        download=True, transform=tf_noaug
     )
     full_targets = np.array(full_train.targets)
     all_idx = np.arange(len(full_train))
@@ -294,26 +329,29 @@ def _build_d_datasets(data_root: str, seed: int = 42):
         all_idx, full_targets, public_frac=D_PUB_FRAC, seed=seed
     )
 
+    # Cap public set at D_N_PUB while keeping stratification
     rng = np.random.default_rng(seed)
     perm = rng.permutation(len(pub_idx))
     pub_idx_use = pub_idx[perm[:D_N_PUB]]
 
     pub_dataset  = Subset(full_train, pub_idx_use.tolist())
     priv_dataset = Subset(
-        torchvision.datasets.CIFAR100(
-            root=data_root, train=True, download=False, transform=train_tf_aug
+        torchvision.datasets.EMNIST(
+            root=data_root, split="balanced", train=True,
+            download=False, transform=tf_aug
         ),
         priv_idx.tolist(),
     )
-    test_dataset = torchvision.datasets.CIFAR100(
-        root=data_root, train=False, download=True, transform=test_tf
+    test_dataset = torchvision.datasets.EMNIST(
+        root=data_root, split="balanced", train=False,
+        download=True, transform=tf_noaug
     )
 
     pub_x = torch.stack([pub_dataset[i][0] for i in range(len(pub_dataset))])
     pub_y = torch.tensor([pub_dataset[i][1] for i in range(len(pub_dataset))],
                          dtype=torch.long)
 
-    class_sizes = np.bincount(full_targets[pub_idx_use], minlength=100)
+    class_sizes = np.bincount(full_targets[pub_idx_use], minlength=D_N_CLASSES)
     return pub_dataset, priv_dataset, test_dataset, pub_x, pub_y, class_sizes
 
 
@@ -766,7 +804,8 @@ def run_exp_d(arm_names, eps_list, n_seeds, data_root, device, out_dir):
     """Run Experiment D: CIFAR-100 from-scratch."""
     pub_ds, priv_ds, test_ds, pub_x, pub_y, class_sizes = \
         _build_d_datasets(data_root, seed=42)
-    print(f"[P10] Exp D: CIFAR-100  pub={len(pub_ds)}  priv={len(priv_ds)}")
+    print(f"[P10] Exp D: EMNIST-balanced ({D_N_CLASSES} classes)  "
+          f"pub={len(pub_ds)}  priv={len(priv_ds)}")
     print(f"[P10] Class sizes (pub): {class_sizes[:10]}...{class_sizes[-5:]}")
 
     for arm in arm_names:
@@ -978,7 +1017,7 @@ def _plot_cos_sim(arm_names, eps, n_seeds, out_dir, title_prefix=""):
 
 
 def _run_analysis(out_dir, n_seeds_d=D_N_SEEDS_Q, n_seeds_e=E_N_SEEDS):
-    print("\n[P10] ===== EXPERIMENT D: CIFAR-100 =====")
+    print("\n[P10] ===== EXPERIMENT D: EMNIST-balanced (47 classes) =====")
     _print_table("Final accuracy — Exp D", _final_acc,
                  D_ARMS, D_EPS_LIST, n_seeds_d, out_dir)
     _print_table("Best accuracy — Exp D",  _best_acc,
@@ -996,7 +1035,7 @@ def _run_analysis(out_dir, n_seeds_d=D_N_SEEDS_Q, n_seeds_e=E_N_SEEDS):
     pda_d = [a for a in D_ARMS if "pda" in a]
     pda_e = [a for a in E_ARMS if "pda" in a]
     for eps in D_EPS_LIST:
-        _plot_curves(D_ARMS, eps, n_seeds_d, out_dir, "Exp D CIFAR-100: ")
+        _plot_curves(D_ARMS, eps, n_seeds_d, out_dir, "Exp D EMNIST: ")
         _plot_cos_sim(pda_d, eps, n_seeds_d, out_dir, "Exp D: ")
     for eps in E_EPS_LIST:
         _plot_curves(E_ARMS, eps, n_seeds_e, out_dir, "Exp E linear probe: ")
