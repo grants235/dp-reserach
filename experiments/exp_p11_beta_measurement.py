@@ -50,7 +50,7 @@ import torchvision
 import torchvision.transforms as T
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from src.models import WideResNet
+from src.models import ResNet20
 from src.datasets import make_public_private_split
 
 # ---------------------------------------------------------------------------
@@ -148,7 +148,7 @@ def _subsample_private(priv_noaug, priv_idx, n_total, seed=42):
 # ---------------------------------------------------------------------------
 
 def _make_model():
-    return WideResNet(depth=28, widen_factor=2, num_classes=10, n_groups=16)
+    return ResNet20(num_classes=10, n_groups=16)
 
 
 def _num_params(model):
@@ -296,18 +296,24 @@ def _train_vanilla_warm(priv_ds, test_ds, pub_x, pub_y, device, out_dir,
     priv_loader = DataLoader(priv_ds, batch_size=BATCH_SIZE, shuffle=True,
                              num_workers=4, pin_memory=True, drop_last=True)
 
+    d = sum(p.numel() for p in model.parameters())
+
     for epoch in range(1, EPOCHS + 1):
         model.train()
         for x, y in priv_loader:
             optimizer.zero_grad(set_to_none=True)
-            B      = x.shape[0]
-            grads  = _per_sample_grads_all(model, x, y, device)
-            norms  = grads.norm(dim=1, keepdim=True).clamp(min=1e-8)
-            clipped = grads * (CLIP_C / norms).clamp(max=1.0)
-            sum_g  = clipped.sum(0)
+            B = x.shape[0]
+            # Clip-and-sum on GPU in chunks — never store full [B, d] matrix
+            sum_g = torch.zeros(d, device=device)
+            for i in range(0, B, GRAD_CHUNK):
+                xc = x[i:i+GRAD_CHUNK]; yc = y[i:i+GRAD_CHUNK]
+                gc = _per_sample_grads_chunk(model, xc, yc, device)  # [C, d]
+                nc = gc.norm(dim=1, keepdim=True).clamp(min=1e-8)
+                sum_g += (gc * (CLIP_C / nc).clamp(max=1.0)).sum(0)
+                del gc, nc; torch.cuda.empty_cache()
             noise  = torch.randn_like(sum_g) * (sigma * CLIP_C)
             flat_g = (sum_g + noise) / B
-            _set_grads(model, flat_g.to(device))
+            _set_grads(model, flat_g)
             optimizer.step()
         scheduler.step()
 
@@ -354,38 +360,54 @@ def _compute_public_pca(model, pub_x, pub_y, device, max_rank=MAX_RANK):
 
 def _compute_beta_spectrum(model, sub_ds, device, V_pub, ranks):
     """
-    For each private example in sub_ds, compute per-sample clipped gradient
-    and beta_i^(r) for each rank r.
+    Streaming computation of beta_i^(r) for each private example and each rank r.
+    Processes examples in chunks of GRAD_CHUNK to avoid storing the full [N, d]
+    gradient matrix in CPU RAM.
 
     Returns:
       betas: dict {r: np.array([beta_i for each example])}
     """
-    n  = len(sub_ds)
-    xs = torch.stack([sub_ds[i][0] for i in range(n)])
-    ys = torch.tensor([sub_ds[i][1] for i in range(n)], dtype=torch.long)
+    n    = len(sub_ds)
+    V    = V_pub.float().to(device)          # [d, max_rank] — keep on GPU
+    betas_acc = {r: [] for r in ranks}       # accumulate per-example scalars
 
-    print(f"[P11-E1] Computing per-sample gradients for {n} examples...")
-    G = _per_sample_grads_all(model, xs, ys, device)  # [n, d] CPU
-    norms   = G.norm(dim=1, keepdim=True).clamp(min=1e-8)
-    G_clip  = G * (CLIP_C / norms).clamp(max=1.0)    # [n, d]
-    g_norms2 = G_clip.norm(dim=1).pow(2)              # [n]
+    print(f"[P11-E1] Computing beta spectrum for {n} examples (streaming)...")
+    for start in range(0, n, GRAD_CHUNK):
+        end   = min(start + GRAD_CHUNK, n)
+        xs_c  = torch.stack([sub_ds[i][0] for i in range(start, end)])
+        ys_c  = torch.tensor([sub_ds[i][1] for i in range(start, end)],
+                              dtype=torch.long)
 
-    betas = {}
-    V = V_pub.float()  # [d, max_rank]
+        # Per-sample gradients for this chunk, kept on GPU
+        g_chunk = _per_sample_grads_chunk(model, xs_c, ys_c, device)  # [C, d]
+
+        # Clip
+        norms   = g_chunk.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        g_clip  = g_chunk * (CLIP_C / norms).clamp(max=1.0)           # [C, d]
+        g_norm2 = g_clip.norm(dim=1).pow(2).clamp(min=1e-12)          # [C]
+
+        # Project onto subspace for each rank (single matmul, slice for each r)
+        coords = g_clip @ V          # [C, max_rank]
+
+        for r in ranks:
+            r_act = min(r, V.shape[1])
+            par_norm2 = coords[:, :r_act].pow(2).sum(dim=1)    # [C]
+            beta_r = (1.0 - par_norm2 / g_norm2).clamp(0.0, 1.0)
+            betas_acc[r].extend(beta_r.cpu().tolist())
+
+        del g_chunk, g_clip, g_norm2, coords
+        torch.cuda.empty_cache()
+
+        if (start // GRAD_CHUNK) % 20 == 0:
+            print(f"  ...{end}/{n} examples done")
+
+    betas = {r: np.array(betas_acc[r]) for r in ranks}
     for r in ranks:
-        r_actual = min(r, V.shape[1])
-        Vr = V[:, :r_actual]           # [d, r]
-        # Projection: proj_i = Vr @ (Vr.T @ g_i)
-        # ||P_r g_i||^2 = ||Vr.T g_i||^2
-        coords = G_clip.float() @ Vr   # [n, r]
-        par_norm2 = coords.pow(2).sum(dim=1)   # [n]
-        safe_denom = g_norms2.clamp(min=1e-12)
-        beta_r = 1.0 - (par_norm2 / safe_denom)
-        beta_r = beta_r.clamp(0.0, 1.0)
-        betas[r] = beta_r.numpy()
-        print(f"    r={r_actual:4d}  beta_95={np.percentile(betas[r], 95):.4f}"
-              f"  beta_mean={betas[r].mean():.4f}  beta_max={betas[r].max():.4f}")
+        b = betas[r]
+        print(f"    r={min(r, V.shape[1]):4d}  beta_95={np.percentile(b, 95):.4f}"
+              f"  beta_mean={b.mean():.4f}  beta_max={b.max():.4f}")
 
+    V.cpu(); del V; torch.cuda.empty_cache()
     return betas
 
 

@@ -50,7 +50,7 @@ import torchvision
 import torchvision.transforms as T
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from src.models import WideResNet
+from src.models import ResNet20
 from src.datasets import make_public_private_split
 
 # ---------------------------------------------------------------------------
@@ -124,7 +124,7 @@ def _build_datasets(data_root, seed=42):
 # ---------------------------------------------------------------------------
 
 def _make_model():
-    return WideResNet(depth=28, widen_factor=2, num_classes=10, n_groups=16)
+    return ResNet20(num_classes=10, n_groups=16)
 
 
 def _set_grads(model, flat_grad):
