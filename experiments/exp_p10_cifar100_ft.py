@@ -615,6 +615,7 @@ def _train_run(arm_name, exp, eps, seed,
                pub_batch=D_PUB_BATCH,
                make_model_fn=None,
                pub_dataset=None,
+               n_classes=10,
                tag_suffix=""):
     """
     Core DP training loop — works for both Exp D (CIFAR-100) and Exp E (linear probe).
