@@ -402,15 +402,18 @@ def _train_run(arm_name, eps, seed, pub_ds, priv_ds, test_ds,
     if arm_name == "dist_aware":
         if beta95 is None:
             raise ValueError("dist_aware arm requires --beta95 (from Exp 1 gate check).")
-        # Reduced noise: sigma' = sigma_van / sqrt(beta95)
-        # Claim: (eps, delta)-DP for distributions with beta* <= beta95
-        sigma_use = sigma_van / math.sqrt(beta95)
+        # Absolute noise scale = sigma_van * C_eff  (REDUCED vs sigma_van * C)
+        # C_eff = C * sqrt(beta95) is the claimed effective sensitivity.
+        # The accountant still achieves (eps, delta)-DP at this noise/sensitivity ratio.
+        # sigma_use stores the absolute noise scale (not the multiplier).
         c_eff     = CLIP_C * math.sqrt(beta95)
-        print(f"[P11-E2] dist_aware: beta95={beta95:.4f}, "
-              f"sigma_van={sigma_van:.4f} → sigma_use={sigma_use:.4f} "
-              f"(reduction {sigma_use/sigma_van:.3f}x)")
+        sigma_use = sigma_van * c_eff   # = sigma_van * C * sqrt(beta95) < sigma_van * C
+        noise_reduction = math.sqrt(beta95)
+        print(f"[P11-E2] dist_aware: beta95={beta95:.4f}, c_eff={c_eff:.4f}, "
+              f"noise scale: {sigma_van*CLIP_C:.4f} → {sigma_use:.4f} "
+              f"(reduction {noise_reduction:.3f}x, sqrt(beta95)={noise_reduction:.3f})")
     else:
-        sigma_use = sigma_van
+        sigma_use = sigma_van * CLIP_C  # standard absolute noise scale
         c_eff     = CLIP_C
 
     d = _num_params(_make_model())
@@ -481,17 +484,11 @@ def _train_run(arm_name, eps, seed, pub_ds, priv_ds, test_ds,
             sum_g   = clipped.sum(0)
 
             if arm_name in ("vanilla_warm", "dist_aware"):
-                noise  = torch.randn_like(sum_g) * (sigma_use * CLIP_C)
+                # sigma_use is the absolute noise scale (sigma_van*C for vanilla,
+                # sigma_van*C_eff for dist_aware — already computed above)
+                noise  = torch.randn_like(sum_g) * sigma_use
                 flat_g = (sum_g + noise) / B
                 _set_grads(model, flat_g.to(device))
-
-                # Track empirical beta violation for dist_aware
-                if arm_name == "dist_aware" and r_star is not None:
-                    # Approximate: use mean clipped gradient norm as proxy
-                    # Full computation too expensive per step; track batch max perp norm
-                    g_mean = sum_g / B
-                    epoch_perp_max = max(epoch_perp_max,
-                                        (g_mean - g_mean * 0).norm().item())
 
             elif arm_name == "gep":
                 V_dev  = V.to(device)
@@ -517,7 +514,7 @@ def _train_run(arm_name, eps, seed, pub_ds, priv_ds, test_ds,
 
             elif arm_name == "pda_cw":
                 signal  = sum_g / B
-                noise   = torch.randn_like(sum_g) * (sigma_use * CLIP_C)
+                noise   = torch.randn_like(sum_g) * sigma_use  # sigma_use = sigma_van*C here
                 flat_priv = (sum_g + noise) / B
 
                 g_pub      = _pub_grad_cw_flat(model, pub_x, pub_y, device)
