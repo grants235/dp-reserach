@@ -79,7 +79,11 @@ RESULTS_DIR   = "./results/exp_p11"
 EXP1_DIR = os.path.join(RESULTS_DIR, "exp1")
 P9_DIR   = "./results/exp_p9"
 
-ARMS = ["vanilla_warm", "dist_aware", "gep", "pda_cw"]
+ARMS = ["vanilla_warm", "dist_aware", "gep", "pda_cw", "pda_dpmd"]
+
+# Amid cosine alpha schedule for pda_dpmd: alpha_t = cos(π*t / (2*i*T))
+# i_factor=8 keeps alpha ≥ 0.92 throughout 60 epochs (barely moves)
+I_FACTOR = 8
 
 # Tag convention for P9 reuse:
 # P9 saves: {arm}_ir1_eps2_seed{s}.csv   (balanced CIFAR-10 = IR=1)
@@ -373,8 +377,8 @@ def _train_run(arm_name, eps, seed, pub_ds, priv_ds, test_ds,
     tag      = f"{arm_name}_eps{eps:.0f}_seed{seed}"
     csv_path = os.path.join(out_dir, f"{tag}.csv")
 
-    # Reuse P9 baselines where possible (vanilla_warm, pda_cw)
-    if arm_name in ("vanilla_warm", "pda_cw") and p9_dir:
+    # Reuse P9 baselines where possible (vanilla_warm, pda_cw, pda_dpmd)
+    if arm_name in ("vanilla_warm", "pda_cw", "pda_dpmd") and p9_dir:
         if _try_reuse_p9(arm_name, eps, seed, out_dir, p9_dir):
             with open(csv_path) as f:
                 rows = list(csv.DictReader(f))
@@ -423,8 +427,8 @@ def _train_run(arm_name, eps, seed, pub_ds, priv_ds, test_ds,
 
     # Model
     model = _make_model().to(device)
-    is_pda = arm_name == "pda_cw"
-    needs_pretrain = arm_name in ("vanilla_warm", "dist_aware", "gep", "pda_cw")
+    is_pda = arm_name in ("pda_cw", "pda_dpmd")
+    needs_pretrain = arm_name in ("vanilla_warm", "dist_aware", "gep", "pda_cw", "pda_dpmd")
 
     if needs_pretrain:
         print(f"[P11-E2] Pretraining ({PRETRAIN_EPOCHS} ep)...")
@@ -451,7 +455,7 @@ def _train_run(arm_name, eps, seed, pub_ds, priv_ds, test_ds,
     perp_norms_max = [] if arm_name == "dist_aware" else None
 
     fieldnames = ["epoch", "train_loss", "test_acc", "lr"]
-    if arm_name == "pda_cw":
+    if arm_name in ("pda_cw", "pda_dpmd"):
         fieldnames += ["alpha_mean", "cos_pub_priv"]
     if arm_name == "dist_aware":
         fieldnames += ["max_perp_norm"]
@@ -532,6 +536,30 @@ def _train_run(arm_name, eps, seed, pub_ds, priv_ds, test_ds,
                 flat_g = alpha_t * flat_priv + (1.0 - alpha_t) * g_pub
                 _set_grads(model, flat_g.to(device))
 
+            elif arm_name == "pda_dpmd":
+                # PDA-DPMD (Amid et al. 2022): blend noisy private gradient with
+                # the global public gradient using the Amid cosine alpha schedule.
+                signal    = sum_g / B
+                noise     = torch.randn_like(sum_g) * sigma_use
+                flat_priv = (sum_g + noise) / B
+
+                g_pub      = _pub_grad_flat(model, pub_x, pub_y, device)
+                g_pub_norm = g_pub.norm().clamp(min=1e-8)
+                signal_norm = signal.norm().clamp(min=1e-8)
+                cos_sim = (g_pub @ signal / (g_pub_norm * signal_norm)).item()
+                cos_accum.append(cos_sim)
+
+                # Normalize g_pub to private gradient scale (direction only)
+                priv_norm = flat_priv.norm()
+                g_pub     = g_pub * (priv_norm / g_pub_norm)
+
+                # Amid cosine schedule: alpha_t = cos(π*t / (2*i*T))
+                alpha_t = max(0.0, min(1.0,
+                    math.cos(math.pi * step_global / (2.0 * I_FACTOR * T_steps))))
+                alpha_accum.append(alpha_t)
+                flat_g = alpha_t * flat_priv + (1.0 - alpha_t) * g_pub
+                _set_grads(model, flat_g.to(device))
+
             optimizer.step()
             step_global += 1
 
@@ -543,7 +571,7 @@ def _train_run(arm_name, eps, seed, pub_ds, priv_ds, test_ds,
 
         row = {"epoch": epoch, "train_loss": f"{train_loss:.4f}",
                "test_acc": f"{test_acc:.4f}", "lr": f"{cur_lr:.6f}"}
-        if arm_name == "pda_cw":
+        if arm_name in ("pda_cw", "pda_dpmd"):
             row["alpha_mean"]   = f"{np.mean(alpha_accum):.4f}" if alpha_accum else "nan"
             row["cos_pub_priv"] = f"{np.mean(cos_accum):.4f}"   if cos_accum   else "nan"
         if arm_name == "dist_aware":
@@ -743,7 +771,7 @@ def main():
 
     if args.transfer_p9:
         os.makedirs(args.out_dir, exist_ok=True)
-        for arm in ("vanilla_warm", "pda_cw", "gep"):
+        for arm in ("vanilla_warm", "pda_cw", "pda_dpmd", "gep"):
             for seed in range(args.n_seeds):
                 _try_reuse_p9(arm, args.eps, seed, args.out_dir, args.p9_dir)
         return
