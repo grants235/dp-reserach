@@ -592,8 +592,8 @@ def _print_summary(out_dir):
             print(f"  {arm_name:<20} {'N/A':>3}")
             continue
         accs     = [float(r["test_acc"]) for r in rows]
-        fbs      = [float(r["fallback_frac"]) for r in rows]
-        nes      = [float(r["noise_energy_mean"]) for r in rows]
+        fbs      = [float(r.get("fallback_frac", 0.0)) for r in rows]
+        nes      = [float(r.get("noise_energy_mean", 0.0)) for r in rows]
         acc_str  = f"{np.mean(accs)*100:.2f}±{np.std(accs)*100:.2f}%"
         fb_str   = f"{np.mean(fbs)*100:.1f}%"
         ne_str   = f"{np.mean(nes):.1f}"
@@ -655,7 +655,7 @@ def _print_per_epoch_curves(out_dir, results=None):
             with open(csv_path) as f:
                 for row in csv.DictReader(f):
                     ep = int(row["epoch"])
-                    fb = float(row["fallback_frac"])
+                    fb = float(row.get("fallback_frac", 0.0))
                     if ep not in fallback_by_epoch:
                         fallback_by_epoch[ep] = []
                     fallback_by_epoch[ep].append(fb)
@@ -699,7 +699,7 @@ def _plot_results(out_dir):
                     if ep not in seed_data:
                         seed_data[ep] = {"accs": [], "fbs": []}
                     seed_data[ep]["accs"].append(float(row["test_acc"]))
-                    seed_data[ep]["fbs"].append(float(row["fallback_frac"]))
+                    seed_data[ep]["fbs"].append(float(row.get("fallback_frac", 0.0)))
         for ep in sorted(seed_data):
             curves[arm_name]["epochs"].append(ep)
             curves[arm_name]["accs"].append(np.mean(seed_data[ep]["accs"]))
