@@ -79,7 +79,7 @@ RESULTS_DIR   = "./results/exp_p11"
 EXP1_DIR = os.path.join(RESULTS_DIR, "exp1")
 P9_DIR   = "./results/exp_p9"
 
-ARMS = ["vanilla_warm", "dist_aware", "gep", "pda_cw", "pda_dpmd"]
+ARMS = ["vanilla_warm", "dist_aware", "gep", "pda_cw", "pda_dpmd", "pda_dpmd_da"]
 
 # Amid cosine alpha schedule for pda_dpmd: alpha_t = cos(π*t / (2*i*T))
 # i_factor=8 keeps alpha ≥ 0.92 throughout 60 epochs (barely moves)
@@ -403,9 +403,9 @@ def _train_run(arm_name, eps, seed, pub_ds, priv_ds, test_ds,
 
     sigma_van = _calibrate_sigma(eps, DELTA, q, T_steps)
 
-    if arm_name == "dist_aware":
+    if arm_name in ("dist_aware", "pda_dpmd_da"):
         if beta95 is None:
-            raise ValueError("dist_aware arm requires --beta95 (from Exp 1 gate check).")
+            raise ValueError(f"{arm_name} arm requires --beta95 (from Exp 1 gate check).")
         # Absolute noise scale = sigma_van * C_eff  (REDUCED vs sigma_van * C)
         # C_eff = C * sqrt(beta95) is the claimed effective sensitivity.
         # The accountant still achieves (eps, delta)-DP at this noise/sensitivity ratio.
@@ -427,8 +427,8 @@ def _train_run(arm_name, eps, seed, pub_ds, priv_ds, test_ds,
 
     # Model
     model = _make_model().to(device)
-    is_pda = arm_name in ("pda_cw", "pda_dpmd")
-    needs_pretrain = arm_name in ("vanilla_warm", "dist_aware", "gep", "pda_cw", "pda_dpmd")
+    is_pda = arm_name in ("pda_cw", "pda_dpmd", "pda_dpmd_da")
+    needs_pretrain = arm_name in ("vanilla_warm", "dist_aware", "gep", "pda_cw", "pda_dpmd", "pda_dpmd_da")
 
     if needs_pretrain:
         print(f"[P11-E2] Pretraining ({PRETRAIN_EPOCHS} ep)...")
@@ -455,9 +455,9 @@ def _train_run(arm_name, eps, seed, pub_ds, priv_ds, test_ds,
     perp_norms_max = [] if arm_name == "dist_aware" else None
 
     fieldnames = ["epoch", "train_loss", "test_acc", "lr"]
-    if arm_name in ("pda_cw", "pda_dpmd"):
+    if arm_name in ("pda_cw", "pda_dpmd", "pda_dpmd_da"):
         fieldnames += ["alpha_mean", "cos_pub_priv"]
-    if arm_name == "dist_aware":
+    if arm_name in ("dist_aware", "pda_dpmd_da"):
         fieldnames += ["max_perp_norm"]
 
     csv_file = open(csv_path, "w", newline="")
@@ -536,9 +536,11 @@ def _train_run(arm_name, eps, seed, pub_ds, priv_ds, test_ds,
                 flat_g = alpha_t * flat_priv + (1.0 - alpha_t) * g_pub
                 _set_grads(model, flat_g.to(device))
 
-            elif arm_name == "pda_dpmd":
+            elif arm_name in ("pda_dpmd", "pda_dpmd_da"):
                 # PDA-DPMD (Amid et al. 2022): blend noisy private gradient with
                 # the global public gradient using the Amid cosine alpha schedule.
+                # pda_dpmd_da uses reduced noise (sigma_use = sigma_van * c_eff)
+                # pda_dpmd    uses standard noise (sigma_use = sigma_van * C)
                 signal    = sum_g / B
                 noise     = torch.randn_like(sum_g) * sigma_use
                 flat_priv = (sum_g + noise) / B
@@ -571,10 +573,10 @@ def _train_run(arm_name, eps, seed, pub_ds, priv_ds, test_ds,
 
         row = {"epoch": epoch, "train_loss": f"{train_loss:.4f}",
                "test_acc": f"{test_acc:.4f}", "lr": f"{cur_lr:.6f}"}
-        if arm_name in ("pda_cw", "pda_dpmd"):
+        if arm_name in ("pda_cw", "pda_dpmd", "pda_dpmd_da"):
             row["alpha_mean"]   = f"{np.mean(alpha_accum):.4f}" if alpha_accum else "nan"
             row["cos_pub_priv"] = f"{np.mean(cos_accum):.4f}"   if cos_accum   else "nan"
-        if arm_name == "dist_aware":
+        if arm_name in ("dist_aware", "pda_dpmd_da"):
             row["max_perp_norm"] = f"{epoch_perp_max:.6f}"
 
         writer.writerow(row); csv_file.flush()
