@@ -298,8 +298,10 @@ def _train_run(arm_name, eps, seed, priv_ds, test_ds,
     ckpt_path = os.path.join(out_dir, f"{tag}_final.pt")
     log_path  = os.path.join(log_dir, f"{tag}.parquet")
 
-    if os.path.exists(csv_path) and os.path.exists(log_path):
-        print(f"[P13-E1] {tag}: already done.")
+    log_path_npz = log_path.replace(".parquet", ".npz")
+    log_done     = os.path.exists(log_path) or os.path.exists(log_path_npz)
+    if os.path.exists(ckpt_path) and os.path.exists(csv_path) and log_done:
+        print(f"[P13-E1] {tag}: already done (checkpoint + csv + log found).")
         with open(csv_path) as f:
             rows = list(csv.DictReader(f))
         return float(rows[-1]["test_acc"])
