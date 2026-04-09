@@ -48,11 +48,12 @@ ALL_ARMS    = ["A3", "B2", "C3", "A2", "A1", "B1", "C2", "C1"]
 # Tier names for B arms
 TIER_NAMES  = {0: "head", 1: "mid", 2: "tail"}
 
-# RDP alpha grid
+# RDP alpha grid — extended to avoid "optimal order is largest alpha" warning
 ALPHA_GRID  = np.concatenate([
-    np.arange(1.5,  10,   0.5),
-    np.arange(10,   100,  2.0),
-    np.arange(100,  1000, 20.0),
+    np.arange(1.5,  10,    0.5),
+    np.arange(10,   100,   2.0),
+    np.arange(100,  1000,  20.0),
+    np.arange(1000, 5001,  100.0),
 ])
 
 
@@ -93,17 +94,30 @@ def _data_independent_eps(sigma_mult, q, T_steps, delta, eps_target):
 # Per-instance certificates
 # ---------------------------------------------------------------------------
 
-def _compute_certificates(log_df, sigma_use, delta, n_examples_est):
+def _compute_certificates(log_df, sigma_use, delta, n_examples_est, q):
     """
     Compute norm-based and direction-aware per-instance certificates.
 
-    sigma_use: absolute noise std = sigma_multiplier * C
+    Uses the subsampled Gaussian mechanism RDP (Thudi et al. Theorem 3.2):
+      ε_i(α) ≈ q² * (α/2) * Σ_{t: i∈B_t} ||ḡ_it||² / σ_use²
+
+    The q² factor is the subsampling amplification from Poisson sampling at
+    rate q. Without it, the formula is the raw (unsubsampled) Gaussian RDP,
+    which loses the amplification and can exceed the data-independent ε.
+
+    Mathematically, since ||ḡ_it|| ≤ C and there are at most T steps,
+    ε_norm_i ≤ q² * (α/2) * qT * C² / σ_use² ≈ q * ε_DI, ensuring
+    ε_norm_i ≤ ε_DI always holds.
+
+    sigma_use: absolute noise std = sigma_multiplier * C  (= sigma_mult when C=1)
+    q:         Poisson sampling rate = batch_size / n_train
 
     Returns dict with arrays (one entry per unique example in log):
       example_idx, n_sampled, sum_gnorm2, sum_inorm2,
       eps_norm, eps_direction, beta_mean
     """
     sigma2 = float(sigma_use) ** 2
+    q_sq   = float(q) ** 2   # subsampling amplification factor
 
     idx_arr = log_df["example_idx"].to_numpy(dtype=np.int32)
     gn_arr  = log_df["grad_norm"].to_numpy(dtype=np.float64)
@@ -130,8 +144,10 @@ def _compute_certificates(log_df, sigma_use, delta, n_examples_est):
             eps_norm_arr[i] = 0.0
             eps_dir_arr[i]  = 0.0
             continue
-        rdp_norm = (ALPHA_GRID / 2.0) * sum_gn2[i] / sigma2
-        rdp_dir  = (ALPHA_GRID / 2.0) * sum_in2[i] / sigma2
+        # Subsampled Gaussian mechanism RDP (quadratic approximation, valid for small q):
+        # ε_i(α) = q² * (α/2) * Σ_t ||ḡ_it||² / σ²
+        rdp_norm = q_sq * (ALPHA_GRID / 2.0) * sum_gn2[i] / sigma2
+        rdp_dir  = q_sq * (ALPHA_GRID / 2.0) * sum_in2[i] / sigma2
         eps_norm_arr[i], _ = _rdp_to_dp(rdp_norm, ALPHA_GRID, delta)
         eps_dir_arr[i],  _ = _rdp_to_dp(rdp_dir,  ALPHA_GRID, delta)
 
@@ -316,7 +332,7 @@ def _run_arm(arm, seed, log_dir, train_dir, cert_dir):
 
     # Per-instance certificates
     print(f"  Computing per-instance certificates ...")
-    certs = _compute_certificates(log_df, sigma_use, delta, n_priv)
+    certs = _compute_certificates(log_df, sigma_use, delta, n_priv, q)
 
     # Map tier labels to local positions (certs["example_idx"] are global indices)
     tier_local = None
