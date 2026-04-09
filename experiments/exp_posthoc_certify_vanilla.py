@@ -88,15 +88,15 @@ def _calibrate_sigma(eps, delta, q, steps):
 
 
 def _get_sigma_for_arm(arm_name, eps, delta, n_train, batch_size, epochs):
-    """Return (sigma, q, T_steps) for each arm."""
+    """Return (sigma, q, T_steps) for each arm.
+
+    All arms use single-channel Gaussian mechanism with standard sigma_std.
+    GEP sensitivity is ||g_V|| ≤ ||g|| ≤ C, so same calibration as vanilla.
+    """
     steps_per_epoch = n_train // batch_size
     T_steps         = epochs * steps_per_epoch
     q               = batch_size / n_train
-    if arm_name == "gep_log":
-        # GEP calibrates sigma for 2*T (two-channel RDP composition)
-        sigma = _calibrate_sigma(eps, delta, q, 2 * T_steps)
-    else:
-        sigma = _calibrate_sigma(eps, delta, q, T_steps)
+    sigma = _calibrate_sigma(eps, delta, q, T_steps)
     return sigma, q, T_steps
 
 

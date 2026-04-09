@@ -52,7 +52,6 @@ DELTA           = 1e-5
 EPS             = 2.0
 CLIP_C          = 1.0
 RANK_V          = 100
-C_PERP_FRAC     = 0.4        # GEP: clip norm in V_perp = C_PERP_FRAC * CLIP_C
 N_PUB           = 2000
 EPOCHS          = 60
 BATCH_SIZE      = 1000
@@ -318,14 +317,10 @@ def _train_run(arm_name, eps, seed, priv_ds, test_ds,
     is_gep = (arm_name == "gep_log")
     is_pda = (arm_name == "pda_dpmd_log")
 
-    # GEP uses sigma calibrated for 2*T to account for two-channel RDP composition
-    if is_gep:
-        sigma_std = _calibrate_sigma(eps, DELTA, q, 2 * T_steps)
-        print(f"[P14-A] GEP sigma_2ch={sigma_std:.4f} "
-              f"(calibrated for 2*T={2*T_steps} steps)")
-    else:
-        sigma_std = _calibrate_sigma(eps, DELTA, q, T_steps)
-        print(f"[P14-A] sigma_std={sigma_std:.4f}")
+    # All arms: calibrate sigma for T steps, single Gaussian mechanism.
+    # GEP sensitivity is still ≤ C (||g_V|| ≤ ||g|| ≤ C), same as vanilla.
+    sigma_std = _calibrate_sigma(eps, DELTA, q, T_steps)
+    print(f"[P14-A] sigma_std={sigma_std:.4f}")
 
     print(f"[P14-A] T={T_steps}, q={q:.5f}, "
           f"noise_std={sigma_std * CLIP_C:.4f}")
@@ -410,16 +405,17 @@ def _train_run(arm_name, eps, seed, priv_ds, test_ds,
             # --- Compute DP gradient update ---
 
             if is_gep:
-                # GEP: use coherent component only; noise added in V subspace only
-                # Privacy: same sigma_std (calibrated with 2*T for two-channel RDP)
-                sum_g_V = (sum_g @ V_gpu) @ V_gpu.t()      # [d], V component of sum
+                # GEP (Yu et al. 2021): project gradient sum onto coherent subspace V,
+                # add Gaussian noise ONLY in the r-dimensional V subspace.
+                #
+                # Mechanism: release (Pv @ sum_g) + N(0, σ²C²I_r) in V
+                # Sensitivity: ||g_V|| ≤ ||g|| ≤ C  → same σ as vanilla, T steps.
+                # Key benefit: noise magnitude ||ξ|| ≈ σC√r ≈ 36,
+                # vs vanilla ||ξ|| ≈ σC√d ≈ 1886 → much higher SNR.
+                sum_g_V = (sum_g @ V_gpu) @ V_gpu.t()      # [d], coherent component
                 xi_r    = torch.randn(RANK_V, device=device) * sigma_std * CLIP_C
-                noise_V = xi_r @ V_gpu.t()                  # [d] noise in V
-                # Also add V_perp noise (for the V_perp "channel")
-                xi_full  = torch.randn(d, device=device) * sigma_std * CLIP_C * C_PERP_FRAC
-                xi_V_proj  = (xi_full @ V_gpu) @ V_gpu.t()
-                xi_perp    = xi_full - xi_V_proj
-                flat_g = (sum_g_V + noise_V + xi_perp) / B
+                noise_V = V_gpu @ xi_r                      # [d], noise in V only
+                flat_g  = (sum_g_V + noise_V) / B
 
             elif is_pda:
                 # PDA-DPMD: blend private noisy grad with public grad
