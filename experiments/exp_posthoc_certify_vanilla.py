@@ -90,13 +90,16 @@ def _calibrate_sigma(eps, delta, q, steps):
 def _get_sigma_for_arm(arm_name, eps, delta, n_train, batch_size, epochs):
     """Return (sigma, q, T_steps) for each arm.
 
-    All arms use single-channel Gaussian mechanism with standard sigma_std.
-    GEP sensitivity is ||g_V|| ≤ ||g|| ≤ C, so same calibration as vanilla.
+    GEP uses two independent Gaussian mechanisms (V-channel + V_perp-channel),
+    calibrated for 2*T steps.  Vanilla and PDA use single mechanism, T steps.
     """
     steps_per_epoch = n_train // batch_size
     T_steps         = epochs * steps_per_epoch
     q               = batch_size / n_train
-    sigma = _calibrate_sigma(eps, delta, q, T_steps)
+    if arm_name == "gep_log":
+        sigma = _calibrate_sigma(eps, delta, q, 2 * T_steps)
+    else:
+        sigma = _calibrate_sigma(eps, delta, q, T_steps)
     return sigma, q, T_steps
 
 
@@ -432,19 +435,67 @@ def _run_arm(arm_name, eps, seed, log_dir, cert_dir, delta=DELTA):
     # --- Build RDP lookup table ---
     s_grid, rdp_table = _build_rdp_lookup(q, sigma, ALPHA_GRID, N_BINS)
 
-    # --- Accumulate per-example RDP (norm-based) ---
-    print(f"[P14-B] Accumulating norm-based RDP over {n_rows:,} log rows...")
-    t0 = time.time()
-    rdp_norm, unique_idx, n_sampled = _accumulate_rdp_from_log(
-        log_df, CLIP_C, s_grid, rdp_table, n_train_est)
-    print(f"[P14-B] Norm RDP accumulated in {time.time()-t0:.1f}s")
+    # --- Accumulate per-example RDP ---
+    # GEP uses two-channel mechanism (V-channel + V_perp-channel, both with σ_2ch):
+    #   eps_norm_gep(α)      = Σ_t [rdp(s_V_t, σ_2ch) + rdp(s_perp_t, σ_2ch)]
+    #                        where s_V_t = coherent_norm_t/C = sqrt(grad_norm²-incoherent_norm²)/C
+    #   eps_direction_gep(α) = Σ_t rdp(s_perp_t, σ_2ch)   [only V_perp channel]
+    #
+    # Vanilla / PDA use single Gaussian mechanism:
+    #   eps_norm(α)      = Σ_t rdp(grad_norm_t/C, σ_std)
+    #   eps_direction(α) = Σ_t rdp(incoherent_norm_t/C, σ_std)
 
-    # --- Accumulate per-example RDP (direction-aware) ---
-    print(f"[P14-B] Accumulating direction-aware RDP over {n_rows:,} log rows...")
-    t0 = time.time()
-    rdp_dir = _accumulate_rdp_from_log_inorm(
-        log_df, CLIP_C, s_grid, rdp_table)
-    print(f"[P14-B] Direction RDP accumulated in {time.time()-t0:.1f}s")
+    is_gep = (arm_name == "gep_log")
+
+    if is_gep:
+        # For GEP: coherent_norm = sqrt(max(grad_norm² - incoherent_norm², 0))
+        # Accumulate V-channel (coherent) and V_perp-channel (incoherent) separately
+        print(f"[P14-B] GEP two-channel: accumulating V-channel (coherent) RDP...")
+        t0 = time.time()
+        # Build a temporary log column for coherent sensitivity
+        import pandas as pd
+        gn_sq = log_df["grad_norm"].to_numpy(np.float32) ** 2
+        in_sq = log_df["incoherent_norm"].to_numpy(np.float32) ** 2
+        coh_norm = np.sqrt(np.maximum(gn_sq - in_sq, 0.0)).astype(np.float32)
+        log_df_coh = log_df.copy()
+        log_df_coh["_coh"] = coh_norm
+
+        # Temporarily add a coh column and accumulate
+        class _TmpDF:
+            def __init__(self, df, col): self._df = df; self._col = col
+            def __getitem__(self, k): return self._df[self._col] if k == "grad_norm" else self._df[k]
+            def to_numpy(self, *a, **kw): return self._df.to_numpy(*a, **kw)
+            def __len__(self): return len(self._df)
+
+        # Use _accumulate_rdp_from_log but with coherent_norm as the "grad_norm"
+        # We'll do this by passing a modified DataFrame
+        log_df_coh_only = log_df[["example_idx"]].copy()
+        log_df_coh_only["grad_norm"] = coh_norm
+        log_df_coh_only["incoherent_norm"] = log_df["incoherent_norm"]
+        rdp_V_ch, unique_idx, n_sampled = _accumulate_rdp_from_log(
+            log_df_coh_only, CLIP_C, s_grid, rdp_table, n_train_est)
+        print(f"[P14-B] V-channel accumulated in {time.time()-t0:.1f}s")
+
+        print(f"[P14-B] GEP two-channel: accumulating V_perp-channel (incoherent) RDP...")
+        t0 = time.time()
+        rdp_perp_ch = _accumulate_rdp_from_log_inorm(log_df, CLIP_C, s_grid, rdp_table)
+        print(f"[P14-B] V_perp-channel accumulated in {time.time()-t0:.1f}s")
+
+        rdp_norm = rdp_V_ch + rdp_perp_ch    # both channels compose
+        rdp_dir  = rdp_perp_ch               # direction-aware: only V_perp channel
+        del log_df_coh_only, log_df_coh, coh_norm, gn_sq, in_sq
+
+    else:
+        print(f"[P14-B] Accumulating norm-based RDP over {n_rows:,} log rows...")
+        t0 = time.time()
+        rdp_norm, unique_idx, n_sampled = _accumulate_rdp_from_log(
+            log_df, CLIP_C, s_grid, rdp_table, n_train_est)
+        print(f"[P14-B] Norm RDP accumulated in {time.time()-t0:.1f}s")
+
+        print(f"[P14-B] Accumulating direction-aware RDP over {n_rows:,} log rows...")
+        t0 = time.time()
+        rdp_dir = _accumulate_rdp_from_log_inorm(log_df, CLIP_C, s_grid, rdp_table)
+        print(f"[P14-B] Direction RDP accumulated in {time.time()-t0:.1f}s")
 
     # --- Convert to (ε,δ)-DP ---
     print(f"[P14-B] Converting RDP to (ε,δ)-DP for {len(unique_idx)} examples...")

@@ -320,10 +320,15 @@ def _train_run(arm_name, eps, seed, priv_ds, test_ds,
     is_gep = (arm_name == "gep_log")
     is_pda = (arm_name == "pda_dpmd_log")
 
-    # All arms: calibrate sigma for T steps, single Gaussian mechanism.
-    # GEP sensitivity is still ≤ C (||g_V|| ≤ ||g|| ≤ C), same as vanilla.
-    sigma_std = _calibrate_sigma(eps, DELTA, q, T_steps)
-    print(f"[P14-A] sigma_std={sigma_std:.4f}")
+    # GEP: two independent Gaussian mechanisms (V-channel + V_perp-channel),
+    # each contributing one per-step RDP → calibrate for 2*T steps.
+    # Vanilla / PDA: single mechanism, T steps.
+    if is_gep:
+        sigma_std = _calibrate_sigma(eps, DELTA, q, 2 * T_steps)
+        print(f"[P14-A] GEP sigma_2ch={sigma_std:.4f} (2*T={2*T_steps} steps)")
+    else:
+        sigma_std = _calibrate_sigma(eps, DELTA, q, T_steps)
+        print(f"[P14-A] sigma_std={sigma_std:.4f}")
 
     print(f"[P14-A] T={T_steps}, q={q:.5f}, "
           f"noise_std={sigma_std * CLIP_C:.4f}")
@@ -340,12 +345,8 @@ def _train_run(arm_name, eps, seed, priv_ds, test_ds,
     V_cpu = _compute_subspace(model, pub_x, pub_y, device, rank=RANK_V)
     V_gpu = V_cpu.to(device)   # [d, RANK_V]
 
-    # GEP only updates V-subspace gradients; weight_decay would decay V_perp
-    # parameters from the warm start (with momentum, effective decay ≈ e^{-1.35}
-    # over 2700 steps — destroying 74% of V_perp features). Use wd=0 for GEP.
-    wd = 0.0 if is_gep else WEIGHT_DECAY
     optimizer = torch.optim.SGD(model.parameters(), lr=LR,
-                                momentum=MOMENTUM, weight_decay=wd)
+                                momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
     priv_loader = DataLoader(priv_ds, batch_size=BATCH_SIZE, shuffle=True,
@@ -378,8 +379,13 @@ def _train_run(arm_name, eps, seed, priv_ds, test_ds,
             optimizer.zero_grad(set_to_none=True)
             B = x.shape[0]
 
-            # DP per-sample gradients — accumulated in chunks
-            sum_g = torch.zeros(d, device=device)
+            # Accumulate per-sample gradients in chunks.
+            # All arms: sum_g (full clipped gradient sum, for vanilla/pda).
+            # GEP additionally: sum_c (V-coefficients) and sum_perp (V_perp residual),
+            # each clipped independently to CLIP_C (following P7 exp_p7_cwgep.py).
+            sum_g    = torch.zeros(d,      device=device)
+            sum_c    = torch.zeros(RANK_V, device=device)  # GEP V channel
+            sum_perp = torch.zeros(d,      device=device)  # GEP V_perp channel
 
             for ci in range(0, B, GRAD_CHUNK):
                 xc    = x[ci:ci+GRAD_CHUNK].to(device)
@@ -391,13 +397,13 @@ def _train_run(arm_name, eps, seed, priv_ds, test_ds,
                 gc_clip = gc * (CLIP_C / norms).clamp(max=1.0)             # [c, d]
                 sum_g  += gc_clip.sum(0)
 
-                # Log: incoherent norm = ||g^V⊥|| = ||g - g_V||
+                # Log: incoherent norm = ||g^V⊥|| from the full clipped gradient
                 with torch.no_grad():
-                    coords  = gc_clip @ V_gpu           # [c, RANK_V]
-                    g_V     = coords @ V_gpu.t()        # [c, d]
-                    g_perp  = gc_clip - g_V             # [c, d]
-                    gnorms  = gc_clip.norm(dim=1)       # [c]
-                    inorms  = g_perp.norm(dim=1)        # [c]
+                    coords = gc_clip @ V_gpu                  # [c, RANK_V]
+                    g_V    = coords @ V_gpu.t()               # [c, d]
+                    g_perp_log = gc_clip - g_V                # [c, d]
+                    gnorms = gc_clip.norm(dim=1)              # [c]
+                    inorms = g_perp_log.norm(dim=1)           # [c]
 
                 gn_cpu = gnorms.cpu().numpy().astype(np.float32)
                 in_cpu = inorms.cpu().numpy().astype(np.float32)
@@ -406,23 +412,39 @@ def _train_run(arm_name, eps, seed, priv_ds, test_ds,
                 log_gnorm.extend(gn_cpu.tolist())
                 log_inorm.extend(in_cpu.tolist())
 
-                del gc, gc_clip, coords, g_V, g_perp, gnorms, inorms
+                if is_gep:
+                    # GEP two-channel (P7 pattern): separate clip + accumulate
+                    # V-channel: coefficients c = V^T g_clip, clipped to CLIP_C in r-dim
+                    c_norms = coords.norm(dim=1, keepdim=True).clamp(min=1e-8)
+                    c_clip  = coords * (CLIP_C / c_norms).clamp(max=1.0)  # [c, r]
+                    sum_c  += c_clip.sum(0)                                # [r]
+
+                    # V_perp-channel: residual g_perp, clipped to CLIP_C in d-dim
+                    p_norms   = g_perp_log.norm(dim=1, keepdim=True).clamp(min=1e-8)
+                    gp_clip   = g_perp_log * (CLIP_C / p_norms).clamp(max=1.0)  # [c, d]
+                    sum_perp += gp_clip.sum(0)                             # [d]
+                    del c_clip, p_norms, gp_clip
+
+                del gc, gc_clip, coords, g_V, g_perp_log, gnorms, inorms
                 torch.cuda.empty_cache()
 
             # --- Compute DP gradient update ---
 
             if is_gep:
-                # GEP (Yu et al. 2021): project gradient sum onto coherent subspace V,
-                # add Gaussian noise ONLY in the r-dimensional V subspace.
-                #
-                # Mechanism: release (Pv @ sum_g) + N(0, σ²C²I_r) in V
-                # Sensitivity: ||g_V|| ≤ ||g|| ≤ C  → same σ as vanilla, T steps.
-                # Key benefit: noise magnitude ||ξ|| ≈ σC√r ≈ 36,
-                # vs vanilla ||ξ|| ≈ σC√d ≈ 1886 → much higher SNR.
-                sum_g_V = (sum_g @ V_gpu) @ V_gpu.t()      # [d], coherent component
-                xi_r    = torch.randn(RANK_V, device=device) * sigma_std * CLIP_C
-                noise_V = V_gpu @ xi_r                      # [d], noise in V only
-                flat_g  = (sum_g_V + noise_V) / B
+                # GEP two-channel (Yu et al. 2021 / P7 pattern):
+                #   V-channel:     add N(0, (σ_2ch*C)² I_r) in r-dim, project back via V
+                #   V_perp-channel: add N(0, (σ_2ch*C)² I_d) projected onto V_perp
+                # Reconstruct: V @ (sum_c + noise_V) + (sum_perp + noise_perp)
+                # Privacy: two independent Gaussian mechanisms, σ_2ch calibrated for 2*T.
+                noise_c  = torch.randn(RANK_V, device=device) * sigma_std * CLIP_C
+                sum_c   += noise_c
+
+                # V_perp noise: full-dim Gaussian, orthogonalized to V (P7 line 408)
+                noise_p   = torch.randn(d, device=device) * sigma_std * CLIP_C
+                noise_p   = noise_p - V_gpu @ (V_gpu.t() @ noise_p)   # project out V
+                sum_perp += noise_p
+
+                flat_g = (V_gpu @ sum_c + sum_perp) / B
 
             elif is_pda:
                 # PDA-DPMD: blend private noisy grad with public grad
