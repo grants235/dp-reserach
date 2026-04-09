@@ -337,8 +337,12 @@ def _train_run(arm_name, eps, seed, priv_ds, test_ds,
     V_cpu = _compute_subspace(model, pub_x, pub_y, device, rank=RANK_V)
     V_gpu = V_cpu.to(device)   # [d, RANK_V]
 
+    # GEP only updates V-subspace gradients; weight_decay would decay V_perp
+    # parameters from the warm start (with momentum, effective decay ≈ e^{-1.35}
+    # over 2700 steps — destroying 74% of V_perp features). Use wd=0 for GEP.
+    wd = 0.0 if is_gep else WEIGHT_DECAY
     optimizer = torch.optim.SGD(model.parameters(), lr=LR,
-                                momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
+                                momentum=MOMENTUM, weight_decay=wd)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
     priv_loader = DataLoader(priv_ds, batch_size=BATCH_SIZE, shuffle=True,
