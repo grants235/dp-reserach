@@ -206,6 +206,30 @@ def compute_beta_spectrum(log_df, sigma_use, delta, q, ranks=BETA_RANKS):
 
 
 # ---------------------------------------------------------------------------
+# Load accuracy
+# ---------------------------------------------------------------------------
+
+def load_accuracy(tag, train_dir=TRAIN_DIR):
+    """
+    Load final and best test accuracy from the per-run CSV produced by
+    exp_p16_train.py.  Returns (final_acc, best_acc) or (None, None).
+    """
+    csv_path = os.path.join(train_dir, f"{tag}.csv")
+    if not os.path.exists(csv_path):
+        return None, None
+    try:
+        import pandas as pd
+        df = pd.read_csv(csv_path)
+        if "test_acc" not in df.columns or df.empty:
+            return None, None
+        final_acc = float(df["test_acc"].iloc[-1])
+        best_acc  = float(df["test_acc"].max())
+        return final_acc, best_acc
+    except Exception:
+        return None, None
+
+
+# ---------------------------------------------------------------------------
 # Load log
 # ---------------------------------------------------------------------------
 
@@ -496,6 +520,10 @@ def certify_run_seed(run_id, cfg, seed, log_dir, cert_dir):
         "regime": cfg["regime"], "mech": cfg["mech"],
         "dataset": cfg["dataset"], "eps": eps,
     })
+    final_acc, best_acc = load_accuracy(tag)
+    if final_acc is not None:
+        summ["final_acc"] = final_acc
+        summ["best_acc"]  = best_acc
     if is_r3 and betas:
         for r, v in betas.items():
             summ[f"beta_rank{r}"] = v
@@ -545,13 +573,25 @@ def aggregate_seeds(run_id, cfg, log_dir, cert_dir):
     betas = [c["beta_mean"].mean()     for c in all_certs]
     ratios= [d / max(n, 1e-12) for n, d in zip(norms, dirs)]
 
+    # Collect per-seed accuracy
+    best_accs = []
+    for seed in range(cfg["n_seeds"]):
+        tag = (f"p16_{run_id}_{cfg['mech']}_{cfg['dataset']}_{cfg['regime']}"
+               f"_eps{cfg['eps']:.0f}_seed{seed}")
+        _, ba = load_accuracy(tag)
+        if ba is not None:
+            best_accs.append(ba)
+
     print(f"\n[P16-cert] {run_id}: {len(all_certs)}/{cfg['n_seeds']} seeds aggregated")
     print(f"  ε^norm  median={np.median(norms):.4f}  IQR=[{np.percentile(norms,25):.4f}, {np.percentile(norms,75):.4f}]")
     print(f"  ε^dir   median={np.median(dirs):.4f}   IQR=[{np.percentile(dirs,25):.4f}, {np.percentile(dirs,75):.4f}]")
     print(f"  tighten median={np.median(ratios):.4f} IQR=[{np.percentile(ratios,25):.4f}, {np.percentile(ratios,75):.4f}]")
     print(f"  β       median={np.median(betas):.4f}")
+    if best_accs:
+        print(f"  best_acc median={np.median(best_accs):.4f}  "
+              f"IQR=[{np.percentile(best_accs,25):.4f}, {np.percentile(best_accs,75):.4f}]")
 
-    return {
+    result = {
         "n_seeds_present": len(all_certs),
         "eps_norm_median": float(np.median(norms)),
         "eps_norm_iqr":    [float(np.percentile(norms, 25)), float(np.percentile(norms, 75))],
@@ -560,6 +600,11 @@ def aggregate_seeds(run_id, cfg, log_dir, cert_dir):
         "tightening_median": float(np.median(ratios)),
         "beta_median":     float(np.median(betas)),
     }
+    if best_accs:
+        result["best_acc_median"] = float(np.median(best_accs))
+        result["best_acc_iqr"]    = [float(np.percentile(best_accs, 25)),
+                                     float(np.percentile(best_accs, 75))]
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -570,7 +615,7 @@ def print_table(all_stats):
     """Print Table 1 from the spec across all completed runs."""
     header = (f"{'Run':5s}  {'Regime':6s}  {'Dataset':14s}  {'Mech':8s}  "
               f"{'ε':4s}  {'ε^norm med':10s}  {'ε^dir med':9s}  "
-              f"{'tighten':8s}  {'β med':6s}  {'n_seeds':7s}")
+              f"{'tighten':8s}  {'β med':6s}  {'best_acc':8s}  {'n_seeds':7s}")
     print(f"\n{'='*len(header)}")
     print("  Phase 16 Cross-Run Summary Table")
     print(f"{'='*len(header)}")
@@ -580,6 +625,8 @@ def print_table(all_stats):
         if stats is None:
             continue
         cfg = RUN_MATRIX.get(run_id, {})
+        best_acc_str = (f"{stats['best_acc_median']:.4f}"
+                        if "best_acc_median" in stats else "  N/A  ")
         print(f"  {run_id:5s}  {cfg.get('regime','?'):6s}  "
               f"{cfg.get('dataset','?'):14s}  {cfg.get('mech','?'):8s}  "
               f"{cfg.get('eps',0):4.0f}  "
@@ -587,6 +634,7 @@ def print_table(all_stats):
               f"{stats['eps_dir_median']:9.4f}  "
               f"{stats['tightening_median']:8.4f}  "
               f"{stats['beta_median']:6.4f}  "
+              f"{best_acc_str:8s}  "
               f"{stats['n_seeds_present']:7d}")
     print(f"{'='*len(header)}")
 
