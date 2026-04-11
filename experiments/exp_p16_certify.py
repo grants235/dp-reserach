@@ -746,6 +746,38 @@ def run_lira_attack(run_id, cfg, log_dir, train_dir, cert_dir, device_str="cpu")
 
     print(f"\n[P16-LiRA] === {run_id}: scoring {n_found} targets over {n_shadows} shadows ===")
 
+    # Build global→local index mapping from the corresponding H-run meta file.
+    # in_mask is indexed by local private index, but target_global_idx are global.
+    cert_run = "H7" if run_id == "L1" else "H8"
+    meta_tag  = (f"p16_{cert_run}_vanilla_{dataset}_R2"
+                 f"_eps{int(cfg['eps'])}_seed0")
+    meta_path = os.path.join(log_dir, f"{meta_tag}_meta.npz")
+    global_to_local = None
+    if os.path.exists(meta_path):
+        try:
+            meta_np = np.load(meta_path, allow_pickle=True)
+            priv_idx = meta_np["priv_idx"]
+            global_to_local = {int(g): l for l, g in enumerate(priv_idx)}
+            print(f"  [LiRA] Loaded priv_idx ({len(priv_idx)} entries) from {meta_tag}_meta.npz")
+        except Exception as e:
+            print(f"  [LiRA] Could not load priv_idx from meta: {e}")
+    else:
+        print(f"  [LiRA] Meta file not found ({meta_path}); "
+              f"run --run {cert_run} first or ensure meta is present.")
+
+    if global_to_local is None:
+        print(f"[P16-LiRA] Cannot map target global indices to local — aborting.")
+        return None
+
+    # Local indices for each target (in the private split)
+    target_local_idx = np.array(
+        [global_to_local.get(int(g), -1) for g in target_global_idx], dtype=np.int32)
+    valid_target_mask = target_local_idx >= 0
+    if not valid_target_mask.all():
+        n_missing = (~valid_target_mask).sum()
+        print(f"  [LiRA] Warning: {n_missing}/{n_found} targets not found in priv_idx; "
+              f"they will have NaN scores.")
+
     if os.path.exists(score_path):
         print(f"[P16-LiRA] Loading cached scores: {score_path}")
         data = np.load(score_path)
@@ -764,9 +796,10 @@ def run_lira_attack(run_id, cfg, log_dir, train_dir, cert_dir, device_str="cpu")
                 print(f"  [LiRA] shadow {sid}: membership mask not found, skipping.")
                 continue
 
-            in_mask = np.load(mem_p)  # shape (n_priv,) bool
-            # membership of target examples
-            member_matrix[sid] = in_mask[target_global_idx].astype(np.int8)
+            in_mask = np.load(mem_p)  # shape (n_priv,) bool — indexed by local idx
+            # Map targets via local indices; unresolvable targets stay 0
+            local_valid = target_local_idx[valid_target_mask]
+            member_matrix[sid, valid_target_mask] = in_mask[local_valid].astype(np.int8)
 
             try:
                 losses = _load_shadow_loss(model_p, target_loader, device)
