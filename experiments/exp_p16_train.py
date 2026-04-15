@@ -7,22 +7,31 @@ Implements the full run matrix from phase16_spex.tex:
 
   Tier 1 (HIGH, 5 seeds):  H1-H10  — headline CLIP + from-scratch + EMNIST
   Tier 2 (MED,  3 seeds):  S1-S8   — ε-sweep and batch-size sweep
-  Tier 3 (MED,  1 seed):   M1-M7   — cross-mechanism comparison
-  Tier 4 (LiRA, 1 seed):   L1-L2   — shadow model training (basic)
+  Tier 3 (MED,  1 seed):   M3, M7  — cross-mechanism (auto-clip only)
 
 Three regimes:
   R1: WRN-28-2 + GroupNorm, cold start (random init)
   R2: WRN-28-2 + GroupNorm, warm start (pretrained on public data)
   R3: CLIP ViT-B/32 frozen features + linear head only
 
-Four mechanisms:
+Two mechanisms:
   vanilla  standard clip + Gaussian noise
-  gep      project clipped gradients onto public PCA subspace before noise
-  pda      vanilla DP-SGD + public gradient blend (PDA-DPMD style)
   auto     smooth automatic clipping: g_scaled = g / (||g||/C + 1)
 
-All scripts save per-step (example_idx, grad_norm, incoherent_norm) logs for
-use by exp_p16_certify.py. Checkpoints saved every epoch — fully resumable.
+Per-step logs:
+  Scalar columns (parquet/npz): example_idx, grad_norm, incoherent_norm
+  PCA projections (companion _gproj.npy, shape (N_rows, rank) float32):
+    g_proj_k = (gc_clip @ V)_k  for k=0..rank-1
+
+  These projections are required for the Woodbury rigorous certificate in
+  exp_p16_certify.py.  The PCA eigenvalues λ_k are saved in _meta.npz["lambdas"]
+  so the certify script can compute d_eff^(r)² = Σ_k g_proj_k²/(σ²+λ_k) + ||g_perp||²/σ².
+
+  g_proj is NOT stored in the rolling torch checkpoint (too large at rank=100).
+  Instead a companion _gproj_ckpt.npy is written alongside each checkpoint and
+  reloaded on resume.
+
+Checkpoints saved every epoch — fully resumable.
 
 Usage
 -----
@@ -88,27 +97,18 @@ RUN_MATRIX = {
     "S6":  dict(dataset="cifar10",       regime="R3", mech="vanilla", eps=8.0, batch=1000,  n_seeds=3, tier=2),
     "S7":  dict(dataset="cifar10",       regime="R3", mech="vanilla", eps=8.0, batch=10000, n_seeds=3, tier=2),
     "S8":  dict(dataset="cifar10",       regime="R3", mech="vanilla", eps=8.0, batch=25000, n_seeds=3, tier=2),
-    # --- Tier 3: Cross-mechanism (1 seed) ---
-    "M1":  dict(dataset="cifar10",       regime="R2", mech="gep",     eps=8.0, batch=5000,  n_seeds=1, tier=3),
-    "M2":  dict(dataset="cifar10",       regime="R2", mech="pda",     eps=8.0, batch=5000,  n_seeds=1, tier=3),
+    # --- Tier 3: Cross-mechanism, auto-clip only (1 seed) ---
     "M3":  dict(dataset="cifar10",       regime="R2", mech="auto",    eps=8.0, batch=5000,  n_seeds=1, tier=3),
-    "M4":  dict(dataset="cifar10_lt50",  regime="R2", mech="gep",     eps=8.0, batch=5000,  n_seeds=1, tier=3),
-    "M5":  dict(dataset="cifar10_lt50",  regime="R2", mech="pda",     eps=8.0, batch=5000,  n_seeds=1, tier=3),
-    "M6":  dict(dataset="cifar10",       regime="R3", mech="gep",     eps=8.0, batch=5000,  n_seeds=1, tier=3),
     "M7":  dict(dataset="cifar10",       regime="R3", mech="auto",    eps=8.0, batch=5000,  n_seeds=1, tier=3),
-    # --- Tier 4: LiRA validation ---
-    "L1":  dict(dataset="cifar10",       regime="R2", mech="vanilla", eps=8.0, batch=5000,  n_seeds=1, tier=4, n_shadows=16),
-    "L2":  dict(dataset="cifar10_lt50",  regime="R2", mech="vanilla", eps=8.0, batch=5000,  n_seeds=1, tier=4, n_shadows=16),
 }
 
-# Execution order from spec: Block A first (CLIP), then B (from-scratch), etc.
+# Execution order: Block A first (CLIP, fastest), then from-scratch, EMNIST, sweeps, mech
 BLOCK_ORDER = {
     "A": ["H1", "H2", "H3", "H4", "H5", "S6", "S7", "S8"],
     "B": ["H6", "H7", "H8"],
     "C": ["H9", "H10"],
     "D": ["S1", "S2", "S3", "S4", "S5"],
-    "E": ["M1", "M2", "M3", "M4", "M5", "M6", "M7"],
-    "F": ["L1", "L2"],
+    "E": ["M3", "M7"],
 }
 
 # ---------------------------------------------------------------------------
@@ -117,7 +117,7 @@ BLOCK_ORDER = {
 
 CLIP_C          = 1.0
 RANK_V          = 100          # subspace rank for R1/R2/EMNIST
-RANK_V_CLIP     = 100          # subspace rank for R3 (also test 10)
+RANK_V_CLIP     = 100          # subspace rank for R3
 N_PUB           = 2000         # public examples for subspace
 LR              = 0.1
 MOMENTUM        = 0.9
@@ -130,11 +130,6 @@ CLIP_CHUNK      = 256          # analytical chunk size (R3)
 DATA_ROOT       = "./data"
 CACHE_DIR       = "./data/clip_features"
 RESULTS_DIR     = "./results/exp_p16"
-
-# PDA-DPMD alpha schedule: ramp from 1 → 0.9 over first 10% of steps, then hold
-PDA_ALPHA_INIT  = 1.0
-PDA_ALPHA_FINAL = 0.9
-PDA_RAMP_FRAC   = 0.10         # fraction of T_steps for ramp
 
 # Long-tailed tier boundaries (CIFAR-10)
 LT_HEAD_CLASSES = {0, 1, 2}
@@ -327,7 +322,6 @@ def _load_or_extract_clip_features(dataset_name, data_root, cache_dir, device):
             "ViT-B-32", pretrained="laion2b_s34b_b79k")
         clip_model = clip_model.to(device).eval()
     except ImportError:
-        # Fallback to OpenAI clip
         try:
             import clip as openai_clip
             clip_model, preprocess = openai_clip.load("ViT-B/32", device=device)
@@ -335,7 +329,8 @@ def _load_or_extract_clip_features(dataset_name, data_root, cache_dir, device):
         except ImportError:
             raise RuntimeError(
                 "Neither open_clip nor clip package found. "
-                "Install with: pip install open_clip_torch  or  pip install git+https://github.com/openai/CLIP.git"
+                "Install with: pip install open_clip_torch  or  "
+                "pip install git+https://github.com/openai/CLIP.git"
             )
 
     def _extract(dataset_obj, desc):
@@ -344,20 +339,13 @@ def _load_or_extract_clip_features(dataset_name, data_root, cache_dir, device):
         loader = DataLoader(dataset_obj, batch_size=256, shuffle=False, num_workers=4)
         for batch in loader:
             imgs, labs = batch[0], batch[1]
-            # PIL images expected by preprocess; torchvision gives tensors → convert
-            # preprocess expects PIL; we work around by re-normalising
             imgs = imgs.to(device)
             with torch.no_grad():
-                try:
-                    feats = clip_model.encode_image(imgs)   # open_clip style
-                except AttributeError:
-                    feats = clip_model.encode_image(imgs)   # same API
+                feats = clip_model.encode_image(imgs)
             all_feats.append(feats.cpu().float())
             all_labels.append(labs)
         return torch.cat(all_feats), torch.cat(all_labels)
 
-    # Use CLIP-normalised images (224×224 resize + CLIP mean/std).
-    # Since torchvision gives us 32×32 tensors, we need PIL transforms.
     clip_mean = (0.48145466, 0.4578275,  0.40821073)
     clip_std  = (0.26862954, 0.26130258, 0.27577711)
     clip_tf   = T.Compose([
@@ -428,7 +416,6 @@ def build_dataset_clip(dataset_name, data_root, cache_dir, device, seed=42):
     else:
         tier_labels = None
 
-    # Test dataset as feature dataset (no global indices needed)
     test_ds = _FeatureDataset(test_feats, test_labels, torch.arange(len(test_labels)))
 
     return (pub_feats, pub_labels, priv_ds, test_ds,
@@ -516,12 +503,9 @@ def _per_sample_grads_linear(model, h_chunk, y_chunk, device):
     with torch.no_grad():
         logits = h @ W.t() + b        # [B, K]
         p      = torch.softmax(logits, dim=1)
-        # one-hot
         ey     = torch.zeros_like(p)
         ey.scatter_(1, y.unsqueeze(1), 1.0)
         delta  = p - ey               # [B, K]
-        # gradient w.r.t. W: delta.T ⊗ h = outer product per sample
-        # g_W[i] = delta[i].unsqueeze(1) * h[i].unsqueeze(0)  → [K, d] → flatten
         g_W    = (delta.unsqueeze(2) * h.unsqueeze(1)).reshape(h.shape[0], -1)   # [B, K*d]
         g_b    = delta                                                             # [B, K]
     return torch.cat([g_W, g_b], dim=1)   # [B, K*d+K]
@@ -536,10 +520,19 @@ def _set_grads(model, flat_grad):
 
 
 # ---------------------------------------------------------------------------
-# Subspace (PCA of public clipped gradients)
+# Subspace (PCA of public clipped gradients) + eigenvalues
 # ---------------------------------------------------------------------------
 
 def _compute_subspace(model, pub_x, pub_y, device, rank=RANK_V, regime="R2", chunk=GRAD_CHUNK):
+    """
+    Compute rank-r PCA subspace V from public clipped gradients.
+
+    Returns
+    -------
+    V       : torch.Tensor [d, rank]  — right singular vectors (subspace basis)
+    lambdas : np.ndarray  (rank,)     — eigenvalues of (1/N) G^T G = S²/N
+                                        needed for Woodbury certificate formula
+    """
     print(f"  [subspace] Computing rank-{rank} PCA subspace (regime={regime})...")
     model.eval()
     parts = []
@@ -556,12 +549,15 @@ def _compute_subspace(model, pub_x, pub_y, device, rank=RANK_V, regime="R2", chu
         parts.append((g * (CLIP_C / norms).clamp(max=1.0)).cpu())
         del g; torch.cuda.empty_cache()
     G = torch.cat(parts, dim=0).float()
+    N_pub = G.shape[0]
     k = min(rank, G.shape[0] - 1, G.shape[1] - 1)
-    _, _, V = torch.svd_lowrank(G, q=k, niter=6)
-    V = V[:, :k].cpu()
-    print(f"  [subspace] V shape: {V.shape}")
+    _, S, V = torch.svd_lowrank(G, q=k, niter=6)
+    V       = V[:, :k].cpu()                                # [d, k]
+    S       = S[:k].cpu()
+    lambdas = (S ** 2 / N_pub).numpy().astype(np.float64)   # eigenvalues of G^T G / N
+    print(f"  [subspace] V={V.shape}  λ_max={lambdas[0]:.4g}  λ_min={lambdas[-1]:.4g}")
     del G; torch.cuda.empty_cache()
-    return V   # [d, rank]
+    return V, lambdas
 
 
 # ---------------------------------------------------------------------------
@@ -616,29 +612,11 @@ def evaluate(model, test_ds, device, is_emnist=False, is_clip=False):
 
 
 # ---------------------------------------------------------------------------
-# Public gradient (for PDA-DPMD)
-# ---------------------------------------------------------------------------
-
-def compute_pub_grad(model, pub_x, pub_y, device, is_clip):
-    """Compute average public gradient (no DP, no privacy cost)."""
-    model.train()
-    model.zero_grad()
-    N = pub_x.shape[0]
-    loss = F.cross_entropy(model(pub_x.to(device).float()),
-                           pub_y.to(device))
-    loss.backward()
-    d = sum(p.numel() for p in model.parameters())
-    g = torch.cat([p.grad.view(-1) for p in model.parameters()
-                   if p.grad is not None])
-    model.zero_grad()
-    return g
-
-
-# ---------------------------------------------------------------------------
 # Log helpers
 # ---------------------------------------------------------------------------
 
 def save_log(log_steps, log_idx, log_gnorm, log_inorm, out_path):
+    """Save scalar per-step log (grad_norm, incoherent_norm) to parquet or npz."""
     try:
         import pandas as pd
         df = pd.DataFrame({
@@ -659,6 +637,22 @@ def save_log(log_steps, log_idx, log_gnorm, log_inorm, out_path):
         print(f"  [log] fallback npz: {npz}")
 
 
+def _save_gproj(log_gproj, rank, out_path):
+    """
+    Save accumulated g_proj rows to a .npy file.
+
+    log_gproj : list of (rank,) float32 arrays, one per logged example-step
+    Saves as float32 array of shape (N_rows, rank).
+    """
+    if log_gproj:
+        arr = np.vstack(log_gproj).astype(np.float32)
+    else:
+        arr = np.empty((0, rank), dtype=np.float32)
+    np.save(out_path, arr)
+    print(f"  [log] gproj {out_path} ({arr.shape[0]:,} rows × {arr.shape[1]} cols, "
+          f"{arr.nbytes // (1024*1024)}MB)")
+
+
 def load_log_from_ckpt(ckpt):
     return (list(ckpt.get("log_steps", [])),
             list(ckpt.get("log_idx",   [])),
@@ -671,10 +665,15 @@ def load_log_from_ckpt(ckpt):
 # ---------------------------------------------------------------------------
 
 def _collect_grads(model, x, y, ex_idx, V_gpu, device, regime,
-                   log_steps, log_idx, log_gnorm, log_inorm, step):
+                   log_steps, log_idx, log_gnorm, log_inorm, log_gproj, step):
     """
-    Collect per-sample gradients, compute (gnorm, incoherent_norm), return sum_g.
-    Handles chunking for both vmap (R1/R2) and analytical (R3).
+    Collect per-sample gradients, clip, compute per-example statistics, return sum_g.
+
+    Logs per example-step:
+      - grad_norm     : ||g_clip||
+      - incoherent_norm: ||g_clip - V V^T g_clip||  (out-of-subspace component)
+      - g_proj        : V^T g_clip  (rank-d projection coefficients)
+                        appended to log_gproj as (rank,) float32 arrays
     """
     B     = x.shape[0]
     d     = sum(p.numel() for p in model.parameters())
@@ -696,8 +695,8 @@ def _collect_grads(model, x, y, ex_idx, V_gpu, device, regime,
         sum_g  += gc_clip.sum(0)
 
         with torch.no_grad():
-            coords   = gc_clip @ V_gpu
-            g_V      = coords @ V_gpu.t()
+            coords   = gc_clip @ V_gpu       # (chunk, rank) — PCA projections
+            g_V      = coords @ V_gpu.t()    # back-projection into subspace
             g_perp   = gc_clip - g_V
             gnorms_c = gc_clip.norm(dim=1)
             inorms_c = g_perp.norm(dim=1)
@@ -706,6 +705,7 @@ def _collect_grads(model, x, y, ex_idx, V_gpu, device, regime,
         log_idx.extend(idx_c.tolist())
         log_gnorm.extend(gnorms_c.cpu().numpy().astype(np.float32).tolist())
         log_inorm.extend(inorms_c.cpu().numpy().astype(np.float32).tolist())
+        log_gproj.extend(list(coords.cpu().numpy().astype(np.float32)))
 
         del gc, gc_clip, coords, g_V, g_perp, gnorms_c, inorms_c
         torch.cuda.empty_cache()
@@ -721,14 +721,18 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir,
               out_dir, log_dir, ckpt_dir):
     tag       = f"p16_{run_id}_{cfg['mech']}_{cfg['dataset']}_{cfg['regime']}" \
                 f"_eps{cfg['eps']:.0f}_seed{seed}"
-    csv_path  = os.path.join(out_dir,  f"{tag}.csv")
-    ckpt_path = os.path.join(ckpt_dir, f"{tag}_ckpt.pt")
-    final_path= os.path.join(out_dir,  f"{tag}_final.pt")
-    log_path  = os.path.join(log_dir,  f"{tag}.parquet")
-    meta_path = os.path.join(log_dir,  f"{tag}_meta.npz")
+    csv_path       = os.path.join(out_dir,  f"{tag}.csv")
+    ckpt_path      = os.path.join(ckpt_dir, f"{tag}_ckpt.pt")
+    final_path     = os.path.join(out_dir,  f"{tag}_final.pt")
+    log_path       = os.path.join(log_dir,  f"{tag}.parquet")
+    meta_path      = os.path.join(log_dir,  f"{tag}_meta.npz")
+    # g_proj companion files (separate from torch checkpoint due to size)
+    gproj_ckpt_path  = os.path.join(ckpt_dir, f"{tag}_gproj_ckpt.npy")
+    gproj_final_path = os.path.join(log_dir,  f"{tag}_gproj.npy")
 
     log_npz  = log_path.replace(".parquet", ".npz")
-    log_done = os.path.exists(log_path) or os.path.exists(log_npz)
+    log_done = (os.path.exists(log_path) or os.path.exists(log_npz)) \
+               and os.path.exists(gproj_final_path)
     if os.path.exists(final_path) and os.path.exists(csv_path) and log_done:
         print(f"[P16] {tag}: already done, skipping.")
         return
@@ -772,18 +776,6 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir,
     os.makedirs(out_dir,  exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    np.savez(meta_path,
-             run_id=np.str_(run_id), mech=np.str_(mech),
-             dataset=np.str_(dataset), regime=np.str_(regime),
-             n_priv=np.int32(n_priv), batch_size=np.int32(batch),
-             epochs=np.int32(epochs), eps=np.float64(eps),
-             delta=np.float64(delta), q=np.float64(q),
-             T_steps=np.int32(T_steps), sigma_mult=np.float64(sigma),
-             sigma_use=np.float64(sigma_use),
-             tier_labels=(tier_labels if tier_labels is not None
-                          else np.array([], dtype=np.int32)),
-             priv_idx=priv_idx.astype(np.int32))
-
     # Model
     model = make_model(regime, num_classes, dataset).to(device)
     d     = sum(p.numel() for p in model.parameters())
@@ -799,11 +791,25 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir,
     pub_x_cpu = pub_x.cpu()
     pub_y_cpu = pub_y.cpu()
 
-    # Subspace
-    V_cpu = _compute_subspace(model, pub_x_cpu, pub_y_cpu, device,
-                               rank=RANK_V_CLIP if is_clip else RANK_V,
-                               regime=regime)
+    # Subspace + eigenvalues (needed before saving meta so lambdas are available)
+    rank_v = RANK_V_CLIP if is_clip else RANK_V
+    V_cpu, lambdas = _compute_subspace(model, pub_x_cpu, pub_y_cpu, device,
+                                        rank=rank_v, regime=regime)
     V_gpu = V_cpu.to(device)
+
+    # Save meta (includes lambdas for Woodbury certificate computation)
+    np.savez(meta_path,
+             run_id=np.str_(run_id), mech=np.str_(mech),
+             dataset=np.str_(dataset), regime=np.str_(regime),
+             n_priv=np.int32(n_priv), batch_size=np.int32(batch),
+             epochs=np.int32(epochs), eps=np.float64(eps),
+             delta=np.float64(delta), q=np.float64(q),
+             T_steps=np.int32(T_steps), sigma_mult=np.float64(sigma),
+             sigma_use=np.float64(sigma_use),
+             lambdas=lambdas,
+             tier_labels=(tier_labels if tier_labels is not None
+                          else np.array([], dtype=np.int32)),
+             priv_idx=priv_idx.astype(np.int32))
 
     optimizer = torch.optim.SGD(model.parameters(), lr=LR,
                                 momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
@@ -815,6 +821,7 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir,
     log_idx      = []
     log_gnorm    = []
     log_inorm    = []
+    log_gproj    = []   # list of (rank_v,) float32 arrays — NOT in torch checkpoint
     step_global  = 0
     best_acc     = 0.0
 
@@ -831,6 +838,18 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir,
         step_global = ckpt["step_global"]
         best_acc    = ckpt["best_acc"]
         log_steps, log_idx, log_gnorm, log_inorm = load_log_from_ckpt(ckpt)
+        # Load g_proj from companion file (not stored in torch checkpoint)
+        expected_gproj_rows = ckpt.get("log_gproj_nrows", 0)
+        if os.path.exists(gproj_ckpt_path):
+            try:
+                arr = np.load(gproj_ckpt_path)
+                log_gproj = list(arr[:expected_gproj_rows])
+                print(f"  [resume] Loaded {len(log_gproj):,} gproj rows from {gproj_ckpt_path}")
+            except Exception as e:
+                print(f"  [resume] gproj load failed ({e}); gproj will be incomplete")
+                log_gproj = []
+        else:
+            print(f"  [resume] gproj companion not found; gproj will be incomplete")
         print(f"  [resume] Resumed from epoch {ckpt['epoch']}, step {step_global}, "
               f"log_rows={len(log_steps):,}")
 
@@ -844,26 +863,15 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir,
     priv_loader = DataLoader(priv_ds, batch_size=batch, shuffle=True,
                              num_workers=4, pin_memory=True, drop_last=True)
 
-    # PDA public grad computation uses full public set
-    pub_x_for_pda = pub_x_cpu.float()
-    pub_y_for_pda = pub_y_cpu.long()
-
     for epoch in range(start_epoch, epochs + 1):
         model.train()
         total_loss = 0.0
         n_batches  = 0
 
-        # PDA: compute public gradient once per epoch
-        if mech == "pda":
-            g_pub = compute_pub_grad(model, pub_x_for_pda, pub_y_for_pda, device, is_clip)
-        else:
-            g_pub = None
-
         for batch_data in priv_loader:
             x, y, ex_idx = batch_data[0], batch_data[1], batch_data[2]
             optimizer.zero_grad(set_to_none=True)
 
-            # --- Collect per-sample gradients ---
             if mech == "auto":
                 # Smooth auto-clip: g_scaled = g / (||g||/C + 1)
                 B     = x.shape[0]
@@ -878,12 +886,11 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir,
                     else:
                         gc = _per_sample_grads_vmap(model, xc, yc, device)
                     norms   = gc.norm(dim=1, keepdim=True).clamp(min=1e-8)
-                    # smooth clipping: scale by C/(||g|| + C) = 1/(||g||/C + 1)
                     scale   = CLIP_C / (norms + CLIP_C)
                     gc_clip = gc * scale
                     sum_g  += gc_clip.sum(0)
                     with torch.no_grad():
-                        coords   = gc_clip @ V_gpu
+                        coords   = gc_clip @ V_gpu       # (chunk, rank)
                         g_V      = coords @ V_gpu.t()
                         g_perp   = gc_clip - g_V
                         gnorms_c = gc_clip.norm(dim=1)
@@ -892,34 +899,18 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir,
                     log_idx.extend(idx_c.tolist())
                     log_gnorm.extend(gnorms_c.cpu().numpy().astype(np.float32).tolist())
                     log_inorm.extend(inorms_c.cpu().numpy().astype(np.float32).tolist())
+                    log_gproj.extend(list(coords.cpu().numpy().astype(np.float32)))
                     del gc, gc_clip, coords, g_V, g_perp, gnorms_c, inorms_c
                     torch.cuda.empty_cache()
             else:
+                # vanilla: standard clip + Gaussian noise
                 sum_g = _collect_grads(
                     model, x, y, ex_idx, V_gpu, device, regime,
-                    log_steps, log_idx, log_gnorm, log_inorm, step_global)
+                    log_steps, log_idx, log_gnorm, log_inorm, log_gproj, step_global)
 
             B = x.shape[0]
-
-            if mech == "gep":
-                # GEP: use in-subspace component of the aggregate gradient
-                # Average clipped gradient (same as vanilla)
-                noise   = torch.randn(d, device=device) * sigma_use
-                flat_g  = (sum_g + noise) / B
-                # Project onto subspace: reduces effective noise
-                flat_g  = (flat_g @ V_gpu) @ V_gpu.t()
-            elif mech == "pda":
-                # PDA-DPMD: blend private (DP) gradient with public gradient
-                t_frac  = step_global / max(T_steps, 1)
-                ramp    = min(1.0, t_frac / max(PDA_RAMP_FRAC, 1e-9))
-                alpha   = PDA_ALPHA_INIT - ramp * (PDA_ALPHA_INIT - PDA_ALPHA_FINAL)
-                noise   = torch.randn(d, device=device) * sigma_use
-                g_priv  = (sum_g + noise) / B
-                flat_g  = alpha * g_priv + (1.0 - alpha) * g_pub.to(device)
-            else:
-                # vanilla and auto: standard noisy average
-                noise  = torch.randn(d, device=device) * sigma_use
-                flat_g = (sum_g + noise) / B
+            noise  = torch.randn(d, device=device) * sigma_use
+            flat_g = (sum_g + noise) / B
 
             _set_grads(model, flat_g)
             optimizer.step()
@@ -948,132 +939,44 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir,
                "test_acc": f"{test_acc:.4f}", "lr": f"{cur_lr:.6f}"}
         writer.writerow(row); csv_file.flush()
         print(f"  ep {epoch:3d}/{epochs}  acc={test_acc:.4f}  best={best_acc:.4f}  "
-              f"log_rows={len(log_steps):,}")
+              f"log_rows={len(log_steps):,}  gproj_rows={len(log_gproj):,}")
 
-        # Save checkpoint every epoch (overwrite latest)
+        # Save checkpoint + companion g_proj file every epoch
+        _save_gproj(log_gproj, rank_v, gproj_ckpt_path)
         torch.save({
-            "epoch":          epoch,
-            "model_state":    model.state_dict(),
-            "optimizer_state":optimizer.state_dict(),
-            "scheduler_state":scheduler.state_dict(),
-            "rng_state":      torch.get_rng_state(),
-            "np_rng_state":   np.random.get_state(),
-            "py_rng_state":   random.getstate(),
-            "step_global":    step_global,
-            "best_acc":       best_acc,
-            "log_steps":      log_steps,
-            "log_idx":        log_idx,
-            "log_gnorm":      log_gnorm,
-            "log_inorm":      log_inorm,
+            "epoch":             epoch,
+            "model_state":       model.state_dict(),
+            "optimizer_state":   optimizer.state_dict(),
+            "scheduler_state":   scheduler.state_dict(),
+            "rng_state":         torch.get_rng_state(),
+            "np_rng_state":      np.random.get_state(),
+            "py_rng_state":      random.getstate(),
+            "step_global":       step_global,
+            "best_acc":          best_acc,
+            "log_steps":         log_steps,
+            "log_idx":           log_idx,
+            "log_gnorm":         log_gnorm,
+            "log_inorm":         log_inorm,
+            "log_gproj_nrows":   len(log_gproj),   # pointer into companion .npy
         }, ckpt_path)
 
-        # Flush log every 5 epochs (or every epoch for CLIP since epochs are fast)
+        # Flush scalar log every 5 epochs (every epoch for CLIP)
         if is_clip or epoch % 5 == 0:
             save_log(log_steps, log_idx, log_gnorm, log_inorm, log_path)
 
     csv_file.close()
     torch.save(model.state_dict(), final_path)
     save_log(log_steps, log_idx, log_gnorm, log_inorm, log_path)
+    _save_gproj(log_gproj, rank_v, gproj_final_path)
 
     # Remove rolling checkpoint (keep final only)
-    if os.path.exists(ckpt_path):
-        os.remove(ckpt_path)
+    for p in [ckpt_path, gproj_ckpt_path]:
+        if os.path.exists(p):
+            os.remove(p)
 
     del V_gpu; torch.cuda.empty_cache()
     print(f"[P16] {run_id} seed={seed} done — final={test_acc:.4f}  best={best_acc:.4f}  "
-          f"total_log_rows={len(log_steps):,}")
-
-
-# ---------------------------------------------------------------------------
-# LiRA shadow model training (Tier 4)
-# ---------------------------------------------------------------------------
-
-def train_lira_shadows(run_id, cfg, device, data_root, out_dir, log_dir, ckpt_dir):
-    """Train shadow models for LiRA (L1, L2). Each shadow trains on a random half."""
-    n_shadows = cfg.get("n_shadows", 16)
-    n_targets = 200
-
-    print(f"\n[P16-LiRA] === {run_id} — {n_shadows} shadow models + target ===")
-
-    dataset = cfg["dataset"]
-    regime  = cfg["regime"]   # R2
-    eps     = cfg["eps"]
-    batch   = cfg["batch"]
-
-    (pub_ds, priv_ds, test_ds, pub_x, pub_y, num_classes,
-     priv_idx, tier_labels, delta) = build_dataset_wrn(dataset, data_root, seed=42)
-    n_priv = len(priv_ds)
-
-    # Pick n_targets target examples
-    rng_t = np.random.default_rng(1234)
-    target_local_idx = rng_t.choice(n_priv, size=n_targets, replace=False)
-    target_global_idx = priv_idx[target_local_idx]
-    np.save(os.path.join(log_dir, f"lira_{run_id}_target_idx.npy"), target_global_idx)
-
-    for shadow_id in range(n_shadows):
-        tag_s = f"p16_lira_{run_id}_shadow{shadow_id:03d}"
-        final_s = os.path.join(out_dir, f"{tag_s}_final.pt")
-        if os.path.exists(final_s):
-            print(f"  [LiRA] shadow {shadow_id}: already done.")
-            continue
-
-        # Each shadow is trained on a random 50% of priv examples (Poisson sampling)
-        rng_s = np.random.default_rng(shadow_id * 31337)
-        in_mask = rng_s.random(n_priv) < 0.5
-        shadow_local = np.where(in_mask)[0]
-
-        # Save membership for this shadow
-        np.save(os.path.join(log_dir, f"{tag_s}_member_mask.npy"), in_mask)
-
-        shadow_priv_idx = priv_idx[shadow_local]
-        shadow_priv_ds  = _IndexedSubset(priv_ds.base if hasattr(priv_ds, 'base') else priv_ds,
-                                          shadow_priv_idx)
-        n_shadow = len(shadow_priv_ds)
-        epochs_s = get_epochs(regime, dataset)
-        steps_s  = max(1, n_shadow // batch) * epochs_s
-        q_s      = batch / n_shadow
-        sigma_s  = calibrate_sigma(eps, delta, q_s, steps_s)
-
-        model_s = make_model(regime, num_classes, dataset).to(device)
-        _pretrain(model_s, pub_x.to(device).float(), pub_y.to(device).long(), device)
-
-        V_s = _compute_subspace(model_s, pub_x, pub_y, device, rank=RANK_V, regime=regime)
-        V_s_gpu = V_s.to(device)
-
-        opt_s = torch.optim.SGD(model_s.parameters(), lr=LR,
-                                momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
-        sch_s = torch.optim.lr_scheduler.CosineAnnealingLR(opt_s, T_max=epochs_s)
-
-        loader_s = DataLoader(shadow_priv_ds, batch_size=batch, shuffle=True,
-                              num_workers=2, pin_memory=True, drop_last=True)
-        d = sum(p.numel() for p in model_s.parameters())
-
-        for epoch in range(1, epochs_s + 1):
-            model_s.train()
-            for batch_data in loader_s:
-                x, y, _ = batch_data
-                opt_s.zero_grad(set_to_none=True)
-                B = x.shape[0]
-                sum_g = torch.zeros(d, device=device)
-                for ci in range(0, B, GRAD_CHUNK):
-                    xc = x[ci:ci+GRAD_CHUNK]; yc = y[ci:ci+GRAD_CHUNK]
-                    gc = _per_sample_grads_vmap(model_s, xc, yc, device)
-                    norms = gc.norm(dim=1, keepdim=True).clamp(min=1e-8)
-                    sum_g += (gc * (CLIP_C / norms).clamp(max=1.0)).sum(0)
-                    del gc; torch.cuda.empty_cache()
-                noise  = torch.randn(d, device=device) * sigma_s * CLIP_C
-                _set_grads(model_s, (sum_g + noise) / B)
-                opt_s.step()
-            sch_s.step()
-            if epoch % 10 == 0:
-                acc_s = evaluate(model_s, test_ds, device)
-                print(f"  [LiRA] shadow {shadow_id:3d} ep {epoch}/{epochs_s} acc={acc_s:.4f}")
-
-        torch.save(model_s.state_dict(), final_s)
-        del V_s_gpu, model_s; torch.cuda.empty_cache()
-        print(f"  [LiRA] shadow {shadow_id} saved: {final_s}")
-
-    print(f"[P16-LiRA] {run_id} done.")
+          f"total_log_rows={len(log_steps):,}  gproj_rows={len(log_gproj):,}")
 
 
 # ---------------------------------------------------------------------------
@@ -1083,11 +986,11 @@ def train_lira_shadows(run_id, cfg, device, data_root, out_dir, log_dir, ckpt_di
 def main():
     parser = argparse.ArgumentParser(description="Phase 16 training")
     parser.add_argument("--run",       type=str, default=None,
-                        help="Single run ID (e.g. H1, S3, M2, L1)")
+                        help="Single run ID (e.g. H1, S3, M3)")
     parser.add_argument("--block",     type=str, default=None,
                         choices=list(BLOCK_ORDER.keys()),
-                        help="Run all entries in a block (A=CLIP, B=scratch, C=EMNIST, D=sweep, E=mech, F=LiRA)")
-    parser.add_argument("--tier",      type=int, default=None, choices=[1, 2, 3, 4],
+                        help="Run all entries in a block (A=CLIP, B=scratch, C=EMNIST, D=sweep, E=mech)")
+    parser.add_argument("--tier",      type=int, default=None, choices=[1, 2, 3],
                         help="Run all entries in a tier")
     parser.add_argument("--all",       action="store_true",
                         help="Run all entries in priority order")
@@ -1116,12 +1019,10 @@ def main():
     elif args.tier:
         run_ids = [rid for rid, c in RUN_MATRIX.items() if c["tier"] == args.tier]
     elif args.all:
-        # Execute in block order
         run_ids = []
-        for blk in "ABCDEF":
+        for blk in "ABCDE":
             run_ids.extend(BLOCK_ORDER[blk])
     else:
-        # Default: Block A (fastest/headline CLIP runs)
         print("[P16] No run specified. Running Block A (CLIP headline). Use --all for full matrix.")
         run_ids = BLOCK_ORDER["A"]
 
@@ -1131,13 +1032,6 @@ def main():
             continue
         cfg = RUN_MATRIX[run_id]
 
-        if cfg["tier"] == 4:
-            # LiRA shadow training
-            train_lira_shadows(run_id, cfg, device, args.data_root,
-                               args.out_dir, args.log_dir, args.ckpt_dir)
-            continue
-
-        # Determine seeds
         if args.seed is not None:
             seeds = [args.seed]
         else:

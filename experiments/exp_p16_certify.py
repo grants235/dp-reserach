@@ -130,16 +130,38 @@ def data_independent_eps(sigma_mult, q, T_steps, delta):
 # Per-instance certificates
 # ---------------------------------------------------------------------------
 
-def compute_certificates(log_df, sigma_use, delta, q):
+def compute_certificates(log_df, sigma_use, delta, q, lambdas=None):
     """
     Compute norm-based and direction-aware per-instance certificates.
 
     RDP (subsampled Gaussian, quadratic approximation):
-      ε_i(α) = q² * (α/2) * Σ_{t: i∈B_t} ||ḡ_it||² / σ_use²
+      ε_i(α) = q² * (α/2) * Σ_{t: i∈B_t} d²_it
+
+    where d²_it is the per-step effective squared distance:
+      - Norm-based:  d²_it = ||ḡ_it||² / σ_use²
+      - Direction-aware (Woodbury, rigorous upper bound on d_eff^(r)²):
+            d²_it = Σ_k (g_proj_k)² / (σ_use² + λ_k)  +  ||g_perp||² / σ_use²
+
+        This is equivalent to:
+            d²_it = ||ḡ_it||² / σ_use²
+                    - Σ_k (g_proj_k)² λ_k / (σ_use² (σ_use² + λ_k))
+
+        At r=0 it reduces to the norm-based bound.  No eigenspace assumption needed.
+
+    Parameters
+    ----------
+    log_df    : DataFrame with columns example_idx, grad_norm, incoherent_norm,
+                and optionally g_proj_0 … g_proj_{r-1}
+    sigma_use : actual noise std = sigma_mult * C  (σ_use² = σ_mult² C²)
+    delta     : DP delta
+    q         : subsampling rate
+    lambdas   : (r,) array of PCA eigenvalues Λ, loaded from meta.  When None
+                (or g_proj columns absent), falls back to incoherent-norm-only
+                formula (not rigorous — kept for backward compatibility).
 
     Returns dict with arrays indexed by unique example_idx.
     """
-    sigma2 = float(sigma_use) ** 2
+    sigma2 = float(sigma_use) ** 2   # σ_use² = σ_mult² C²
     q_sq   = float(q) ** 2
 
     idx_arr = log_df["example_idx"].to_numpy(dtype=np.int32)
@@ -151,6 +173,31 @@ def compute_certificates(log_df, sigma_use, delta, q):
     g2l        = {int(g): l for l, g in enumerate(unique_idx)}
     local_idx  = np.array([g2l[int(g)] for g in idx_arr], dtype=np.int32)
 
+    # ---- Try to load g_proj projections for Woodbury formula ----------------
+    use_woodbury = False
+    rank         = 0
+    sum_gproj2   = None   # (n, rank) — accumulated Σ_t (g_proj_k)² per example
+
+    if lambdas is not None and len(lambdas) > 0:
+        rank      = len(lambdas)
+        lambdas   = np.asarray(lambdas, dtype=np.float64)
+        proj_cols = [f"g_proj_{k}" for k in range(rank)]
+        if all(c in log_df.columns for c in proj_cols):
+            g_proj_mat  = log_df[proj_cols].to_numpy(dtype=np.float64)  # (N_rows, rank)
+            sum_gproj2  = np.zeros((n, rank), dtype=np.float64)
+            for k in range(rank):
+                np.add.at(sum_gproj2[:, k], local_idx, g_proj_mat[:, k] ** 2)
+            use_woodbury = True
+        else:
+            missing = [c for c in proj_cols if c not in log_df.columns]
+            print(f"  [cert] g_proj columns missing in log ({len(missing)}/{rank} absent); "
+                  f"falling back to incoherent-norm-only formula (not rigorous).")
+
+    if not use_woodbury:
+        print("  [cert] Woodbury formula NOT used — using incoherent-norm proxy "
+              "(lower bound on d_eff; certificates may be overly optimistic).")
+
+    # ---- Accumulate per-example sums ----------------------------------------
     n_sampled = np.zeros(n, dtype=np.int32)
     sum_gn2   = np.zeros(n, dtype=np.float64)
     sum_in2   = np.zeros(n, dtype=np.float64)
@@ -158,6 +205,18 @@ def compute_certificates(log_df, sigma_use, delta, q):
     np.add.at(sum_gn2,   local_idx, gn_arr ** 2)
     np.add.at(sum_in2,   local_idx, in_arr  ** 2)
 
+    # ---- Woodbury sum: Σ_t [ Σ_k (g_proj_k)²/(σ²+λ_k)  +  ||g_perp||²/σ² ] --
+    # Equivalently: sum_gn2/σ² - Σ_k sum_gproj2[:,k]*λ_k/(σ²(σ²+λ_k))
+    if use_woodbury:
+        # (n,) vector: Σ_k sum_gproj2[i,k] / (sigma2 + lambdas[k])
+        proj_term    = np.dot(sum_gproj2, 1.0 / (sigma2 + lambdas))  # (n,)
+        incoher_term = sum_in2 / sigma2                               # (n,)
+        sum_woodbury2 = proj_term + incoher_term
+    else:
+        # Fallback: only the incoherent term (not a rigorous upper bound)
+        sum_woodbury2 = sum_in2 / sigma2
+
+    # ---- RDP → ε conversion -------------------------------------------------
     eps_norm_arr = np.zeros(n, dtype=np.float64)
     eps_dir_arr  = np.zeros(n, dtype=np.float64)
 
@@ -165,20 +224,25 @@ def compute_certificates(log_df, sigma_use, delta, q):
         if n_sampled[i] == 0:
             continue
         rdp_norm = q_sq * (ALPHA_GRID / 2.0) * sum_gn2[i] / sigma2
-        rdp_dir  = q_sq * (ALPHA_GRID / 2.0) * sum_in2[i] / sigma2
+        # Direction-aware: uses full Woodbury formula when available
+        rdp_dir  = q_sq * (ALPHA_GRID / 2.0) * sum_woodbury2[i]
         eps_norm_arr[i], _ = rdp_to_dp(rdp_norm, ALPHA_GRID, delta)
         eps_dir_arr[i],  _ = rdp_to_dp(rdp_dir,  ALPHA_GRID, delta)
 
+    # β = incoherent fraction of gradient energy (unchanged definition)
     beta_mean = np.where(sum_gn2 > 0, sum_in2 / sum_gn2, 0.0)
 
     return {
-        "example_idx":   unique_idx,
-        "n_sampled":     n_sampled,
-        "sum_gnorm2":    sum_gn2,
-        "sum_inorm2":    sum_in2,
-        "eps_norm":      eps_norm_arr,
-        "eps_direction": eps_dir_arr,
-        "beta_mean":     beta_mean,
+        "example_idx":    unique_idx,
+        "n_sampled":      n_sampled,
+        "sum_gnorm2":     sum_gn2,
+        "sum_inorm2":     sum_in2,
+        "sum_woodbury2":  sum_woodbury2,
+        "eps_norm":       eps_norm_arr,
+        "eps_direction":  eps_dir_arr,
+        "beta_mean":      beta_mean,
+        "woodbury_used":  use_woodbury,
+        "woodbury_rank":  rank,
     }
 
 
@@ -186,30 +250,68 @@ def compute_certificates(log_df, sigma_use, delta, q):
 # β-spectrum computation (rank sweep for R3 runs)
 # ---------------------------------------------------------------------------
 
-def compute_beta_spectrum(log_df, sigma_use, delta, q, ranks=BETA_RANKS):
+def compute_beta_spectrum(log_df, sigma_use, delta, q, lambdas=None, ranks=BETA_RANKS):
     """
-    For each rank r in `ranks`, recompute per-instance direction-aware certificates
-    using only the top-r columns of V (V is not reloaded; instead we note that
-    incoherent_norm in the log was computed at rank RANK_V=100).
+    For each rank r in `ranks`, compute direction-aware certificates using the
+    top-r PCA components via the Woodbury formula.
 
-    Since we logged ||g_perp|| at rank 100, we cannot exactly recompute at lower
-    ranks from the log alone. Instead, we compute the β-spectrum from the
-    aggregate statistics: β̄ = mean(incoherent²) / mean(grad²) is rank-100 β.
-    For a theoretical β-spectrum, we would need to re-run with each rank.
+    When g_proj columns and lambdas are present (Woodbury path):
+      - For each rank r, truncate lambdas to the top-r eigenvalues and use only
+        g_proj_0 … g_proj_{r-1}.  This gives a valid upper bound at each rank:
+        d_eff^(r)² ≥ d_eff^(r')²  for r > r', so eps^dir decreases (tightens)
+        as r grows.
+      - β^(r) is defined as the mean of (sum_woodbury2^(r) / (sum_gnorm2/sigma2)).
 
-    What we can do from the existing log: compute certificates at rank 100 and
-    report the aggregate β = sum_inorm2 / sum_gnorm2.
-    For the actual β-spectrum, we flag that a re-run with each rank is needed.
+    When g_proj columns are absent (fallback):
+      - Only rank-100 β (the incoherent fraction) is reported; lower ranks need
+        a separate training run with smaller rank logged.
     """
-    print("  [β-spectrum] Note: recomputing at lower ranks requires per-example "
-          "gradient projections. Reporting rank-100 aggregate β here.")
-    certs = compute_certificates(log_df, sigma_use, delta, q)
+    sigma2     = float(sigma_use) ** 2
+    has_proj   = (lambdas is not None and len(lambdas) > 0 and
+                  f"g_proj_0" in log_df.columns)
+
+    if not has_proj:
+        print("  [β-spectrum] g_proj columns absent — reporting rank-100 β only.")
+        certs = compute_certificates(log_df, sigma_use, delta, q, lambdas=lambdas)
+        betas = {}
+        for r in ranks:
+            if r == max(ranks):
+                betas[r] = float(certs["beta_mean"].mean())
+            else:
+                betas[r] = None
+        return betas, certs
+
+    # Full Woodbury β-spectrum: compute certs at each rank
+    # Use all components for the "full" cert returned alongside betas
+    certs = compute_certificates(log_df, sigma_use, delta, q, lambdas=lambdas)
     betas = {}
     for r in ranks:
-        if r == 100:
-            betas[r] = float(certs["beta_mean"].mean())
+        r_use = min(r, len(lambdas))
+        lam_r = lambdas[:r_use]
+        # Reuse accumulation from certs; rebuild sum_gproj2 at rank r
+        idx_arr   = log_df["example_idx"].to_numpy(dtype=np.int32)
+        unique_idx = certs["example_idx"]
+        n          = len(unique_idx)
+        g2l        = {int(g): l for l, g in enumerate(unique_idx)}
+        local_idx  = np.array([g2l[int(g)] for g in idx_arr], dtype=np.int32)
+
+        sum_in2 = certs["sum_inorm2"]   # always at full rank (perp to all r cols)
+        sum_gn2 = certs["sum_gnorm2"]
+
+        if r_use > 0:
+            proj_cols  = [f"g_proj_{k}" for k in range(r_use)]
+            g_proj_mat = log_df[proj_cols].to_numpy(dtype=np.float64)
+            sgp2       = np.zeros((n, r_use), dtype=np.float64)
+            for k in range(r_use):
+                np.add.at(sgp2[:, k], local_idx, g_proj_mat[:, k] ** 2)
+            proj_term  = np.dot(sgp2, 1.0 / (sigma2 + lam_r))
         else:
-            betas[r] = None   # requires separate per-rank logging
+            proj_term  = np.zeros(n, dtype=np.float64)
+
+        sw2   = proj_term + sum_in2 / sigma2
+        norm2 = np.where(sum_gn2 > 0, sum_gn2 / sigma2, 1.0)
+        betas[r] = float(np.mean(sw2 / norm2))
+
     return betas, certs
 
 
@@ -242,23 +344,63 @@ def load_accuracy(tag, train_dir=TRAIN_DIR):
 # ---------------------------------------------------------------------------
 
 def load_log(log_path):
-    """Load parquet or npz log file."""
-    log_npz = log_path.replace(".parquet", ".npz")
+    """Load scalar log (parquet/npz) and merge g_proj companion file.
+
+    The scalar log (parquet or npz) contains: example_idx, grad_norm, incoherent_norm.
+    The companion _gproj.npy (written by exp_p16_train.py) contains the per-step PCA
+    projection vectors g_proj = V^T g_clip, shape (N_rows, rank).  These are merged
+    as columns g_proj_0 … g_proj_{rank-1} so that compute_certificates can use the
+    Woodbury formula.
+
+    Falls back gracefully if either file is missing.
+    """
+    import pandas as pd
+    log_npz      = log_path.replace(".parquet", ".npz")
+    gproj_path   = log_path.replace(".parquet", "_gproj.npy")
+
+    df = None
     if os.path.exists(log_path):
         try:
-            import pandas as pd
-            return pd.read_parquet(log_path)
+            df = pd.read_parquet(log_path)
         except Exception as e:
             print(f"  [warn] parquet load failed ({e}), trying npz...")
-    if os.path.exists(log_npz):
-        import pandas as pd
-        data = np.load(log_npz)
-        return pd.DataFrame({
+
+    if df is None and os.path.exists(log_npz):
+        data    = np.load(log_npz)
+        df_dict = {
             "example_idx":     data["example_idx"],
             "grad_norm":       data["grad_norm"],
             "incoherent_norm": data["incoherent_norm"],
-        })
-    return None
+        }
+        # Legacy npz that already embedded g_proj (older format)
+        if "g_proj" in data:
+            g_proj = data["g_proj"]
+            for k in range(g_proj.shape[1]):
+                df_dict[f"g_proj_{k}"] = g_proj[:, k]
+        df = pd.DataFrame(df_dict)
+
+    if df is None:
+        return None
+
+    # Merge companion _gproj.npy when g_proj columns are not already present
+    if "g_proj_0" not in df.columns and os.path.exists(gproj_path):
+        try:
+            g_proj = np.load(gproj_path)        # (N_rows, rank) float32
+            if len(g_proj) == len(df):
+                for k in range(g_proj.shape[1]):
+                    df[f"g_proj_{k}"] = g_proj[:, k]
+                print(f"  [log] Merged g_proj ({g_proj.shape[1]} cols, "
+                      f"{g_proj.shape[0]:,} rows) from {gproj_path}")
+            else:
+                print(f"  [warn] g_proj row count mismatch "
+                      f"({len(g_proj):,} vs {len(df):,} in scalar log); skipping Woodbury")
+        except Exception as e:
+            print(f"  [warn] g_proj load failed ({e}); Woodbury will not be used")
+    elif "g_proj_0" not in df.columns:
+        print(f"  [warn] No g_proj companion found at {gproj_path}; "
+              f"Woodbury formula will fall back to incoherent-norm proxy")
+
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -271,10 +413,17 @@ def summarize(label, certs, delta, eps_target, tier_local=None):
     ns    = certs["n_sampled"]
     bm    = certs["beta_mean"]
     ratio = np.where(en > 0, ed / en, np.nan)
+    woodbury_used = certs.get("woodbury_used", False)
+    woodbury_rank = certs.get("woodbury_rank", 0)
+
+    method_tag = (f"Woodbury r={woodbury_rank} [rigorous upper bound]"
+                  if woodbury_used
+                  else "incoherent-norm proxy [NOT rigorous — lower bound on d_eff]")
 
     print(f"\n{'='*70}")
     print(f"  {label}")
     print(f"  n={len(en)}, ε_target={eps_target}, δ={delta:.2e}")
+    print(f"  ε^dir method: {method_tag}")
     print(f"{'='*70}")
     print(f"  Norm-based  (ε^norm):  mean={en.mean():.4f}  "
           f"95th={np.percentile(en,95):.4f}  max={en.max():.4f}")
@@ -315,6 +464,9 @@ def build_summary_dict(certs, eps_di, alpha_di, tier_local=None):
         "tightening_med":  float(np.median(r_clean)) if len(r_clean) > 0 else float("nan"),
         "beta_mean": float(bm.mean()), "beta_95": float(np.percentile(bm, 95)),
         "n_sampled_mean": float(ns.mean()),
+        # Woodbury metadata: indicates whether ε^dir used the rigorous formula
+        "woodbury_used": bool(certs.get("woodbury_used", False)),
+        "woodbury_rank": int(certs.get("woodbury_rank", 0)),
     }
     if tier_local is not None and len(tier_local) > 0:
         for t, tname in TIER_NAMES.items():
@@ -334,9 +486,10 @@ def build_summary_dict(certs, eps_di, alpha_di, tier_local=None):
 
 def save_certs_csv(certs, cert_path, tier_local=None):
     fieldnames = ["example_idx", "n_sampled", "eps_norm", "eps_direction",
-                  "beta_mean", "sum_gnorm2", "sum_inorm2"]
+                  "beta_mean", "sum_gnorm2", "sum_inorm2", "sum_woodbury2"]
     if tier_local is not None and len(tier_local) > 0:
         fieldnames.append("tier")
+    woodbury_used = certs.get("woodbury_used", False)
     with open(cert_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
@@ -350,11 +503,13 @@ def save_certs_csv(certs, cert_path, tier_local=None):
                 "beta_mean":     f"{certs['beta_mean'][i]:.6f}",
                 "sum_gnorm2":    f"{certs['sum_gnorm2'][i]:.6f}",
                 "sum_inorm2":    f"{certs['sum_inorm2'][i]:.6f}",
+                "sum_woodbury2": f"{certs['sum_woodbury2'][i]:.6f}",
             }
             if tier_local is not None and len(tier_local) > 0:
                 row["tier"] = int(tier_local[i])
             w.writerow(row)
-    print(f"  [cert] Saved: {cert_path}")
+    rigour = "Woodbury" if woodbury_used else "incoherent-norm proxy (not rigorous)"
+    print(f"  [cert] Saved: {cert_path}  [{rigour}]")
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +615,12 @@ def certify_run_seed(run_id, cfg, seed, log_dir, cert_dir):
                 "beta_mean":     df["beta_mean"].to_numpy(np.float64),
                 "sum_gnorm2":    df["sum_gnorm2"].to_numpy(np.float64),
                 "sum_inorm2":    df["sum_inorm2"].to_numpy(np.float64),
+                "sum_woodbury2": (df["sum_woodbury2"].to_numpy(np.float64)
+                                  if "sum_woodbury2" in df.columns
+                                  else df["sum_inorm2"].to_numpy(np.float64)),
+                # Cached certs don't store the Woodbury flag; mark as unknown
+                "woodbury_used": "sum_woodbury2" in df.columns,
+                "woodbury_rank": 0,
             }
             tier_local = df["tier"].to_numpy(np.int32) if "tier" in df.columns else None
             return certs, tier_local
@@ -487,6 +648,14 @@ def certify_run_seed(run_id, cfg, seed, log_dir, cert_dir):
     priv_idx  = meta["priv_idx"]
     has_tiers = len(tier_arr) > 0
 
+    # PCA eigenvalues for Woodbury formula (stored by exp_p16_train.py as "lambdas")
+    lambdas = meta["lambdas"].astype(np.float64) if "lambdas" in meta else None
+    if lambdas is not None:
+        print(f"  Woodbury: loaded {len(lambdas)} PCA eigenvalues from meta "
+              f"(λ_max={lambdas[0]:.4g}, λ_min={lambdas[-1]:.4g})")
+    else:
+        print("  Woodbury: no lambdas in meta — will use incoherent-norm fallback.")
+
     print(f"\n[P16-cert] === {run_id} seed={seed} ===")
     print(f"  log rows={len(log_df):,}  n_priv={n_priv}  eps={eps}  delta={delta:.2e}")
     print(f"  sigma_use={sigma_use:.4f}  q={q:.5f}  T={T_steps}")
@@ -498,9 +667,11 @@ def certify_run_seed(run_id, cfg, seed, log_dir, cert_dir):
     # Per-instance certificates
     is_r3 = cfg["regime"] == "R3"
     if is_r3:
-        betas, certs = compute_beta_spectrum(log_df, sigma_use, delta, q)
+        betas, certs = compute_beta_spectrum(log_df, sigma_use, delta, q,
+                                             lambdas=lambdas)
     else:
-        certs = compute_certificates(log_df, sigma_use, delta, q)
+        certs = compute_certificates(log_df, sigma_use, delta, q,
+                                     lambdas=lambdas)
         betas = {}
 
     # Map tier labels to local positions
