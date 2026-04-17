@@ -651,8 +651,20 @@ def certify_run_seed(run_id, cfg, seed, log_dir, cert_dir):
     # PCA eigenvalues for Woodbury formula (stored by exp_p16_train.py as "lambdas")
     lambdas = meta["lambdas"].astype(np.float64) if "lambdas" in meta else None
     if lambdas is not None:
+        pca_lam_max = lambdas[0]
+        pca_lam_min = lambdas[-1]
+        # CRITICAL: Scale PCA eigenvalues to adversary's Poisson covariance eigenvalues.
+        # exp_p16_train.py stores eigenvalues of (1/N_pub) Σ_j ḡ_j ḡ_j^T (sample covariance).
+        # The adversary's Poisson covariance is:
+        #   Σ = q(1-q) Σ_{j=1}^{n_priv} ḡ_j ḡ_j^T = q(1-q) * n_priv * sample_covariance
+        # So: λ_k^Σ = q(1-q) * n_priv * λ_k^PCA
+        # Without this scaling, λ_k^PCA ~ 0.001–0.01 vs σ² ~ 6.8, giving ~0% tightening.
+        scale = q * (1.0 - q) * n_priv
+        lambdas = lambdas * scale
         print(f"  Woodbury: loaded {len(lambdas)} PCA eigenvalues from meta "
-              f"(λ_max={lambdas[0]:.4g}, λ_min={lambdas[-1]:.4g})")
+              f"(raw λ_max={pca_lam_max:.4g}, λ_min={pca_lam_min:.4g})")
+        print(f"  Woodbury: scaled by q(1-q)*n_priv = {q:.5f}*(1-{q:.5f})*{n_priv} = {scale:.2f} "
+              f"→ λ_max={lambdas[0]:.4g}, λ_min={lambdas[-1]:.4g}")
     else:
         print("  Woodbury: no lambdas in meta — will use incoherent-norm fallback.")
 
