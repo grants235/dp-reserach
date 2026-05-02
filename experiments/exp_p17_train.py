@@ -225,10 +225,10 @@ def _load_or_extract_clip_features(data_root, cache_dir, device):
              for k in ["train", "train_labels", "test", "test_labels"]}
     if all(os.path.exists(p) for p in paths.values()):
         print("  [CLIP] Loading cached features")
-        return (torch.load(paths["train"],        map_location="cpu"),
-                torch.load(paths["train_labels"], map_location="cpu"),
-                torch.load(paths["test"],         map_location="cpu"),
-                torch.load(paths["test_labels"],  map_location="cpu"))
+        return (torch.load(paths["train"],        map_location="cpu", weights_only=False),
+                torch.load(paths["train_labels"], map_location="cpu", weights_only=False),
+                torch.load(paths["test"],         map_location="cpu", weights_only=False),
+                torch.load(paths["test_labels"],  map_location="cpu", weights_only=False))
     print("  [CLIP] Extracting features (requires open_clip)...")
     try:
         import open_clip
@@ -619,7 +619,7 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir,
 
     if os.path.exists(ckpt_path):
         print(f"  [resume] Loading: {ckpt_path}")
-        ckpt = torch.load(ckpt_path, map_location=device)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state"])
         optimizer.load_state_dict(ckpt["optimizer_state"])
         scheduler.load_state_dict(ckpt["scheduler_state"])
