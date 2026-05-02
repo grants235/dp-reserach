@@ -143,6 +143,10 @@ def compute_certificates(stats, meta, delta):
     sum_reduction_k = stats["sum_reduction_k"].astype(np.float64) # [n_priv, rank]
     n_accounted     = int(stats["n_accounted"])
 
+    # Guard against float16 round-trip inflation: each step contributes at most
+    # C²/σ² to sum_norm2, so the total is bounded by n_accounted * C²/σ².
+    sum_norm2 = np.minimum(sum_norm2, n_accounted * (CLIP_C ** 2) / (sigma_use ** 2))
+
     # Steps not covered by accounting → data-independent fallback
     # At K-sparse accounting: n_unaccounted = T_steps - n_accounted * K
     # (approximately T_steps - n_accounted steps have no all-example logging)

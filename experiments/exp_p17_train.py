@@ -498,7 +498,11 @@ def _accumulate_step(projections, norms_sq, lam, sigma_use, sum_norm2, sum_reduc
     sum_reduction_k [n_priv, rank] += λ_k · (ḡ^T u_k)² / (σ_use² · (σ_use² + λ_k))
     """
     sigma2  = sigma_use ** 2
-    gn2_np  = norms_sq.numpy().astype(np.float64)
+    # Clamp squared norms to C² before accumulating.  The float16 round-trip in
+    # _eigenpairs_r3 (gc_clipped.half() → float32) can push individual norms
+    # fractionally above CLIP_C, causing sum_norm2 to slightly exceed the
+    # data-independent worst-case bound and failing the sanity check.
+    gn2_np  = np.minimum(norms_sq.numpy().astype(np.float64), CLIP_C ** 2)
     proj_np = projections.numpy().astype(np.float64)
     lam_np  = lam.cpu().numpy().astype(np.float64)
 
