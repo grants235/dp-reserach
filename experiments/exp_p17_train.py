@@ -623,7 +623,10 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir,
         model.load_state_dict(ckpt["model_state"])
         optimizer.load_state_dict(ckpt["optimizer_state"])
         scheduler.load_state_dict(ckpt["scheduler_state"])
-        torch.set_rng_state(ckpt["rng_state"])
+        rng_state = ckpt["rng_state"]
+        if not isinstance(rng_state, torch.ByteTensor):
+            rng_state = torch.ByteTensor(rng_state.tolist() if hasattr(rng_state, 'tolist') else list(rng_state))
+        torch.set_rng_state(rng_state)
         np.random.set_state(ckpt["np_rng_state"])
         random.setstate(ckpt["py_rng_state"])
         start_epoch      = ckpt["epoch"] + 1
