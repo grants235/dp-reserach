@@ -91,9 +91,10 @@ BLOCK_ORDER = {
 
 CLIP_C          = 1.0
 RANK            = 100              # eigenvectors to compute per step
-LANCZOS_ITERS   = 120             # for chunked Lanczos — needs > RANK iterations to find RANK eigenvectors
 ALL_EX_CHUNK    = 256             # chunk size for all-example sweep (R3)
 WRN_CHUNK       = 64              # chunk size for vmap per-sample grads (R1/R2)
+RSVD_CHUNK      = 256             # batch size for DataLoader in randomized-SVD passes
+RSVD_OVERSAMPLE = 20              # oversampling for randomized SVD (k = RANK + RSVD_OVERSAMPLE)
 N_PUB           = 2000
 LR              = 0.1
 MOMENTUM        = 0.9
@@ -400,85 +401,96 @@ def _eigenpairs_r3(model, priv_feats, priv_labels, q, rank, device):
     return U_r, lam, projections, norms_sq
 
 
-def _sigma_t_matvec_chunked(v, model, priv_ds, q, device, regime):
+def _eigenpairs_rsvd(model, priv_ds, q, rank, device, n_oversample=RSVD_OVERSAMPLE):
     """
-    Compute Σ_t v = q(1-q) Σ_j ḡ_j (ḡ_j^T v) by sweeping the dataset in chunks.
-    v: [d] GPU tensor.  Returns [d] GPU tensor.
-    """
-    result = torch.zeros_like(v)
-    N = len(priv_ds)
-    for i in range(0, N, WRN_CHUNK):
-        batch = [priv_ds[j] for j in range(i, min(i + WRN_CHUNK, N))]
-        xb = torch.stack([b[0] for b in batch])
-        yb = torch.tensor([b[1] for b in batch], dtype=torch.long)
-        with torch.no_grad():
-            gc   = _per_sample_grads_vmap(model, xb, yb, device)
-            nms  = gc.norm(dim=1, keepdim=True).clamp(min=1e-8)
-            gc_c = gc * (CLIP_C / nms).clamp(max=1.0)
-            dots = gc_c @ v                  # [chunk]
-            result += gc_c.T @ dots          # [d]
-        del gc, gc_c, dots; torch.cuda.empty_cache()
-    return q * (1.0 - q) * result
+    Top-r eigenpairs of Σ_t = q(1-q) G_t^T G_t via randomized SVD.
 
+    Replaces the Lanczos approach.  Lanczos needed RANK+ full sweeps of the
+    dataset (one per Krylov iteration), making it O(hours) per accounting step.
+    Randomized SVD uses exactly 3 sweeps regardless of rank, giving ~40x speedup.
 
-def _eigenpairs_chunked(model, priv_ds, q, rank, device, n_iter=LANCZOS_ITERS):
-    """
-    R1/R2: Lanczos on Σ_t using chunked matvec (gradients recomputed per iteration).
-    Returns (U_r [d, rank], eigvals [rank], projections [n_priv, rank], norms_sq [n_priv]).
+    Algorithm (Halko et al. 2011):
+      Pass 1: Y = G @ Omega  (random sketch, k = rank + oversample)  + norms_sq
+      QR:     Q = orth(Y)
+      Pass 2: B = Q^T @ G   (left projection, B ∈ ℝ^{k×d})
+      SVD:    B B^T → eigenpairs → V_r ∈ ℝ^{d×rank}, eigenvalues
+      Pass 3: P = G @ V_r   (projections for accumulation)
+
+    Memory: B ∈ ℝ^{k×d} ≈ 130 MB for d=272k, k=120 — fits on 40 GB A100.
     """
     d = sum(p.numel() for p in model.parameters())
+    k = rank + n_oversample
 
-    # ----- Lanczos (custom, on GPU) ----------------------------------------
-    v = F.normalize(torch.randn(d, device=device), dim=0)
-    V_mat = torch.zeros(d, n_iter + 1, device=device)   # Krylov basis
-    alpha = torch.zeros(n_iter, device=device)
-    beta  = torch.zeros(n_iter + 1, device=device)
+    loader = DataLoader(priv_ds, batch_size=RSVD_CHUNK, shuffle=False,
+                        num_workers=4, pin_memory=True, drop_last=False)
 
-    V_mat[:, 0] = v
-    for j in range(n_iter):
-        Av = _sigma_t_matvec_chunked(V_mat[:, j], model, priv_ds, q, device, regime="R1")
-        if j > 0:
-            Av -= beta[j] * V_mat[:, j - 1]
-        alpha[j] = V_mat[:, j] @ Av
-        Av -= alpha[j] * V_mat[:, j]
-        beta[j + 1] = Av.norm()
-        if beta[j + 1].item() < 1e-10:
-            n_iter = j + 1
-            break
-        V_mat[:, j + 1] = Av / beta[j + 1]
+    # Fixed sketch matrix — use a separate Generator so we don't perturb global RNG.
+    sketch_rng = torch.Generator(device=device); sketch_rng.manual_seed(12345)
+    Omega = torch.randn(d, k, generator=sketch_rng, device=device)
 
-    # Tridiagonal eigenproblem
-    n_conv = n_iter
-    T_diag = alpha[:n_conv]
-    T_off  = beta[1:n_conv]
-    T_mat  = torch.diag(T_diag) + torch.diag(T_off, 1) + torch.diag(T_off, -1)
-    evals_T, evecs_T = torch.linalg.eigh(T_mat)   # ascending
-
-    # Top-rank Ritz vectors
-    k_use   = min(rank, n_conv)
-    U_r     = (V_mat[:, :n_conv] @ evecs_T[:, -k_use:]).flip(1)   # [d, k_use] descending
-    lam     = evals_T[-k_use:].flip(0)                              # [k_use] descending
-    del V_mat, T_mat, evecs_T; torch.cuda.empty_cache()
-
-    # ----- Compute projections + norms (one more sweep) --------------------
-    N = len(priv_ds)
-    proj_parts = []; norms_sq_parts = []
-    U_r_T = U_r.T   # [rank, d]
-    for i in range(0, N, WRN_CHUNK):
-        batch = [priv_ds[j] for j in range(i, min(i + WRN_CHUNK, N))]
-        xb = torch.stack([b[0] for b in batch])
-        yb = torch.tensor([b[1] for b in batch], dtype=torch.long)
+    # --- Pass 1: Y = G @ Omega, accumulate norms_sq -------------------------
+    Y_parts = []; norms_sq_parts = []
+    for batch_data in loader:
+        x, y = batch_data[0], batch_data[1]
         with torch.no_grad():
-            gc   = _per_sample_grads_vmap(model, xb, yb, device)
+            gc   = _per_sample_grads_vmap(model, x, y, device)
             nms  = gc.norm(dim=1, keepdim=True).clamp(min=1e-8)
             gc_c = gc * (CLIP_C / nms).clamp(max=1.0)
-            proj_parts.append((gc_c @ U_r).cpu())         # [chunk, rank]
-            norms_sq_parts.append((gc_c ** 2).sum(1).cpu())  # [chunk]
+            Y_parts.append((gc_c @ Omega).cpu())           # [B, k]
+            norms_sq_parts.append((gc_c ** 2).sum(1).cpu())  # [B]
         del gc, gc_c; torch.cuda.empty_cache()
 
-    projections = torch.cat(proj_parts, dim=0)   # [n_priv, rank]
-    norms_sq    = torch.cat(norms_sq_parts, dim=0)  # [n_priv]
-    return U_r, lam, projections, norms_sq
+    Y        = torch.cat(Y_parts,        dim=0).float()  # [N, k]
+    norms_sq = torch.cat(norms_sq_parts, dim=0)          # [N]
+    del Y_parts, norms_sq_parts, Omega
+    torch.cuda.empty_cache()
+
+    # QR of Y (on CPU, Y is N×k ≈ 45k×120 = 21 MB — fast)
+    Q, _ = torch.linalg.qr(Y); del Y  # Q: [N, k]
+
+    # --- Pass 2: B = Q^T @ G  (accumulated chunk by chunk) ------------------
+    B   = torch.zeros(k, d, device=device, dtype=torch.float32)
+    row = 0
+    for batch_data in loader:
+        x, y  = batch_data[0], batch_data[1]
+        bs    = x.shape[0]
+        with torch.no_grad():
+            gc    = _per_sample_grads_vmap(model, x, y, device)
+            nms   = gc.norm(dim=1, keepdim=True).clamp(min=1e-8)
+            gc_c  = gc * (CLIP_C / nms).clamp(max=1.0)
+            Q_gpu = Q[row:row+bs, :].to(device)           # [bs, k]
+            B.addmm_(Q_gpu.T, gc_c)                       # B += Q_gpu^T @ gc_c
+        row += bs
+        del gc, gc_c, Q_gpu; torch.cuda.empty_cache()
+    del Q
+
+    # Eigendecomposition via B B^T ∈ ℝ^{k×k} (tiny)
+    with torch.no_grad():
+        BBT            = B @ B.T                                         # [k, k]
+        eigvals, U_B   = torch.linalg.eigh(BBT)                         # ascending
+        top_r          = min(rank, int((eigvals > 0).sum().item())) or 1
+        eigvals_r      = eigvals[-top_r:].flip(0).clamp(min=0.0)        # [top_r] desc
+        U_B_r          = U_B[:, -top_r:].flip(1)                        # [k, top_r]
+        s_r            = eigvals_r.sqrt().clamp(min=1e-12)
+        V_r            = (B.T @ U_B_r) / s_r[None, :]                  # [d, top_r]
+        lam            = q * (1.0 - q) * eigvals_r                      # [top_r]
+    del B, BBT, U_B; torch.cuda.empty_cache()
+
+    # --- Pass 3: P = G @ V_r ------------------------------------------------
+    proj_parts = []
+    for batch_data in loader:
+        x, y = batch_data[0], batch_data[1]
+        with torch.no_grad():
+            gc   = _per_sample_grads_vmap(model, x, y, device)
+            nms  = gc.norm(dim=1, keepdim=True).clamp(min=1e-8)
+            gc_c = gc * (CLIP_C / nms).clamp(max=1.0)
+            proj_parts.append((gc_c @ V_r).cpu())          # [B, top_r]
+        del gc, gc_c; torch.cuda.empty_cache()
+
+    projections = torch.cat(proj_parts, dim=0)  # [N, top_r]
+    del V_r; torch.cuda.empty_cache()
+
+    return None, lam, projections, norms_sq
 
 
 # ---------------------------------------------------------------------------
@@ -680,7 +692,7 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir,
                     U_r, lam, projections, norms_sq = _eigenpairs_r3(
                         model, priv_feats_all, priv_labels_all, q, RANK, device)
                 else:
-                    U_r, lam, projections, norms_sq = _eigenpairs_chunked(
+                    U_r, lam, projections, norms_sq = _eigenpairs_rsvd(
                         model, priv_ds, q, RANK, device)
 
                 _accumulate_step(
