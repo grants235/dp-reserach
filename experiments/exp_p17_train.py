@@ -350,17 +350,28 @@ def _set_grads(model, flat_grad):
 # Standard DP-SGD step (collect gradients for the training update)
 # ---------------------------------------------------------------------------
 
-def _collect_and_update(model, x, y, sigma_use, d_params, device, regime):
-    """Standard DP-SGD: clip per-sample, sum, add noise, return flat noisy gradient."""
+def _collect_and_update(model, x, y, sigma_use, d_params, device, regime,
+                        out_clipped_norms=None):
+    """
+    Standard DP-SGD step.
+
+    If out_clipped_norms is a list, appends a CPU float32 tensor of per-sample
+    clipped gradient norms for the current batch.  This is essentially free
+    (the gradients are already being computed) and enables sampled-side
+    norm logging for R1/R2 without any all-example backward passes.
+    """
     B = x.shape[0]; sum_g = torch.zeros(d_params, device=device)
     c = ALL_EX_CHUNK if regime == "R3" else WRN_CHUNK
     for ci in range(0, B, c):
         xc, yc = x[ci:ci+c], y[ci:ci+c]
-        gc = (_per_sample_grads_linear(model, xc, yc, device) if regime == "R3"
-              else _per_sample_grads_vmap(model, xc, yc, device))
+        gc    = (_per_sample_grads_linear(model, xc, yc, device) if regime == "R3"
+                 else _per_sample_grads_vmap(model, xc, yc, device))
         norms = gc.norm(dim=1, keepdim=True).clamp(min=1e-8)
-        sum_g += (gc * (CLIP_C / norms).clamp(max=1.0)).sum(0)
-        del gc; torch.cuda.empty_cache()
+        gc_c  = gc * (CLIP_C / norms).clamp(max=1.0)
+        sum_g += gc_c.sum(0)
+        if out_clipped_norms is not None:
+            out_clipped_norms.append(gc_c.norm(dim=1).cpu())   # clipped norms ≤ C
+        del gc, gc_c; torch.cuda.empty_cache()
     noise = torch.randn(d_params, device=device) * sigma_use
     return (sum_g + noise) / B
 

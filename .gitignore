@@ -1,0 +1,10 @@
+venv 
+
+*.tex
+run_all.py
+analyze_*.py
+/data 
+/results
+show_p6_oracle_vs_vanilla.py
+*.pyc
+*/__pycache__/*
