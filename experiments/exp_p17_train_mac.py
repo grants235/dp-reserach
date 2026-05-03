@@ -37,6 +37,10 @@ Usage
 """
 
 import os, sys, csv, math, argparse, random, json
+
+# Allow unsupported MPS ops to fall back to CPU instead of crashing on Apple Silicon.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -91,7 +95,7 @@ BLOCK_ORDER = {
 
 CLIP_C          = 1.0
 RANK            = 100              # eigenvectors to compute per step
-LANCZOS_ITERS   = 120             # for chunked Lanczos — needs > RANK iterations to find RANK eigenvectors
+LANCZOS_ITERS   = 60              # for chunked Lanczos (WRN/CNN)
 ALL_EX_CHUNK    = 256             # chunk size for all-example sweep (R3)
 WRN_CHUNK       = 64              # chunk size for vmap per-sample grads (R1/R2)
 N_PUB           = 2000
@@ -108,6 +112,45 @@ RESULTS_DIR     = "./results/exp_p17"
 LT_HEAD_CLASSES = {0, 1, 2}
 LT_MID_CLASSES  = {3, 4, 5, 6}
 LT_TAIL_CLASSES = {7, 8, 9}
+
+
+def choose_device(device_arg="auto", gpu=0):
+    """Choose CUDA, Apple Silicon MPS, or CPU.
+
+    On MacBook Pro GPUs, use --device mps. CUDA is only for NVIDIA GPUs.
+    """
+    if device_arg == "cpu":
+        return torch.device("cpu")
+
+    if device_arg == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA requested, but torch.cuda.is_available() is False.")
+        return torch.device(f"cuda:{gpu}")
+
+    if device_arg == "mps":
+        if not torch.backends.mps.is_available():
+            raise RuntimeError("MPS requested, but torch.backends.mps.is_available() is False.")
+        return torch.device("mps")
+
+    # auto
+    if torch.cuda.is_available():
+        return torch.device(f"cuda:{gpu}")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def empty_cache():
+    """Free accelerator cache for the active backend when available."""
+    if torch.cuda.is_available():
+        empty_cache()
+    elif torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+
+def dataloader_workers():
+    """macOS multiprocessing with MPS can be finicky; use 0 workers there."""
+    return 0 if sys.platform == "darwin" else 4
 
 
 def class_to_tier(c):
@@ -243,7 +286,7 @@ def _load_or_extract_clip_features(data_root, cache_dir, device):
                             T.CenterCrop(224), T.ToTensor(), T.Normalize(clip_mean, clip_std)])
     def _extract(ds_obj):
         feats, labs = [], []
-        for batch in DataLoader(ds_obj, batch_size=256, shuffle=False, num_workers=4):
+        for batch in DataLoader(ds_obj, batch_size=256, shuffle=False, num_workers=dataloader_workers()):
             with torch.no_grad():
                 f = clip_model.encode_image(batch[0].to(device))
             feats.append(f.cpu().float()); labs.append(batch[1])
@@ -253,7 +296,7 @@ def _load_or_extract_clip_features(data_root, cache_dir, device):
     tf, tl = _extract(train_raw); ef, el = _extract(test_raw)
     torch.save(tf, paths["train"]); torch.save(tl, paths["train_labels"])
     torch.save(ef, paths["test"]);  torch.save(el, paths["test_labels"])
-    del clip_model; torch.cuda.empty_cache()
+    del clip_model; empty_cache()
     return tf, tl, ef, el
 
 
@@ -359,7 +402,7 @@ def _collect_and_update(model, x, y, sigma_use, d_params, device, regime):
               else _per_sample_grads_vmap(model, xc, yc, device))
         norms = gc.norm(dim=1, keepdim=True).clamp(min=1e-8)
         sum_g += (gc * (CLIP_C / norms).clamp(max=1.0)).sum(0)
-        del gc; torch.cuda.empty_cache()
+        del gc; empty_cache()
     noise = torch.randn(d_params, device=device) * sigma_use
     return (sum_g + noise) / B
 
@@ -384,19 +427,28 @@ def _eigenpairs_r3(model, priv_feats, priv_labels, q, rank, device):
             gc = _per_sample_grads_linear(model, h, y, device)
             norms = gc.norm(dim=1, keepdim=True).clamp(min=1e-8)
             G_parts.append((gc * (CLIP_C / norms).clamp(max=1.0)).half())  # float16 to save VRAM
-        del gc; torch.cuda.empty_cache()
+        del gc; empty_cache()
     G_t = torch.cat(G_parts, dim=0).float()  # [n_priv, d]
 
     with torch.no_grad():
         cov = q * (1.0 - q) * (G_t.T @ G_t)      # [d, d]
-        eigvals_all, eigvecs_all = torch.linalg.eigh(cov)  # ascending
+        # Some torch.linalg ops are not consistently implemented on MPS.
+        # Compute the covariance on the accelerator, then do the eigensolve on CPU
+        # for Apple Silicon and move the top eigenspace back to the active device.
+        if device.type == "mps":
+            eigvals_all, eigvecs_all = torch.linalg.eigh(cov.cpu())  # ascending
+            eigvals_all = eigvals_all.to(device)
+            eigvecs_all = eigvecs_all.to(device)
+        else:
+            eigvals_all, eigvecs_all = torch.linalg.eigh(cov)  # ascending
+
         U_r = eigvecs_all[:, -rank:].flip(1)        # [d, rank], descending
         lam  = eigvals_all[-rank:].flip(0)           # [rank], descending
 
     projections = G_t @ U_r  # [n_priv, rank]
     norms_sq    = (G_t ** 2).sum(dim=1)  # [n_priv]
 
-    del G_t, cov, eigvecs_all; torch.cuda.empty_cache()
+    del G_t, cov, eigvecs_all; empty_cache()
     return U_r, lam, projections, norms_sq
 
 
@@ -417,7 +469,7 @@ def _sigma_t_matvec_chunked(v, model, priv_ds, q, device, regime):
             gc_c = gc * (CLIP_C / nms).clamp(max=1.0)
             dots = gc_c @ v                  # [chunk]
             result += gc_c.T @ dots          # [d]
-        del gc, gc_c, dots; torch.cuda.empty_cache()
+        del gc, gc_c, dots; empty_cache()
     return q * (1.0 - q) * result
 
 
@@ -452,13 +504,18 @@ def _eigenpairs_chunked(model, priv_ds, q, rank, device, n_iter=LANCZOS_ITERS):
     T_diag = alpha[:n_conv]
     T_off  = beta[1:n_conv]
     T_mat  = torch.diag(T_diag) + torch.diag(T_off, 1) + torch.diag(T_off, -1)
-    evals_T, evecs_T = torch.linalg.eigh(T_mat)   # ascending
+    if device.type == "mps":
+        evals_T, evecs_T = torch.linalg.eigh(T_mat.cpu())   # ascending
+        evals_T = evals_T.to(device)
+        evecs_T = evecs_T.to(device)
+    else:
+        evals_T, evecs_T = torch.linalg.eigh(T_mat)   # ascending
 
     # Top-rank Ritz vectors
     k_use   = min(rank, n_conv)
     U_r     = (V_mat[:, :n_conv] @ evecs_T[:, -k_use:]).flip(1)   # [d, k_use] descending
     lam     = evals_T[-k_use:].flip(0)                              # [k_use] descending
-    del V_mat, T_mat, evecs_T; torch.cuda.empty_cache()
+    del V_mat, T_mat, evecs_T; empty_cache()
 
     # ----- Compute projections + norms (one more sweep) --------------------
     N = len(priv_ds)
@@ -474,7 +531,7 @@ def _eigenpairs_chunked(model, priv_ds, q, rank, device, n_iter=LANCZOS_ITERS):
             gc_c = gc * (CLIP_C / nms).clamp(max=1.0)
             proj_parts.append((gc_c @ U_r).cpu())         # [chunk, rank]
             norms_sq_parts.append((gc_c ** 2).sum(1).cpu())  # [chunk]
-        del gc, gc_c; torch.cuda.empty_cache()
+        del gc, gc_c; empty_cache()
 
     projections = torch.cat(proj_parts, dim=0)   # [n_priv, rank]
     norms_sq    = torch.cat(norms_sq_parts, dim=0)  # [n_priv]
@@ -498,21 +555,20 @@ def _accumulate_step(projections, norms_sq, lam, sigma_use, sum_norm2, sum_reduc
     sum_reduction_k [n_priv, rank] += λ_k · (ḡ^T u_k)² / (σ_use² · (σ_use² + λ_k))
     """
     sigma2  = sigma_use ** 2
+    # Clamp squared norms to C² before accumulating.  The float16 round-trip in
+    # _eigenpairs_r3 (gc_clipped.half() → float32) can push individual norms
+    # fractionally above CLIP_C, causing sum_norm2 to slightly exceed the
+    # data-independent worst-case bound and failing the sanity check.
     gn2_np  = np.minimum(norms_sq.numpy().astype(np.float64), CLIP_C ** 2)
     proj_np = projections.numpy().astype(np.float64)
     lam_np  = lam.cpu().numpy().astype(np.float64)
 
-    # k_use may be < RANK when Lanczos terminates early (fewer Krylov steps
-    # than requested eigenvectors).  Only fill the first k_use columns;
-    # remaining columns stay zero, giving a conservative (zero) reduction
-    # for those directions — the bound is still valid.
-    k_use = len(lam_np)
-
     sum_norm2[:] += gn2_np / sigma2
 
-    denom  = sigma2 * (sigma2 + lam_np)                        # [k_use]
-    weight = lam_np / denom                                     # [k_use]
-    sum_reduction_k[:, :k_use] += (proj_np ** 2) * weight[None, :]
+    # reduction_k[j, k] = λ_k * proj²[j,k] / (σ²*(σ²+λ_k))
+    denom  = sigma2 * (sigma2 + lam_np)          # [rank]
+    weight = lam_np / denom                       # [rank]
+    sum_reduction_k[:] += (proj_np ** 2) * weight[None, :]
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +597,13 @@ def calibrate_sigma(eps, delta, q, T_steps):
 
 @torch.no_grad()
 def evaluate(model, test_ds, device, is_emnist=False, is_clip=False):
-    loader = DataLoader(test_ds, batch_size=512, shuffle=False, num_workers=4, pin_memory=True)
+    loader = DataLoader(
+        test_ds,
+        batch_size=512,
+        shuffle=False,
+        num_workers=dataloader_workers(),
+        pin_memory=(device.type == "cuda"),
+    )
     model.eval(); correct = total = 0
     for batch in loader:
         x, y = batch[0].to(device), batch[1].to(device)
@@ -658,8 +720,14 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir,
     writer   = csv.DictWriter(csv_file, fieldnames=["epoch", "train_loss", "test_acc", "lr", "n_accounted"])
     if csv_mode == "w": writer.writeheader()
 
-    priv_loader = DataLoader(priv_ds, batch_size=batch, shuffle=True,
-                             num_workers=4, pin_memory=True, drop_last=True)
+    priv_loader = DataLoader(
+        priv_ds,
+        batch_size=batch,
+        shuffle=True,
+        num_workers=dataloader_workers(),
+        pin_memory=(device.type == "cuda"),
+        drop_last=True,
+    )
 
     for epoch in range(start_epoch, epochs + 1):
         model.train(); total_loss = 0.0; n_batches = 0
@@ -690,7 +758,7 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir,
                 eigval_history.append(lam.cpu().numpy().astype(np.float32))
                 print(f"    [acct] step={step_global}  λ_max={lam[0].item():.4g}  "
                       f"λ_r={lam[-1].item():.4g}  n_accounted={n_accounted}")
-                del U_r, lam, projections, norms_sq; torch.cuda.empty_cache()
+                del U_r, lam, projections, norms_sq; empty_cache()
                 model.train()
 
             with torch.no_grad():
@@ -741,7 +809,7 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir,
     np.savez(meta_path, **meta_d)
 
     if os.path.exists(ckpt_path): os.remove(ckpt_path)
-    torch.cuda.empty_cache()
+    empty_cache()
     print(f"[P17] {run_id} seed={seed} done — acc={test_acc:.4f}  best={best_acc:.4f}"
           f"  n_accounted={n_accounted}/{step_global}")
 
@@ -759,7 +827,13 @@ def main():
     parser.add_argument("--seed",   type=int, default=None)
     parser.add_argument("--K",      type=int, default=None,
                         help="Sparse accounting interval (default: per run matrix)")
-    parser.add_argument("--gpu",    type=int, default=0)
+    parser.add_argument("--gpu",    type=int, default=0,
+                        help="CUDA GPU index. Ignored for --device mps/cpu.")
+    parser.add_argument("--device", type=str, default="auto",
+                        choices=["auto", "cpu", "cuda", "mps"],
+                        help="Device backend. Use --device mps on Apple Silicon MacBook Pro.")
+    parser.add_argument("--batch",  type=int, default=None,
+                        help="Optional batch-size override for local testing.")
     parser.add_argument("--data_root", type=str, default=DATA_ROOT)
     parser.add_argument("--cache_dir", type=str, default=CACHE_DIR)
     parser.add_argument("--out_dir",   type=str, default=os.path.join(RESULTS_DIR, "train"))
@@ -767,7 +841,7 @@ def main():
     parser.add_argument("--ckpt_dir",  type=str, default=os.path.join(RESULTS_DIR, "checkpoints"))
     args = parser.parse_args()
 
-    device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
+    device = choose_device(args.device, args.gpu)
     print(f"[P17] Device: {device}")
     os.makedirs(args.out_dir, exist_ok=True); os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(args.ckpt_dir, exist_ok=True)
@@ -787,7 +861,9 @@ def main():
     for run_id in run_ids:
         if run_id not in RUN_MATRIX:
             print(f"[P17] Unknown run: {run_id}"); continue
-        cfg = RUN_MATRIX[run_id]
+        cfg = dict(RUN_MATRIX[run_id])
+        if args.batch is not None:
+            cfg["batch"] = args.batch
         seeds = [args.seed] if args.seed is not None else list(range(cfg["n_seeds"]))
         for seed in seeds:
             train_run(run_id, cfg, seed, device, args.data_root, args.cache_dir,
