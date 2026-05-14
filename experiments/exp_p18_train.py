@@ -39,11 +39,20 @@ import torchvision.transforms as T
 # Run matrix (Section 2)
 # ---------------------------------------------------------------------------
 
+# Batch sizes are chosen to hold q = batch/n_priv ≈ 1/9 ≈ 0.111 across all settings.
+# This keeps σ identical at the same (ε, δ, T) so cross-setting comparisons in Table 5
+# are attributable to data distribution, not noise level.
+#
+# Approximate n_priv per dataset (90% private, 10% public per class):
+#   cifar10:       ~45,000  →  batch=5000  q≈0.111  T_train=360 (40ep) / 540 (60ep)
+#   cifar10_lt50:  ~12,602  →  batch=1400  q≈0.111  T_train=360 (40ep) / 540 (60ep)
+#   cifar10_lt100: ~11,167  →  batch=1200  q≈0.107  T_train=360 (40ep) / 540 (60ep)
+
 # Minimal TMLR-ready set (Section 2.1)
 SETTINGS_MINIMAL = {
     "S1": dict(dataset="cifar10",      regime="R3", eps=8.0, batch=5000, n_seeds=3, epochs=40, K=1),
-    "S2": dict(dataset="cifar10_lt50", regime="R3", eps=8.0, batch=5000, n_seeds=3, epochs=40, K=1),
-    "S3": dict(dataset="cifar10_lt50", regime="R2", eps=8.0, batch=5000, n_seeds=1, epochs=60, K=10),
+    "S2": dict(dataset="cifar10_lt50", regime="R3", eps=8.0, batch=1400, n_seeds=3, epochs=40, K=1),
+    "S3": dict(dataset="cifar10_lt50", regime="R2", eps=8.0, batch=1400, n_seeds=1, epochs=60, K=10),
 }
 
 # Optional expanded set (Section 2.2)
@@ -51,9 +60,9 @@ SETTINGS_EXPANDED = {
     "S4a": dict(dataset="cifar10",       regime="R3", eps=1.0, batch=5000, n_seeds=3, epochs=40, K=1),
     "S4b": dict(dataset="cifar10",       regime="R3", eps=2.0, batch=5000, n_seeds=3, epochs=40, K=1),
     "S4c": dict(dataset="cifar10",       regime="R3", eps=4.0, batch=5000, n_seeds=3, epochs=40, K=1),
-    "S5":  dict(dataset="cifar10_lt100", regime="R3", eps=8.0, batch=5000, n_seeds=3, epochs=40, K=1),
+    "S5":  dict(dataset="cifar10_lt100", regime="R3", eps=8.0, batch=1200, n_seeds=3, epochs=40, K=1),
     "S6":  dict(dataset="cifar10",       regime="R2", eps=8.0, batch=5000, n_seeds=1, epochs=60, K=10),
-    "S7":  dict(dataset="cifar10_lt100", regime="R2", eps=8.0, batch=5000, n_seeds=1, epochs=60, K=10),
+    "S7":  dict(dataset="cifar10_lt100", regime="R2", eps=8.0, batch=1200, n_seeds=1, epochs=60, K=10),
     "S9":  dict(dataset="cifar10",       regime="R1", eps=8.0, batch=5000, n_seeds=1, epochs=60, K=10),
 }
 
