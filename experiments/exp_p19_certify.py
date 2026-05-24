@@ -418,6 +418,7 @@ def certify_run(run_dir: str, cert_dir: str, ranks=None,
     T     = int(meta["T_train"])
     run_id = meta.get("run_id", "?")
     seed   = meta.get("seed", 0)
+    tag    = f"p19_{run_id}_seed{seed}"
 
     # Load statistics
     def _load(name):
@@ -452,25 +453,41 @@ def certify_run(run_dir: str, cert_dir: str, ranks=None,
     # ===================================================================
     print(f"\n  [cert] Building budget grid (committed before charge analysis)...")
     grid = build_budget_grid(sigma, q, T_use, ALPHA_GRID)
-    grid_path = os.path.join(cert_dir, f"p19_{run_id}_seed{seed}_filter_budget_grid.json")
+    grid_path = os.path.join(cert_dir, f"{tag}_filter_budget_grid.json")
     save_budget_grid(grid, grid_path)
 
     # ===================================================================
     # STEP 2: Compute norm-based realized cumulative charges
     #   (norm doesn't depend on rank — compute once)
     # ===================================================================
-    print(f"  [cert] Computing norm-based realized charges (T={T_use}, n={n})...")
-    # We need C_norm for all α. Compute together with dir at rank=100 (headline).
-    # For norm: mu_norm_{i,t} = ‖ḡ_{i,t}‖/√a (independent of rank).
-    # We'll extract C_norm as a by-product of the first rank computation.
+    headline_rank  = 100
+    ckpt_meta_path = os.path.join(cert_dir, f"{tag}_ckpt_meta.json")
+    c_norm_ckpt    = os.path.join(cert_dir, f"{tag}_C_realized_norm.npy")
+    c_dir100_ckpt  = os.path.join(cert_dir, f"{tag}_C_realized_dir_rank_{headline_rank}.npy")
 
-    # Compute for all ranks; norm is independent of rank so we extract it once.
-    headline_rank = 100
-    print(f"  [cert] Computing headline rank r={headline_rank}...")
-    C_norm, C_dir_100, fallback_rate, mu_dir_max, mu_norm_max = \
-        compute_realized_cumulative(
-            clipped_norms, B_matrices, YTY_matrices, Y_projections,
-            a, rho, sigma, q, headline_rank, ALPHA_GRID)
+    if (os.path.exists(c_norm_ckpt) and os.path.exists(c_dir100_ckpt)
+            and os.path.exists(ckpt_meta_path)):
+        print(f"  [cert] Resuming: loading cached C_norm + C_dir_r{headline_rank}...")
+        C_norm    = np.load(c_norm_ckpt)
+        C_dir_100 = np.load(c_dir100_ckpt)
+        with open(ckpt_meta_path) as f:
+            _cm = json.load(f)
+        fallback_rate = _cm["fallback_rate"]
+        mu_dir_max    = _cm["mu_dir_max"]
+        mu_norm_max   = _cm["mu_norm_max"]
+    else:
+        print(f"  [cert] Computing norm + headline rank r={headline_rank} (T={T_use}, n={n})...")
+        C_norm, C_dir_100, fallback_rate, mu_dir_max, mu_norm_max = \
+            compute_realized_cumulative(
+                clipped_norms, B_matrices, YTY_matrices, Y_projections,
+                a, rho, sigma, q, headline_rank, ALPHA_GRID)
+        np.save(c_norm_ckpt,   C_norm.astype(np.float64))
+        np.save(c_dir100_ckpt, C_dir_100.astype(np.float64))
+        with open(ckpt_meta_path, "w") as f:
+            json.dump({"fallback_rate": float(fallback_rate),
+                       "mu_dir_max":    float(mu_dir_max),
+                       "mu_norm_max":   float(mu_norm_max)}, f, indent=2)
+        print(f"  [cert] Checkpoint saved: C_norm + C_dir_r{headline_rank}")
 
     if verbose:
         print(f"  [cert] fallback_rate={fallback_rate:.6%}  "
@@ -493,13 +510,19 @@ def certify_run(run_dir: str, cert_dir: str, ranks=None,
     B_cert_dir_by_rank = {}
 
     for r in RANK_ABLATION:
+        c_dir_r_ckpt = os.path.join(cert_dir, f"{tag}_C_realized_dir_rank_{r}.npy")
         if r == headline_rank:
-            C_dir_r = C_dir_100
+            C_dir_r = C_dir_100   # already computed above
+        elif os.path.exists(c_dir_r_ckpt):
+            print(f"  [cert] Resuming: loading cached C_dir rank r={r}...")
+            C_dir_r = np.load(c_dir_r_ckpt)
         else:
             print(f"  [cert] Rank ablation r={r}...")
             _, C_dir_r, _, _, _ = compute_realized_cumulative(
                 clipped_norms, B_matrices, YTY_matrices, Y_projections,
                 a, rho, sigma, q, r, ALPHA_GRID)
+            np.save(c_dir_r_ckpt, C_dir_r.astype(np.float64))
+            print(f"  [cert] Checkpoint saved: C_dir_r{r}")
 
         B_cert_r      = filter_replay(C_dir_r, grid)
         eps_cert_dir_r, best_alpha_r = certified_epsilon(B_cert_r, ALPHA_GRID, delta)
@@ -528,7 +551,6 @@ def certify_run(run_dir: str, cert_dir: str, ranks=None,
     # ===================================================================
     # STEP 5: Save output files (spec §8.5–8.6)
     # ===================================================================
-    tag = f"p19_{run_id}_seed{seed}"
     np.save(os.path.join(cert_dir, f"{tag}_Bcert_norm.npy"),
             B_cert_norm.astype(np.float64))
     np.save(os.path.join(cert_dir, f"{tag}_epsilon_cert_norm.npy"),
@@ -561,23 +583,26 @@ def certify_run(run_dir: str, cert_dir: str, ranks=None,
         np.save(os.path.join(cert_dir, f"{tag}_filter_halt_step_dir_rank_{r}.npy"), halt_dir)
 
     # Per-step Ufull and d2hat for headline rank (diagnostic)
-    # Recomputed from stored data
-    Ufull_100  = np.zeros((n, T_use), dtype=np.float64)
-    dhat2_100  = np.zeros((n, T_use), dtype=np.float64)
-    fallback_100 = np.zeros((n, T_use), dtype=bool)
-    for t in range(T_use):
-        U_t, d2_t, fb_t = compute_U_full_and_d2hat(
-            clipped_norms[:, t], B_matrices[t], YTY_matrices[t],
-            Y_projections[:, t, :], a, rho, headline_rank)
-        Ufull_100[:, t]   = U_t
-        dhat2_100[:, t]   = d2_t
-        fallback_100[:, t] = fb_t
-    np.save(os.path.join(cert_dir, f"{tag}_Ufull_rank_{headline_rank}.npy"),
-            Ufull_100.astype(np.float32))
-    np.save(os.path.join(cert_dir, f"{tag}_dhat2_rank_{headline_rank}.npy"),
-            dhat2_100.astype(np.float32))
-    np.save(os.path.join(cert_dir, f"{tag}_fallback_mask_rank_{headline_rank}.npy"),
-            fallback_100.astype(bool))
+    ufull_ckpt    = os.path.join(cert_dir, f"{tag}_Ufull_rank_{headline_rank}.npy")
+    dhat2_ckpt    = os.path.join(cert_dir, f"{tag}_dhat2_rank_{headline_rank}.npy")
+    fallback_ckpt = os.path.join(cert_dir, f"{tag}_fallback_mask_rank_{headline_rank}.npy")
+    if os.path.exists(ufull_ckpt) and os.path.exists(dhat2_ckpt) and os.path.exists(fallback_ckpt):
+        print(f"  [cert] Resuming: loading cached Ufull/dhat2 diagnostics (r={headline_rank})...")
+    else:
+        Ufull_100    = np.zeros((n, T_use), dtype=np.float64)
+        dhat2_100    = np.zeros((n, T_use), dtype=np.float64)
+        fallback_100 = np.zeros((n, T_use), dtype=bool)
+        for t in range(T_use):
+            U_t, d2_t, fb_t = compute_U_full_and_d2hat(
+                clipped_norms[:, t], B_matrices[t], YTY_matrices[t],
+                Y_projections[:, t, :], a, rho, headline_rank)
+            Ufull_100[:, t]    = U_t
+            dhat2_100[:, t]    = d2_t
+            fallback_100[:, t] = fb_t
+        np.save(ufull_ckpt,    Ufull_100.astype(np.float32))
+        np.save(dhat2_ckpt,    dhat2_100.astype(np.float32))
+        np.save(fallback_ckpt, fallback_100.astype(bool))
+        print(f"  [cert] Checkpoint saved: Ufull/dhat2 diagnostics (r={headline_rank})")
 
     # ===================================================================
     # STEP 6: Sanity checks (spec §13.1–13.5)
