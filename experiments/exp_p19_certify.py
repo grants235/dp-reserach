@@ -30,6 +30,7 @@ Usage:
 """
 
 import os, sys, json, math, argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 from numpy.polynomial.hermite import hermgauss
 
@@ -381,6 +382,36 @@ def certified_epsilon(B_cert: np.ndarray,      # (n, n_alpha)
 
 
 # ---------------------------------------------------------------------------
+# Parallel rank-ablation worker (top-level so ProcessPoolExecutor can pickle it)
+# ---------------------------------------------------------------------------
+
+def _rank_worker(args):
+    """
+    Compute C_dir for one rank r, loading arrays via mmap to avoid pickling them.
+    Returns (r, C_dir_r).
+    """
+    run_dir, cert_dir, tag, r, a, rho, sigma, q, T_use = args
+    c_dir_r_ckpt = os.path.join(cert_dir, f"{tag}_C_realized_dir_rank_{r}.npy")
+    if os.path.exists(c_dir_r_ckpt):
+        print(f"  [cert] Resuming: loading cached C_dir rank r={r}...")
+        return r, np.load(c_dir_r_ckpt)
+
+    # mmap_mode='r' lets workers share the on-disk arrays without copying them
+    clipped_norms = np.load(os.path.join(run_dir, "clipped_norms.npy"), mmap_mode='r')[:, :T_use]
+    B_matrices    = np.load(os.path.join(run_dir, "B_matrices.npy"),    mmap_mode='r')[:T_use]
+    YTY_matrices  = np.load(os.path.join(run_dir, "YTY_matrices.npy"),  mmap_mode='r')[:T_use]
+    Y_projections = np.load(os.path.join(run_dir, "Y_projections.npy"), mmap_mode='r')[:, :T_use, :]
+
+    _, C_dir_r, _, _, _ = compute_realized_cumulative(
+        clipped_norms, B_matrices, YTY_matrices, Y_projections,
+        a, rho, sigma, q, r, ALPHA_GRID)
+
+    np.save(c_dir_r_ckpt, C_dir_r.astype(np.float64))
+    print(f"  [cert] Checkpoint saved: C_dir_r{r}")
+    return r, C_dir_r
+
+
+# ---------------------------------------------------------------------------
 # Full certification for one run
 # ---------------------------------------------------------------------------
 
@@ -504,35 +535,34 @@ def certify_run(run_dir: str, cert_dir: str, ranks=None,
     eps_cert_dir_100,  best_alpha_dir_100  = certified_epsilon(B_cert_dir_100, ALPHA_GRID, delta)
 
     # ===================================================================
-    # STEP 4: Rank ablation
+    # STEP 4: Rank ablation (parallel across ranks)
     # ===================================================================
-    rank_results  = {}
+    C_dir_by_rank = {headline_rank: C_dir_100}
+
+    other_ranks = [r for r in RANK_ABLATION if r != headline_rank]
+    if other_ranks:
+        n_workers = min(len(other_ranks), os.cpu_count() or 4)
+        print(f"  [cert] Rank ablation {other_ranks} — {n_workers} parallel workers")
+        worker_args = [
+            (run_dir, cert_dir, tag, r, a, rho, sigma, q, T_use)
+            for r in other_ranks
+        ]
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futures = {pool.submit(_rank_worker, wa): wa[3] for wa in worker_args}
+            for fut in as_completed(futures):
+                r_done, C_dir_r = fut.result()
+                C_dir_by_rank[r_done] = C_dir_r
+
+    rank_results       = {}
     B_cert_dir_by_rank = {}
-
     for r in RANK_ABLATION:
-        c_dir_r_ckpt = os.path.join(cert_dir, f"{tag}_C_realized_dir_rank_{r}.npy")
-        if r == headline_rank:
-            C_dir_r = C_dir_100   # already computed above
-        elif os.path.exists(c_dir_r_ckpt):
-            print(f"  [cert] Resuming: loading cached C_dir rank r={r}...")
-            C_dir_r = np.load(c_dir_r_ckpt)
-        else:
-            print(f"  [cert] Rank ablation r={r}...")
-            _, C_dir_r, _, _, _ = compute_realized_cumulative(
-                clipped_norms, B_matrices, YTY_matrices, Y_projections,
-                a, rho, sigma, q, r, ALPHA_GRID)
-            np.save(c_dir_r_ckpt, C_dir_r.astype(np.float64))
-            print(f"  [cert] Checkpoint saved: C_dir_r{r}")
-
-        B_cert_r      = filter_replay(C_dir_r, grid)
+        C_dir_r        = C_dir_by_rank[r]
+        B_cert_r       = filter_replay(C_dir_r, grid)
         eps_cert_dir_r, best_alpha_r = certified_epsilon(B_cert_r, ALPHA_GRID, delta)
         B_cert_dir_by_rank[r] = B_cert_r
 
-        # Realized (for discretization overhead diagnostics)
         eps_realized_dir_r, _ = certified_epsilon(C_dir_r, ALPHA_GRID, delta)
-
-        # Discretization overhead
-        overhead_r = B_cert_r - C_dir_r                # (n, n_alpha)
+        overhead_r = B_cert_r - C_dir_r
 
         rank_results[r] = {
             "eps_cert_dir":     eps_cert_dir_r,
@@ -545,8 +575,7 @@ def certify_run(run_dir: str, cert_dir: str, ranks=None,
 
         if verbose:
             print(f"    r={r:3d}: ε^dir_cert med={np.median(eps_cert_dir_r):.4f}  "
-                  f"ε^norm_cert med={np.median(eps_cert_norm):.4f}  "
-                  f"fallback rate already computed at r=100")
+                  f"ε^norm_cert med={np.median(eps_cert_norm):.4f}")
 
     # ===================================================================
     # STEP 5: Save output files (spec §8.5–8.6)
