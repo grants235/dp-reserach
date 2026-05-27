@@ -307,11 +307,26 @@ def table_3(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR, out_dir=OUT
             if r:
                 r["tier"] = t_name; r["within_tier"] = True
                 wt_rhos.append(r["rho"]); rows.append(r)
+            r = _compute_row(eps_norm_members[mask_t],
+                             f"  ε^norm cert [{t_name}]",
+                             D_arr=D_lira[mask_t])
+            if r:
+                r["tier"] = t_name; r["within_tier"] = True; rows.append(r)
+            if loss_final is not None:
+                r = _compute_row(loss_final[mask_t],
+                                 f"  loss [{t_name}]",
+                                 D_arr=D_lira[mask_t])
+                if r:
+                    r["tier"] = t_name; r["within_tier"] = True; rows.append(r)
         if wt_rhos:
             headline_rho = next((r["rho"] for r in rows
                                  if "within_tier" not in r and "ε^dir cert" in r["label"]), None)
-            print(f"\n  Mean within-tier ρ: {np.mean(wt_rhos):.4f}  "
-                  + (f"vs headline raw ρ={headline_rho:.4f}" if headline_rho else ""))
+            wt_norm_rhos = [r["rho"] for r in rows
+                            if r.get("within_tier") and "ε^norm" in r["label"]]
+            print(f"\n  Mean within-tier ρ (ε^dir):  {np.mean(wt_rhos):.4f}"
+                  + (f"  vs headline raw ρ={headline_rho:.4f}" if headline_rho else ""))
+            if wt_norm_rhos:
+                print(f"  Mean within-tier ρ (ε^norm): {np.mean(wt_norm_rhos):.4f}")
 
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "table3_lira_correlation.json"), "w") as f:
