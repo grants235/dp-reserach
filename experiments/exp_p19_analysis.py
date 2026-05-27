@@ -40,6 +40,8 @@ ALPHA_GRID = np.concatenate([
     np.arange(1000, 5001,  100.0),
 ]).astype(np.float64)
 
+RANK_ABLATION = [10, 25, 50, 100, 200]
+
 
 def _plt():
     try:
@@ -725,13 +727,95 @@ def gaussian_validation(run_id, seed, runs_dir=RUNS_DIR, out_dir=OUT_DIR,
 
 
 # ---------------------------------------------------------------------------
+# Table 6: Rank ablation
+# ---------------------------------------------------------------------------
+
+def table_6(cert_dir=CERT_DIR, out_dir=OUT_DIR):
+    """
+    Table 6: Certified ε^dir vs Nyström rank r across RANK_ABLATION = [10,25,50,100,200].
+
+    Key question: does masking saturate before r=100 (rank is sufficient) or
+    keep shrinking at r=200 (higher rank would tighten the bound further)?
+    Reports median/p5/p95 of ε^dir cert and overhead p95 at each rank, with
+    ε^norm as the baseline reference.
+    """
+    print(f"\n{'='*72}")
+    print(f"  Table 6: Rank Ablation (ε^dir cert vs Nyström rank r)")
+    print(f"{'='*72}")
+
+    all_rows = []
+    for run_id, seeds in [("F1", [0]), ("F5", [0, 1, 2])]:
+        for seed in seeds:
+            tag  = f"p19_{run_id}_seed{seed}"
+            cert = _load_cert(run_id, seed, cert_dir)
+            if "epsilon_cert_norm" not in cert:
+                continue
+            eps_norm = cert["epsilon_cert_norm"]
+
+            # Load ε^dir for every rank that was computed
+            rank_eps = {}
+            for r in RANK_ABLATION:
+                p = os.path.join(cert_dir, f"{tag}_epsilon_cert_dir_rank_{r}.npy")
+                if os.path.exists(p):
+                    rank_eps[r] = np.load(p)
+
+            if not rank_eps:
+                print(f"  {run_id} seed={seed}: no rank ablation files found, skipping.")
+                continue
+
+            norm_med = float(np.median(eps_norm))
+            print(f"\n  {run_id} seed={seed}  (ε^norm med={norm_med:.4f})")
+            hdr = (f"    {'r':>5}  {'ε^dir med':>10}  {'p5':>7}  {'p95':>8}  "
+                   f"{'masking%':>9}  {'Δ vs r-1':>9}  {'overhead p95':>13}")
+            print(hdr)
+
+            prev_med = None
+            for r in RANK_ABLATION:
+                if r not in rank_eps:
+                    continue
+                ed  = rank_eps[r]
+                med = float(np.median(ed))
+                masking_pct = 100.0 * (1.0 - med / max(norm_med, 1e-15))
+                delta = (med - prev_med) if prev_med is not None else float('nan')
+
+                overhead_p95 = float('nan')
+                b_path = os.path.join(cert_dir, f"{tag}_Bcert_dir_rank_{r}.npy")
+                c_path = os.path.join(cert_dir, f"{tag}_C_realized_dir_rank_{r}.npy")
+                if os.path.exists(b_path) and os.path.exists(c_path):
+                    overhead_p95 = float(np.percentile(
+                        (np.load(b_path) - np.load(c_path)).flatten(), 95))
+
+                delta_str = f"{delta:+9.4f}" if np.isfinite(delta) else f"{'—':>9}"
+                print(f"    {r:5d}  {med:10.4f}  "
+                      f"{np.percentile(ed,5):7.4f}  {np.percentile(ed,95):8.4f}  "
+                      f"{masking_pct:9.2f}%  {delta_str}  {overhead_p95:13.6f}")
+
+                all_rows.append({
+                    "run_id": run_id, "seed": seed, "rank": r,
+                    "eps_dir_med":  med,
+                    "eps_dir_p5":   float(np.percentile(ed, 5)),
+                    "eps_dir_p95":  float(np.percentile(ed, 95)),
+                    "eps_norm_med": norm_med,
+                    "masking_pct":  masking_pct,
+                    "delta_vs_prev_rank": float(delta),
+                    "overhead_p95": overhead_p95,
+                })
+                prev_med = med
+
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "table6_rank_ablation.json"), "w") as f:
+        json.dump(all_rows, f, indent=2)
+    print(f"\n  [saved] {out_dir}/table6_rank_ablation.json")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="Phase 19 analysis")
     parser.add_argument("--all",     action="store_true", help="Run all tables and figures")
-    parser.add_argument("--table",   type=str, default=None, choices=["1","2","3","4","5"],
+    parser.add_argument("--table",   type=str, default=None, choices=["1","2","3","4","5","6"],
                         help="Run specific table")
     parser.add_argument("--figure",  type=str, default=None, choices=["1","2"],
                         help="Run specific figure")
@@ -756,6 +840,8 @@ def main():
         table_4(args.cert_dir, args.out_dir)
     if args.all or args.table == "5":
         table_5(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir)
+    if args.all or args.table == "6":
+        table_6(args.cert_dir, args.out_dir)
     if args.all or args.figure == "1":
         figure_1(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir)
     if args.all or args.figure == "2":
