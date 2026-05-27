@@ -467,17 +467,39 @@ def run_scoring(lira_id, cfg, device, runs_dir, lira_dir):
     np.save(os.path.join(out_dir, "lira_scores_members.npy"),    in_arr.astype(np.float32))
     np.save(os.path.join(out_dir, "lira_scores_nonmembers.npy"), out_arr.astype(np.float32))
 
-    # Compute D_i^LiRA for members
-    VAR_FLOOR = 1e-6
+    # Compute global score variance as a data-driven variance floor.
+    # A hard 1e-6 floor inflates |D_lira| for easy (head) examples where var_in
+    # and var_out both collapse to near zero: pooled_std → 1e-3 and D_lira explodes.
+    # Since ε_dir also correlates with tier, this creates an artifactual component
+    # in the headline ρ. Using global_var (across all shadow scores, all targets)
+    # as the floor matches the Carlini et al. 2022 global-variance offline variant.
+    all_scores_flat = []
+    for i in range(n_m):
+        all_scores_flat.extend(shadow_scores_m_in[i])
+        all_scores_flat.extend(shadow_scores_m_out[i])
+    global_var = float(np.var(all_scores_flat)) if len(all_scores_flat) > 1 else 1.0
+    VAR_FLOOR = max(global_var, 1e-6)
+    print(f"  [LiRA {lira_id}] global_var={global_var:.6f}  VAR_FLOOR={VAR_FLOOR:.6f}")
+
     D_lira_members = np.zeros(n_m)
+    n_floor_hits_in = 0; n_floor_hits_out = 0
     for i in range(n_m):
         s_in  = np.array(shadow_scores_m_in[i])
         s_out = np.array(shadow_scores_m_out[i])
         if len(s_in) < 2 or len(s_out) < 2: continue
-        mu_in, var_in   = s_in.mean(), max(s_in.var(), VAR_FLOOR)
-        mu_out, var_out = s_out.mean(), max(s_out.var(), VAR_FLOOR)
+        raw_var_in  = s_in.var();  raw_var_out = s_out.var()
+        if raw_var_in  < VAR_FLOOR: n_floor_hits_in  += 1
+        if raw_var_out < VAR_FLOOR: n_floor_hits_out += 1
+        mu_in, var_in   = s_in.mean(), max(raw_var_in,  VAR_FLOOR)
+        mu_out, var_out = s_out.mean(), max(raw_var_out, VAR_FLOOR)
         pooled_std = math.sqrt(0.5 * (var_in + var_out))
         D_lira_members[i] = (mu_in - mu_out) / max(pooled_std, 1e-12)
+
+    floor_hit_rate_in  = n_floor_hits_in  / max(n_m, 1)
+    floor_hit_rate_out = n_floor_hits_out / max(n_m, 1)
+    print(f"  [LiRA {lira_id}] var-floor hits: in={n_floor_hits_in}/{n_m} "
+          f"({floor_hit_rate_in:.1%})  out={n_floor_hits_out}/{n_m} "
+          f"({floor_hit_rate_out:.1%})")
 
     # D_i^LiRA for nonmembers (using DP model logits as proxy for nonmember score)
     # For nonmembers, D_i^LiRA is typically negative (excluded from training)
@@ -497,7 +519,9 @@ def run_scoring(lira_id, cfg, device, runs_dir, lira_dir):
         llr_dp_nonmembers = logit_score(dp_nm_logits, nonmember_labels).astype(np.float32)
 
     np.save(os.path.join(out_dir, "D_lira_members.npy"),    D_lira_members.astype(np.float32))
-    # Nonmembers D_lira: approximate as -expected_D (or zeros for now)
+    # D_lira for nonmembers is NOT computed here — shadow training only covers private
+    # training examples, so test-set nonmembers have no in/out shadow split.
+    # Saved as zeros; Table 3 correlations use members only (clearly labeled).
     np.save(os.path.join(out_dir, "D_lira_nonmembers.npy"), np.zeros(n_nm, dtype=np.float32))
     np.save(os.path.join(out_dir, "llr_dp_members.npy"),    llr_dp_members)
     np.save(os.path.join(out_dir, "llr_dp_nonmembers.npy"), llr_dp_nonmembers)
@@ -540,6 +564,10 @@ def run_scoring(lira_id, cfg, device, runs_dir, lira_dir):
         "split_half_stability": split_half_corr,
         "min_in_shadows":  int(min_in),
         "min_out_shadows": int(min_out),
+        "global_var_floor": float(VAR_FLOOR),
+        "floor_hit_rate_in":  float(floor_hit_rate_in),
+        "floor_hit_rate_out": float(floor_hit_rate_out),
+        "note_nonmembers": "D_lira_nonmembers saved as zeros; Table 3 uses members only",
     }
     with open(os.path.join(out_dir, "lira_summary.json"), "w") as f:
         json.dump(summary, f, indent=2)

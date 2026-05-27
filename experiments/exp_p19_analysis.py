@@ -243,15 +243,15 @@ def table_3(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR, out_dir=OUT
     else:
         eps_real_dir_members = None
 
-    def _compute_row(y, label):
-        """Compute Spearman ρ, CI, rank R², AUC vs D_lira."""
-        mask = np.isfinite(y) & np.isfinite(D_lira)
-        y_m = y[mask]; D_m = D_lira[mask]
+    def _compute_row(y, label, D_arr=None):
+        """Compute Spearman ρ, CI, rank R² vs D_lira (or D_arr if provided)."""
+        D_ref = D_arr if D_arr is not None else D_lira
+        mask = np.isfinite(y) & np.isfinite(D_ref)
+        y_m = y[mask]; D_m = D_ref[mask]
         if len(y_m) < 10: return None
 
         if HAS_SCIPY:
             rho_val, pval = spearmanr(y_m, D_m)
-            # Bootstrap 95% CI
             def _spr(x, y): return spearmanr(x, y).statistic
             bs = bootstrap((y_m, D_m), _spr, n_resamples=1000,
                            paired=True, confidence_level=0.95,
@@ -263,19 +263,22 @@ def table_3(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR, out_dir=OUT
             rho_val = float(corrcoef(ry, rd)[0,1])
             ci_lo = ci_hi = float('nan')
 
-        # Rank-rank R²
         ry = np.argsort(np.argsort(y_m)); rd = np.argsort(np.argsort(D_m))
         r2 = float(np.corrcoef(ry, rd)[0, 1]**2)
 
-        print(f"    {label:35s}  ρ={rho_val:+.4f}  CI=[{ci_lo:.3f},{ci_hi:.3f}]  "
-              f"R²={r2:.4f}")
-        return {"label": label, "rho": float(rho_val), "ci_lo": ci_lo, "ci_hi": ci_hi, "R2": r2}
+        print(f"    {label:45s}  ρ={rho_val:+.4f}  CI=[{ci_lo:.3f},{ci_hi:.3f}]  "
+              f"R²={r2:.4f}  n={len(y_m)}")
+        return {"label": label, "rho": float(rho_val), "ci_lo": ci_lo, "ci_hi": ci_hi,
+                "R2": r2, "n": len(y_m)}
 
     rows = []
-    print(f"  {'Feature':35s}  {'Spearman ρ':10s}  {'95% CI':18s}  {'R²':6s}")
-    r = _compute_row(eps_dir_members, "certified ε^dir (r=100)")
+    # All correlations are rank Spearman across the 1500 *member* targets only.
+    # Nonmembers are not scored (D_lira_nonmembers = zeros placeholder).
+    print(f"  NOTE: all ρ values are Spearman rank correlations across member targets only.")
+    print(f"  {'Feature':45s}  {'Spearman ρ':10s}  {'95% CI':18s}  {'R²':6s}  {'n':5s}")
+    r = _compute_row(eps_dir_members, "ε^dir cert r=100 (member targets)")
     if r: rows.append(r)
-    r = _compute_row(eps_norm_members, "certified ε^norm")
+    r = _compute_row(eps_norm_members, "ε^norm cert (member targets)")
     if r: rows.append(r)
     if eps_real_dir_members is not None:
         r = _compute_row(eps_real_dir_members, "realized ε^dir (diagnostic, not cert)")
@@ -286,6 +289,29 @@ def table_3(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR, out_dir=OUT
     if "tier_labels" in run:
         r = _compute_row(run["tier_labels"][member_local].astype(float), "tier label")
         if r: rows.append(r)
+
+    # Within-tier partial Spearman: controls for tier-level confounding.
+    # If ε_dir and D_lira both track tier (and tier alone drives ρ), then
+    # within-tier ρ ≈ 0; if ε_dir captures finer-grained memorization beyond
+    # tier, within-tier ρ > 0 and the headline claim is genuinely stronger.
+    if "tier_labels" in run:
+        tier_arr = run["tier_labels"][member_local]
+        print(f"\n  Within-tier Spearman ρ (partial, controlling for tier):")
+        wt_rhos = []
+        for t_id, t_name in {0: "head", 1: "mid", 2: "tail"}.items():
+            mask_t = (tier_arr == t_id)
+            if mask_t.sum() < 10: continue
+            r = _compute_row(eps_dir_members[mask_t],
+                             f"  ε^dir cert [{t_name}]",
+                             D_arr=D_lira[mask_t])
+            if r:
+                r["tier"] = t_name; r["within_tier"] = True
+                wt_rhos.append(r["rho"]); rows.append(r)
+        if wt_rhos:
+            headline_rho = next((r["rho"] for r in rows
+                                 if "within_tier" not in r and "ε^dir cert" in r["label"]), None)
+            print(f"\n  Mean within-tier ρ: {np.mean(wt_rhos):.4f}  "
+                  + (f"vs headline raw ρ={headline_rho:.4f}" if headline_rho else ""))
 
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "table3_lira_correlation.json"), "w") as f:
@@ -622,18 +648,17 @@ def gaussian_validation(run_id, seed, runs_dir=RUNS_DIR, out_dir=OUT_DIR,
         t_idx = min(t_idx, T - 1)
         print(f"\n  [GV] {run_id} seed={seed}  phase={phase} step={t_idx}")
 
-        # Use Y_proj[:,t,:] as the gradient proxy for each example
-        # Y_proj[i,t,:r] = Y_t^T ḡ_{i,t} — a low-dimensional projection of gradient
-        # This is not the full gradient G_t, but it captures the covariance structure
-        # For the Gaussian validation of sampling uncertainty, we use:
-        #   G_{-i,t} = Σ_{j≠i} I_{j,t} Y_proj[j,t,:]  (projected)
-        # vs fitted Gaussian with covariance ρ Σ_{j≠i} Y_proj[j,t,:] Y_proj[j,t,:]^T
+        # NOTE: Y_proj[i,t,:r] = Y_t^T ḡ_{i,t} is a projection onto the top-r
+        # covariance directions of the gradient covariance matrix. This validation
+        # therefore tests Gaussianity only for the *dominant* directions — those
+        # where the CLT is most likely to hold by Lyapunov. The low-variance /
+        # incoherent directions (where the Gaussian approximation may break, and
+        # where the masking argument for tail examples is most sensitive) are
+        # truncated away. KS statistics here should be reported with this caveat.
         yp_t = Y_proj[:, t_idx, :n_projections].astype(np.float64)  # (n, K)
         K = yp_t.shape[1]
 
-        # Expected Cov(G_{-i,t}) ≈ ρ Σ_{j≠i} yp_j yp_j^T
-        # For each target, focus on the top projection direction
-        for (i_target, tier_name) in targets[:3]:    # limit for speed
+        for (i_target, tier_name) in targets:
             # Leave-one-out: directions from all j ≠ i
             yp_others = np.concatenate([yp_t[:i_target], yp_t[i_target+1:]], axis=0)
             # (n-1, K)
