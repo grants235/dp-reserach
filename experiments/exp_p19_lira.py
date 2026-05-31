@@ -27,10 +27,12 @@ Outputs (per LiRA run):
   lira/{lira_id}/lira_summary.json
 
 Usage:
-  python experiments/exp_p19_lira.py --lira_id LF1 --gpu 0
+  python experiments/exp_p19_lira.py --lira_id LF1 --gpu 0                        # seed 0 only
+  python experiments/exp_p19_lira.py --lira_id LF1 --all_seeds --gpu 0            # seeds 0,1,2
+  python experiments/exp_p19_lira.py --lira_id LF1 --seed 1 --gpu 0               # seed 1 only
   python experiments/exp_p19_lira.py --lira_id LF1 --shadow_start 0 --shadow_end 64 --gpu 0
-  python experiments/exp_p19_lira.py --lira_id LF1 --score_only --gpu 0
-  python experiments/exp_p19_lira.py --all --gpu 0
+  python experiments/exp_p19_lira.py --lira_id LF1 --score_only --all_seeds --gpu 0
+  python experiments/exp_p19_lira.py --all --all_seeds --gpu 0
 """
 
 import os, sys, json, argparse, random, math
@@ -52,11 +54,11 @@ import torchvision.transforms as T
 # ---------------------------------------------------------------------------
 
 LIRA_SETTINGS = {
-    "LF1": dict(matched_run="F1", seed=0, dataset="cifar10_lt50", regime="R3",
+    "LF1": dict(matched_run="F1", seeds=[0, 1, 2], dataset="cifar10_lt50", regime="R3",
                 n_targets=1500, n_shadows=128, shadow_epochs=20),
-    "LF2": dict(matched_run="F2", seed=0, dataset="cifar10",      regime="R3",
+    "LF2": dict(matched_run="F2", seeds=[0, 1, 2], dataset="cifar10",      regime="R3",
                 n_targets=1000, n_shadows=64,  shadow_epochs=20),
-    "LF5": dict(matched_run="F5", seed=0, dataset="cifar10_lt50", regime="R2",
+    "LF5": dict(matched_run="F5", seeds=[0, 1, 2], dataset="cifar10_lt50", regime="R2",
                 n_targets=300,  n_shadows=24,  shadow_epochs=30),
 }
 
@@ -280,17 +282,17 @@ def compute_lira_scores(member_in_scores, member_out_scores,
 # ---------------------------------------------------------------------------
 
 def run_lira(lira_id, cfg, shadow_start, shadow_end, device,
-             data_root, cache_dir, runs_dir, lira_dir):
+             data_root, cache_dir, runs_dir, lira_dir, seed=None):
     """Train shadow models and save their logit scores."""
     matched_run = cfg["matched_run"]
-    run_seed    = cfg["seed"]
+    run_seed    = seed if seed is not None else cfg["seeds"][0]
     dataset     = cfg["dataset"]
     regime      = cfg["regime"]
     n_shadows   = cfg["n_shadows"]
     n_epochs    = cfg["shadow_epochs"]
     is_clip     = (regime == "R3")
 
-    out_dir = os.path.join(lira_dir, lira_id)
+    out_dir = os.path.join(lira_dir, lira_id, f"seed_{run_seed}")
     os.makedirs(out_dir, exist_ok=True)
 
     run_dir = os.path.join(runs_dir, matched_run, f"seed_{run_seed}")
@@ -380,7 +382,7 @@ def run_lira(lira_id, cfg, shadow_start, shadow_end, device,
         np.save(os.path.join(out_dir, "nonmember_labels.npy"), nonmember_labels.astype(np.int32))
 
     meta = {
-        "lira_id": lira_id, "matched_run": matched_run, "seed": run_seed,
+        "lira_id": lira_id, "matched_run": matched_run, "run_seed": run_seed,
         "dataset": dataset, "regime": regime, "n_shadows": n_shadows,
         "n_targets_members": n_targets_m, "n_targets_nonmembers": n_targets_nm,
         "shadow_epochs": n_epochs, "shadow_range_done": [shadow_start, shadow_end_actual],
@@ -390,7 +392,7 @@ def run_lira(lira_id, cfg, shadow_start, shadow_end, device,
     print(f"  [LiRA {lira_id}] Shadows {shadow_start}–{shadow_end_actual} done.")
 
 
-def run_scoring(lira_id, cfg, device, runs_dir, lira_dir):
+def run_scoring(lira_id, cfg, device, runs_dir, lira_dir, seed=None):
     """
     Aggregate all shadow logits and compute LiRA scores.
 
@@ -400,12 +402,12 @@ def run_scoring(lira_id, cfg, device, runs_dir, lira_dir):
       D_i^LiRA = (mu_in - mu_out) / sqrt(0.5*(sigma_in^2 + sigma_out^2))
     """
     matched_run = cfg["matched_run"]
-    run_seed    = cfg["seed"]
+    run_seed    = seed if seed is not None else cfg["seeds"][0]
     n_shadows   = cfg["n_shadows"]
     regime      = cfg["regime"]
     is_clip     = (regime == "R3")
 
-    out_dir = os.path.join(lira_dir, lira_id)
+    out_dir = os.path.join(lira_dir, lira_id, f"seed_{run_seed}")
     run_dir = os.path.join(runs_dir, matched_run, f"seed_{run_seed}")
 
     member_local   = np.load(os.path.join(run_dir, "lira_member_local_idx.npy"))
@@ -556,6 +558,7 @@ def run_scoring(lira_id, cfg, device, runs_dir, lira_dir):
 
     summary = {
         "lira_id": lira_id,
+        "run_seed": run_seed,
         "n_shadows_used": available_shadows,
         "n_targets_members": n_m, "n_targets_nonmembers": n_nm,
         "D_lira_mean": float(D_lira_members.mean()),
@@ -586,6 +589,10 @@ def main():
     parser.add_argument("--shadow_end",   type=int, default=None)
     parser.add_argument("--score_only",   action="store_true")
     parser.add_argument("--all",          action="store_true")
+    parser.add_argument("--seed",         type=int, default=None,
+                        help="Single seed to run (overrides config seeds)")
+    parser.add_argument("--all_seeds",    action="store_true",
+                        help="Run all seeds defined in LIRA_SETTINGS (default: seed 0 only)")
     parser.add_argument("--gpu",          type=int, default=0)
     parser.add_argument("--data_root",    type=str, default=DATA_ROOT)
     parser.add_argument("--cache_dir",    type=str, default=CACHE_DIR)
@@ -608,13 +615,23 @@ def main():
     for lid in lira_ids:
         cfg = LIRA_SETTINGS[lid]
         shadow_end = args.shadow_end if args.shadow_end is not None else cfg["n_shadows"]
-        print(f"\n[P19-LiRA] === {lid} ===")
 
-        if not args.score_only:
-            run_lira(lid, cfg, args.shadow_start, shadow_end, device,
-                     args.data_root, args.cache_dir, args.runs_dir, args.lira_dir)
+        if args.seed is not None:
+            seeds = [args.seed]
+        elif args.all_seeds:
+            seeds = cfg["seeds"]
+        else:
+            seeds = [cfg["seeds"][0]]
 
-        run_scoring(lid, cfg, device, args.runs_dir, args.lira_dir)
+        for s in seeds:
+            print(f"\n[P19-LiRA] === {lid} seed={s} ===")
+
+            if not args.score_only:
+                run_lira(lid, cfg, args.shadow_start, shadow_end, device,
+                         args.data_root, args.cache_dir, args.runs_dir, args.lira_dir,
+                         seed=s)
+
+            run_scoring(lid, cfg, device, args.runs_dir, args.lira_dir, seed=s)
 
     print("\n[P19-LiRA] Done.")
 
