@@ -17,9 +17,11 @@ Produces:
 
 Usage:
   python experiments/exp_p19_analysis.py --all
+  python experiments/exp_p19_analysis.py --all --all_lira_seeds          # use all available LiRA seeds
+  python experiments/exp_p19_analysis.py --table 3 --all_lira_seeds
+  python experiments/exp_p19_analysis.py --table 3 --lira_seeds 0 1 2   # explicit seeds
   python experiments/exp_p19_analysis.py --table 1
   python experiments/exp_p19_analysis.py --table 2
-  python experiments/exp_p19_analysis.py --table 3
   python experiments/exp_p19_analysis.py --gaussian_validation --run F1 --seed 0
 """
 
@@ -80,8 +82,8 @@ def _load_run(run_id, seed, runs_dir=RUNS_DIR):
     return out
 
 
-def _load_lira(lira_id, lira_dir=LIRA_DIR):
-    d = os.path.join(lira_dir, lira_id)
+def _load_lira(lira_id, lira_dir=LIRA_DIR, seed=0):
+    d = os.path.join(lira_dir, lira_id, f"seed_{seed}")
     out = {}
     for name in ["lira_scores_members", "lira_scores_nonmembers",
                  "llr_dp_members", "llr_dp_nonmembers",
@@ -93,6 +95,21 @@ def _load_lira(lira_id, lira_dir=LIRA_DIR):
     if os.path.exists(summ):
         with open(summ) as f: out["summary"] = json.load(f)
     return out
+
+
+def _available_lira_seeds(lira_id, lira_dir=LIRA_DIR):
+    """Return sorted list of seeds that have a lira_summary.json."""
+    base = os.path.join(lira_dir, lira_id)
+    seeds = []
+    for entry in sorted(os.listdir(base)) if os.path.isdir(base) else []:
+        if entry.startswith("seed_"):
+            try:
+                s = int(entry.split("_")[1])
+            except (ValueError, IndexError):
+                continue
+            if os.path.exists(os.path.join(base, entry, "lira_summary.json")):
+                seeds.append(s)
+    return seeds
 
 
 # ---------------------------------------------------------------------------
@@ -195,11 +212,11 @@ def table_2(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=OUT_DIR):
 # Table 3: Headline LiRA correlation
 # ---------------------------------------------------------------------------
 
-def table_3(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR, out_dir=OUT_DIR):
+def table_3(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR, out_dir=OUT_DIR,
+            lira_seeds=None):
     """
-    Table 3: Headline LiRA correlation (F1/LF1).
-    Requires LiRA results from exp_p19_lira.py.
-    Correlates certified ε with D_i^LiRA using Spearman rank correlation.
+    Table 3: Headline LiRA correlation (F1/LF1), aggregated across all available seeds.
+    Reports per-seed Spearman ρ and mean±std across seeds.
     """
     try:
         from scipy.stats import spearmanr
@@ -213,126 +230,149 @@ def table_3(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR, out_dir=OUT
     print(f"  Table 3: Headline LiRA Correlation (F1/LF1)")
     print(f"{'='*72}")
 
-    lf1 = _load_lira("LF1", lira_dir)
-    cert = _load_cert("F1", 0, cert_dir)
-    run  = _load_run("F1", 0, runs_dir)
+    seeds_to_use = lira_seeds if lira_seeds is not None else _available_lira_seeds("LF1", lira_dir)
+    if not seeds_to_use:
+        seeds_to_use = [0]
 
-    if not lf1 or "D_lira_members" not in lf1:
-        print("  [Table 3] LiRA results not found (run exp_p19_lira.py first).")
-        return
-
-    # Align LiRA member targets with certified ε
-    # LiRA scores for members: D_i^LiRA
-    D_lira = lf1["D_lira_members"]                             # (n_targets,)
-    member_local = np.load(os.path.join(runs_dir, "F1", "seed_0", "lira_member_local_idx.npy"))
-
-    if "epsilon_cert_dir_rank_100" not in cert:
-        print("  [Table 3] Certified ε not found."); return
-
-    eps_dir_all  = cert["epsilon_cert_dir_rank_100"]           # (n,)
-    eps_norm_all = cert["epsilon_cert_norm"]                   # (n,)
-
-    eps_dir_members  = eps_dir_all[member_local]
-    eps_norm_members = eps_norm_all[member_local]
-
-    # Also: final losses
-    losses_all   = run.get("losses", None)
-    loss_final   = losses_all[member_local, -1] if losses_all is not None else None
-
-    # Also: realized ε (diagnostic, clearly labeled)
-    if "epsilon_realized_dir_rank_100" in cert:
-        eps_real_dir_members = cert["epsilon_realized_dir_rank_100"][member_local]
-    else:
-        eps_real_dir_members = None
-
-    def _compute_row(y, label, D_arr=None):
-        """Compute Spearman ρ, CI, rank R² vs D_lira (or D_arr if provided)."""
-        D_ref = D_arr if D_arr is not None else D_lira
+    def _compute_row(y, label, D_ref):
         mask = np.isfinite(y) & np.isfinite(D_ref)
         y_m = y[mask]; D_m = D_ref[mask]
         if len(y_m) < 10: return None
 
         if HAS_SCIPY:
-            rho_val, pval = spearmanr(y_m, D_m)
+            rho_val, _pval = spearmanr(y_m, D_m)
             def _spr(x, y): return spearmanr(x, y).statistic
             bs = bootstrap((y_m, D_m), _spr, n_resamples=1000,
                            paired=True, confidence_level=0.95,
                            random_state=42, method="percentile")
-            ci_lo, ci_hi = float(bs.confidence_interval.low), float(bs.confidence_interval.high)
+            ci_lo = float(bs.confidence_interval.low)
+            ci_hi = float(bs.confidence_interval.high)
         else:
-            from numpy import corrcoef, argsort
-            ry = argsort(argsort(y_m)); rd = argsort(argsort(D_m))
-            rho_val = float(corrcoef(ry, rd)[0,1])
+            ry = np.argsort(np.argsort(y_m)); rd = np.argsort(np.argsort(D_m))
+            rho_val = float(np.corrcoef(ry, rd)[0, 1])
             ci_lo = ci_hi = float('nan')
 
         ry = np.argsort(np.argsort(y_m)); rd = np.argsort(np.argsort(D_m))
-        r2 = float(np.corrcoef(ry, rd)[0, 1]**2)
+        r2 = float(np.corrcoef(ry, rd)[0, 1] ** 2)
 
-        print(f"    {label:45s}  ρ={rho_val:+.4f}  CI=[{ci_lo:.3f},{ci_hi:.3f}]  "
+        print(f"    {label:52s}  ρ={rho_val:+.4f}  CI=[{ci_lo:.3f},{ci_hi:.3f}]  "
               f"R²={r2:.4f}  n={len(y_m)}")
         return {"label": label, "rho": float(rho_val), "ci_lo": ci_lo, "ci_hi": ci_hi,
                 "R2": r2, "n": len(y_m)}
 
-    rows = []
-    # All correlations are rank Spearman across the 1500 *member* targets only.
-    # Nonmembers are not scored (D_lira_nonmembers = zeros placeholder).
-    print(f"  NOTE: all ρ values are Spearman rank correlations across member targets only.")
-    print(f"  {'Feature':45s}  {'Spearman ρ':10s}  {'95% CI':18s}  {'R²':6s}  {'n':5s}")
-    r = _compute_row(eps_dir_members, "ε^dir cert r=100 (member targets)")
-    if r: rows.append(r)
-    r = _compute_row(eps_norm_members, "ε^norm cert (member targets)")
-    if r: rows.append(r)
-    if eps_real_dir_members is not None:
-        r = _compute_row(eps_real_dir_members, "realized ε^dir (diagnostic, not cert)")
-        if r: rows.append(r)
-    if loss_final is not None:
-        r = _compute_row(loss_final, "final training loss")
-        if r: rows.append(r)
-    if "tier_labels" in run:
-        r = _compute_row(run["tier_labels"][member_local].astype(float), "tier label")
-        if r: rows.append(r)
+    all_rows = []
+    # Collect per-seed ρ values for headline aggregation
+    per_seed_dir_rho  = []
+    per_seed_norm_rho = []
 
-    # Within-tier partial Spearman: controls for tier-level confounding.
-    # If ε_dir and D_lira both track tier (and tier alone drives ρ), then
-    # within-tier ρ ≈ 0; if ε_dir captures finer-grained memorization beyond
-    # tier, within-tier ρ > 0 and the headline claim is genuinely stronger.
-    if "tier_labels" in run:
-        tier_arr = run["tier_labels"][member_local]
-        print(f"\n  Within-tier Spearman ρ (partial, controlling for tier):")
-        wt_rhos = []
-        for t_id, t_name in {0: "head", 1: "mid", 2: "tail"}.items():
-            mask_t = (tier_arr == t_id)
-            if mask_t.sum() < 10: continue
-            r = _compute_row(eps_dir_members[mask_t],
-                             f"  ε^dir cert [{t_name}]",
-                             D_arr=D_lira[mask_t])
-            if r:
-                r["tier"] = t_name; r["within_tier"] = True
-                wt_rhos.append(r["rho"]); rows.append(r)
-            r = _compute_row(eps_norm_members[mask_t],
-                             f"  ε^norm cert [{t_name}]",
-                             D_arr=D_lira[mask_t])
-            if r:
-                r["tier"] = t_name; r["within_tier"] = True; rows.append(r)
-            if loss_final is not None:
-                r = _compute_row(loss_final[mask_t],
-                                 f"  loss [{t_name}]",
-                                 D_arr=D_lira[mask_t])
+    print(f"  NOTE: all ρ are Spearman rank correlations across member targets only.")
+    print(f"  {'Feature':52s}  {'Spearman ρ':10s}  {'95% CI':18s}  {'R²':6s}  {'n':5s}")
+
+    for s in seeds_to_use:
+        lf1  = _load_lira("LF1", lira_dir, seed=s)
+        cert = _load_cert("F1", s, cert_dir)
+        run  = _load_run("F1", s, runs_dir)
+
+        if not lf1 or "D_lira_members" not in lf1:
+            print(f"  [Table 3] LiRA seed={s} not found, skipping.")
+            continue
+        if "epsilon_cert_dir_rank_100" not in cert:
+            print(f"  [Table 3] Certified ε seed={s} not found, skipping.")
+            continue
+
+        print(f"\n  -- seed={s} --")
+        D_lira       = lf1["D_lira_members"]
+        member_local = np.load(
+            os.path.join(runs_dir, "F1", f"seed_{s}", "lira_member_local_idx.npy"))
+
+        eps_dir_m  = cert["epsilon_cert_dir_rank_100"][member_local]
+        eps_norm_m = cert["epsilon_cert_norm"][member_local]
+        losses_all = run.get("losses", None)
+        loss_final = losses_all[member_local, -1] if losses_all is not None else None
+        eps_real_dir_m = (cert["epsilon_realized_dir_rank_100"][member_local]
+                          if "epsilon_realized_dir_rank_100" in cert else None)
+
+        rows_seed = []
+        r = _compute_row(eps_dir_m,  f"[s{s}] ε^dir cert r=100", D_lira)
+        if r:
+            r["seed"] = s; rows_seed.append(r); per_seed_dir_rho.append(r["rho"])
+        r = _compute_row(eps_norm_m, f"[s{s}] ε^norm cert", D_lira)
+        if r:
+            r["seed"] = s; rows_seed.append(r); per_seed_norm_rho.append(r["rho"])
+        if eps_real_dir_m is not None:
+            r = _compute_row(eps_real_dir_m, f"[s{s}] realized ε^dir (diagnostic)", D_lira)
+            if r: r["seed"] = s; rows_seed.append(r)
+        if loss_final is not None:
+            r = _compute_row(loss_final, f"[s{s}] final training loss", D_lira)
+            if r: r["seed"] = s; rows_seed.append(r)
+        if "tier_labels" in run:
+            r = _compute_row(run["tier_labels"][member_local].astype(float),
+                             f"[s{s}] tier label", D_lira)
+            if r: r["seed"] = s; rows_seed.append(r)
+
+        # Within-tier partial Spearman
+        if "tier_labels" in run:
+            tier_arr = run["tier_labels"][member_local]
+            print(f"    Within-tier ρ (seed={s}):")
+            wt_rhos = []
+            for t_id, t_name in {0: "head", 1: "mid", 2: "tail"}.items():
+                mask_t = (tier_arr == t_id)
+                if mask_t.sum() < 10: continue
+                r = _compute_row(eps_dir_m[mask_t],
+                                 f"[s{s}]   ε^dir cert [{t_name}]",
+                                 D_lira[mask_t])
                 if r:
-                    r["tier"] = t_name; r["within_tier"] = True; rows.append(r)
-        if wt_rhos:
-            headline_rho = next((r["rho"] for r in rows
-                                 if "within_tier" not in r and "ε^dir cert" in r["label"]), None)
-            wt_norm_rhos = [r["rho"] for r in rows
-                            if r.get("within_tier") and "ε^norm" in r["label"]]
-            print(f"\n  Mean within-tier ρ (ε^dir):  {np.mean(wt_rhos):.4f}"
-                  + (f"  vs headline raw ρ={headline_rho:.4f}" if headline_rho else ""))
-            if wt_norm_rhos:
-                print(f"  Mean within-tier ρ (ε^norm): {np.mean(wt_norm_rhos):.4f}")
+                    r["seed"] = s; r["tier"] = t_name; r["within_tier"] = True
+                    wt_rhos.append(r["rho"]); rows_seed.append(r)
+                r = _compute_row(eps_norm_m[mask_t],
+                                 f"[s{s}]   ε^norm cert [{t_name}]",
+                                 D_lira[mask_t])
+                if r:
+                    r["seed"] = s; r["tier"] = t_name; r["within_tier"] = True
+                    rows_seed.append(r)
+                if loss_final is not None:
+                    r = _compute_row(loss_final[mask_t],
+                                     f"[s{s}]   loss [{t_name}]",
+                                     D_lira[mask_t])
+                    if r:
+                        r["seed"] = s; r["tier"] = t_name; r["within_tier"] = True
+                        rows_seed.append(r)
+            if wt_rhos:
+                print(f"    Mean within-tier ρ (ε^dir, seed={s}): {np.mean(wt_rhos):.4f}")
+
+        all_rows.extend(rows_seed)
+
+    # Cross-seed summary
+    if len(per_seed_dir_rho) > 1:
+        print(f"\n  Cross-seed summary ({len(per_seed_dir_rho)} seeds):")
+        print(f"    ε^dir  ρ per seed: {[f'{v:+.4f}' for v in per_seed_dir_rho]}")
+        print(f"    ε^dir  mean ρ = {np.mean(per_seed_dir_rho):+.4f}  "
+              f"std = {np.std(per_seed_dir_rho):.4f}")
+        print(f"    ε^norm ρ per seed: {[f'{v:+.4f}' for v in per_seed_norm_rho]}")
+        print(f"    ε^norm mean ρ = {np.mean(per_seed_norm_rho):+.4f}  "
+              f"std = {np.std(per_seed_norm_rho):.4f}")
+        all_rows.append({
+            "label": "AGGREGATE ε^dir cert r=100",
+            "seeds": seeds_to_use,
+            "rho_per_seed": per_seed_dir_rho,
+            "rho_mean": float(np.mean(per_seed_dir_rho)),
+            "rho_std":  float(np.std(per_seed_dir_rho)),
+        })
+        all_rows.append({
+            "label": "AGGREGATE ε^norm cert",
+            "seeds": seeds_to_use,
+            "rho_per_seed": per_seed_norm_rho,
+            "rho_mean": float(np.mean(per_seed_norm_rho)),
+            "rho_std":  float(np.std(per_seed_norm_rho)),
+        })
+
+    if not all_rows:
+        print("  [Table 3] No LiRA results found. Run exp_p19_lira.py first.")
+        return
 
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "table3_lira_correlation.json"), "w") as f:
-        json.dump(rows, f, indent=2)
+        json.dump(all_rows, f, indent=2)
     print(f"\n  [saved] {out_dir}/table3_lira_correlation.json")
 
 
@@ -496,48 +536,62 @@ def table_5(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR, out_dir=OUT
 # Figure 1: Headline masking scatter (F1/LF1 with LiRA D_i)
 # ---------------------------------------------------------------------------
 
-def figure_1(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR, out_dir=OUT_DIR):
+def figure_1(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR, out_dir=OUT_DIR,
+             lira_seeds=None):
     """
     Figure 1: Scatter plot of ε^dir and ε^norm vs D_i^LiRA, colored by tier.
-    Requires LiRA results from exp_p19_lira.py.
+    Plots one panel per available LiRA seed; if multiple seeds, uses a subplot row per seed.
     """
     plt = _plt(); os.makedirs(out_dir, exist_ok=True)
-    lf1  = _load_lira("LF1", lira_dir)
-    cert = _load_cert("F1", 0, cert_dir)
-    run  = _load_run("F1", 0, runs_dir)
-
-    if not lf1 or "D_lira_members" not in lf1:
-        print("  [Fig 1] LiRA results not found."); return
-
-    member_local = np.load(os.path.join(runs_dir, "F1", "seed_0", "lira_member_local_idx.npy"))
-    D_lira  = lf1["D_lira_members"]
-    eps_dir = cert.get("epsilon_cert_dir_rank_100")
-    eps_norm = cert.get("epsilon_cert_norm")
-    if eps_dir is None or eps_norm is None: return
-
-    eps_dir_m  = eps_dir[member_local]
-    eps_norm_m = eps_norm[member_local]
-    tiers = run.get("tier_labels")
-    tier_m = tiers[member_local] if tiers is not None else None
-
     if plt is None: return
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    seeds_to_use = lira_seeds if lira_seeds is not None else _available_lira_seeds("LF1", lira_dir)
+    if not seeds_to_use:
+        seeds_to_use = [0]
+
     tier_colors = {0: "steelblue", 1: "orange", 2: "firebrick"}
     tier_names  = {0: "head", 1: "mid", 2: "tail"}
 
-    for ax, (eps_v, lbl) in zip(axes, [(eps_dir_m, "ε^dir cert"), (eps_norm_m, "ε^norm cert")]):
-        if tier_m is not None:
-            for t_id, t_name in tier_names.items():
-                mask = (tier_m == t_id)
-                if mask.sum() == 0: continue
-                ax.scatter(D_lira[mask], eps_v[mask], c=tier_colors[t_id],
-                           s=6, alpha=0.5, label=t_name)
-        else:
-            ax.scatter(D_lira, eps_v, s=6, alpha=0.5)
-        ax.set_xlabel("D_i^LiRA"); ax.set_ylabel(lbl)
-        ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
-    axes[0].set_title("Figure 1a: D_i^LiRA vs ε^dir (headline)")
-    axes[1].set_title("Figure 1b: D_i^LiRA vs ε^norm")
+    valid = []
+    for s in seeds_to_use:
+        lf1  = _load_lira("LF1", lira_dir, seed=s)
+        cert = _load_cert("F1", s, cert_dir)
+        run  = _load_run("F1", s, runs_dir)
+        if not lf1 or "D_lira_members" not in lf1: continue
+        eps_dir  = cert.get("epsilon_cert_dir_rank_100")
+        eps_norm = cert.get("epsilon_cert_norm")
+        if eps_dir is None or eps_norm is None: continue
+        member_local = np.load(
+            os.path.join(runs_dir, "F1", f"seed_{s}", "lira_member_local_idx.npy"))
+        tiers = run.get("tier_labels")
+        tier_m = tiers[member_local] if tiers is not None else None
+        valid.append((s, lf1["D_lira_members"],
+                      eps_dir[member_local], eps_norm[member_local], tier_m))
+
+    if not valid:
+        print("  [Fig 1] LiRA results not found."); return
+
+    n_seeds = len(valid)
+    fig, axes = plt.subplots(n_seeds, 2, figsize=(12, 5 * n_seeds), squeeze=False)
+
+    for row_idx, (s, D_lira, eps_dir_m, eps_norm_m, tier_m) in enumerate(valid):
+        for col_idx, (eps_v, lbl) in enumerate([(eps_dir_m, "ε^dir cert"),
+                                                 (eps_norm_m, "ε^norm cert")]):
+            ax = axes[row_idx][col_idx]
+            if tier_m is not None:
+                for t_id, t_name in tier_names.items():
+                    mask = (tier_m == t_id)
+                    if mask.sum() == 0: continue
+                    ax.scatter(D_lira[mask], eps_v[mask], c=tier_colors[t_id],
+                               s=6, alpha=0.5, label=t_name)
+                ax.legend(fontsize=8)
+            else:
+                ax.scatter(D_lira, eps_v, s=6, alpha=0.5)
+            ax.set_xlabel("D_i^LiRA"); ax.set_ylabel(lbl)
+            ax.grid(True, alpha=0.3)
+            prefix = "a" if col_idx == 0 else "b"
+            ax.set_title(f"Fig 1{prefix} [seed={s}]: D^LiRA vs {lbl}")
+
     fig.suptitle("F1/LF1: Direction-Aware Masking vs LiRA Distinguishability", fontsize=11)
     fig.tight_layout()
     path = os.path.join(out_dir, "figure1_headline_scatter.png")
@@ -821,7 +875,12 @@ def main():
                         help="Run specific figure")
     parser.add_argument("--gaussian_validation", action="store_true")
     parser.add_argument("--run",      type=str, default="F1", choices=["F1","F2","F5"])
-    parser.add_argument("--seed",     type=int, default=0)
+    parser.add_argument("--seed",     type=int, default=0,
+                        help="Seed for --gaussian_validation")
+    parser.add_argument("--lira_seeds", type=int, nargs="+", default=None,
+                        help="LiRA seeds to use for Table 3 / Figure 1 (e.g. --lira_seeds 0 1 2)")
+    parser.add_argument("--all_lira_seeds", action="store_true",
+                        help="Auto-detect all available LiRA seeds (overrides --lira_seeds)")
     parser.add_argument("--runs_dir", type=str, default=RUNS_DIR)
     parser.add_argument("--cert_dir", type=str, default=CERT_DIR)
     parser.add_argument("--lira_dir", type=str, default=LIRA_DIR)
@@ -830,12 +889,21 @@ def main():
 
     os.makedirs(args.out_dir, exist_ok=True)
 
+    # Resolve which LiRA seeds to use for Table 3 / Figure 1
+    if args.all_lira_seeds:
+        lira_seeds = None   # _available_lira_seeds will auto-detect
+    elif args.lira_seeds is not None:
+        lira_seeds = args.lira_seeds
+    else:
+        lira_seeds = None   # auto-detect (falls back to [0] if dir missing)
+
     if args.all or args.table == "1":
         table_1(args.runs_dir, args.out_dir)
     if args.all or args.table == "2":
         table_2(args.cert_dir, args.runs_dir, args.out_dir)
     if args.all or args.table == "3":
-        table_3(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir)
+        table_3(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,
+                lira_seeds=lira_seeds)
     if args.all or args.table == "4":
         table_4(args.cert_dir, args.out_dir)
     if args.all or args.table == "5":
@@ -843,7 +911,8 @@ def main():
     if args.all or args.table == "6":
         table_6(args.cert_dir, args.out_dir)
     if args.all or args.figure == "1":
-        figure_1(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir)
+        figure_1(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,
+                 lira_seeds=lira_seeds)
     if args.all or args.figure == "2":
         figure_2(args.cert_dir, args.runs_dir, args.out_dir)
     if args.gaussian_validation or args.all:
