@@ -897,11 +897,28 @@ def _rank_r2(x, y):
 
 def _load_shadow_traces(lira_id, lira_seed, lira_dir=LIRA_DIR):
     """
-    Load raw per-shadow logit matrix and membership matrix for LT-IQR.
-    Tries several naming conventions used across experiment phases.
-    Returns (logit_matrix, membership_matrix) or (None, None).
+    Load the combined per-shadow logit-score matrix and in-mask matrix for LT-IQR.
+
+    Primary format (written by exp_p19_lira.py run_scoring):
+      shadow_logit_scores.npy      (n_targets, n_shadows)  log-odds per shadow, NaN=missing
+      shadow_in_mask_combined.npy  (n_targets, n_shadows)  bool, True=target was IN that shadow
+
+    Fallback formats (older pipelines):
+      logit_matrix.npy / shadows/logit_matrix.npy  + membership_matrix.npy (same dir)
+
+    Returns (logit_matrix, membership_matrix) or (None, None) if nothing is found.
+    The returned logit_matrix entries are log-odds scores (finite) or NaN (missing shadow).
+    The returned membership_matrix entries are 0/1 integers.
     """
     base = os.path.join(lira_dir, lira_id, f"seed_{lira_seed}")
+
+    # Primary: exp_p19_lira.py outputs
+    logit_p = os.path.join(base, "shadow_logit_scores.npy")
+    mask_p  = os.path.join(base, "shadow_in_mask_combined.npy")
+    if os.path.exists(logit_p) and os.path.exists(mask_p):
+        return np.load(logit_p).astype(np.float64), np.load(mask_p).astype(np.int32)
+
+    # Fallback: older naming conventions
     logit_candidates = [
         "shadow_logits_members.npy",
         "logit_matrix.npy",
@@ -923,7 +940,49 @@ def _load_shadow_traces(lira_id, lira_seed, lira_dir=LIRA_DIR):
     for name in mem_candidates:
         p = os.path.join(base, name)
         if os.path.exists(p):
-            mem_mat = np.load(p); break
+            mem_mat = np.load(p).astype(np.int32); break
+
+    if logit_mat is None or mem_mat is None:
+        # Try reconstructing from per-shadow files if the dense matrices were not saved
+        per_shadow = sorted(f for f in os.listdir(base)
+                            if f.startswith("shadow_") and f.endswith("_member_logits.npy"))
+        if per_shadow:
+            print(f"    [shadow_traces] dense matrices missing; attempting reconstruction "
+                  f"from {len(per_shadow)} per-shadow files in {base}")
+            # Load member labels from the companion member_labels.npy
+            labels_p = os.path.join(base, "member_labels.npy")
+            if not os.path.exists(labels_p):
+                print(f"    [shadow_traces] member_labels.npy not found in {base}")
+                return None, None
+            member_labels = np.load(labels_p)
+            n_m = len(member_labels)
+            n_s = len(per_shadow)
+            logit_mat = np.full((n_m, n_s), np.nan, dtype=np.float64)
+            mem_mat   = np.zeros((n_m, n_s), dtype=np.int32)
+            for col, fname in enumerate(per_shadow):
+                shadow_idx = int(fname.split("_")[1])
+                mask_fname = f"shadow_{shadow_idx}_in_mask.npy"
+                mask_full  = os.path.join(base, mask_fname)
+                logit_full = os.path.join(base, fname)
+                if not os.path.exists(mask_full): continue
+                logits   = np.load(logit_full).astype(np.float32)   # (n_m, C)
+                in_mask  = np.load(mask_full).astype(bool)           # (n_m,)
+                # Convert to log-odds score (same formula as logit_score in the LiRA script)
+                probs = np.exp(logits - logits.max(axis=1, keepdims=True))
+                probs /= probs.sum(axis=1, keepdims=True)
+                n = len(member_labels)
+                p_correct = probs[np.arange(n), member_labels.astype(int)]
+                p_correct = np.clip(p_correct, 1e-7, 1 - 1e-7)
+                scores = np.log(p_correct / (1.0 - p_correct))
+                logit_mat[:, col] = scores.astype(np.float64)
+                mem_mat[:, col]   = in_mask.astype(np.int32)
+            # Save for next time
+            np.save(os.path.join(base, "shadow_logit_scores.npy"),
+                    logit_mat.astype(np.float32))
+            np.save(os.path.join(base, "shadow_in_mask_combined.npy"),
+                    mem_mat.astype(bool))
+            print(f"    [shadow_traces] saved dense matrices for future runs.")
+
     return logit_mat, mem_mat
 
 
@@ -981,25 +1040,36 @@ def _nystrom_H_from_BM(B, M):
     return S, H
 
 
-def _compute_gen_leverage_batch(Y_proj_final, B_final, M_final):
+def _compute_gen_leverage_batch(Y_proj_final, B_final, M_final,
+                                mode="pinv", a=None, g_sqnorm=None,
+                                eigenvalue_floor_factor=1e-8):
     """
-    Generalized leverage h_i = g_i^T Sigma_hat^{+} g_i using the Nystrom
-    pseudoinverse.
+    Generalized leverage (self-influence) h_i = g_i^T Sigma_hat^{+} g_i using
+    the Nystrom pseudoinverse, with W = Y B^{-1/2} and H = W^T W = B^{-1/2} M B^{-1/2}.
 
-    For the Nystrom rank-r approximation Sigma_hat = Y B^{-1} Y^T with
-    W = Y B^{-1/2}:
-        g_i^T (W W^T)^{+} g_i = z_i^T H^{-1} z_i
-    where:
-        z_i = S s_i,  s_i = Y^T g_i  (= Y_proj_final[i]),  S = B^{-1/2}
-        H   = S M S                  (M = Y^T Y)
+    IMPORTANT: the correct pseudoinverse form is
+        h_i = z_i^T H^{-2} z_i   (mode="pinv")
+    NOT z_i^T H^{-1} z_i.  The latter equals ||P_W g_i||^2 (energy in the dominant
+    subspace), which has no inverse-covariance action and correlates negatively with
+    membership vulnerability.  The correct form weights energy by 1/lambda_k^2,
+    emphasising the quiet low-variance directions — the same family as the eps_dir
+    Mahalanobis shift but under a different matrix.
 
-    This reuses the SAME S and H objects as the eps_dir computation but
-    inverts H directly (a→0 limit) rather than (I + a^{-1} H).
+    A ridge-regularised variant (matching the DP-noise-aware eps_dir form) is also
+    provided for comparison:
+        h_i = g_i^T (a I + Sigma_hat)^{-1} g_i
+            = ||g_i||^2/a  -  (1/a^2) z_i^T (I + H/a)^{-1} z_i   (mode="ridge")
 
-    Y_proj_final: (n, r)  — Y_t^T g_i at the final accounting step
-    B_final:      (r, r)
-    M_final:      (r, r)
-    Returns: leverage (n,) ≥ 0
+    Parameters
+    ----------
+    Y_proj_final : (n, r)   s_i = Y_t^T g_i at the final accounting step.
+    B_final, M_final : (r, r)   B and M = Y^T Y at the final step.
+    mode : {"pinv", "ridge"}
+    a    : float, required for mode="ridge" (e.g. sigma^2 C^2).
+    g_sqnorm : (n,) or float, required for mode="ridge" (ambient ||g_i||^2).
+    eigenvalue_floor_factor : pseudoinverse floor = factor * lambda_max.
+
+    Returns : (n,) leverage scores >= 0.
     """
     Y_proj = np.asarray(Y_proj_final, dtype=np.float64)
     if Y_proj.ndim == 1:
@@ -1007,14 +1077,35 @@ def _compute_gen_leverage_batch(Y_proj_final, B_final, M_final):
     n, r = Y_proj.shape
 
     S, H = _nystrom_H_from_BM(B_final, M_final)
-    evals_H, evecs_H = np.linalg.eigh(H)
-    lmax = evals_H.max() if evals_H.max() > 0 else 1.0
-    evals_H_reg = np.maximum(evals_H, lmax * 1e-8 + 1e-12)
-    H_inv = evecs_H @ np.diag(1.0 / evals_H_reg) @ evecs_H.T
+    evals_H, evecs_H = np.linalg.eigh(H)           # ascending order
+    lmax  = float(evals_H.max()) if evals_H.size and evals_H.max() > 0 else 1.0
+    floor = eigenvalue_floor_factor * lmax
+    valid = evals_H > floor
 
-    Z = Y_proj @ S.T          # (n, r)   z_i = S s_i
-    ZH = Z @ H_inv            # (n, r)
-    leverage = np.einsum("ij,ij->i", ZH, Z)   # (n,) quadratic form z_i^T H^{-1} z_i
+    # z_i = S s_i = W^T g_i ; coefficients in H-eigenbasis: C[i,k] = v_k^T z_i
+    Z = Y_proj @ S.T          # (n, r)
+    C = Z @ evecs_H            # (n, r)
+
+    if mode == "pinv":
+        # h_i = z_i^T H^{+2} z_i = sum_k C_{ik}^2 / lambda_k^2  (lambda_k > floor)
+        inv2 = np.zeros(r, dtype=np.float64)
+        inv2[valid] = 1.0 / (evals_H[valid] ** 2)
+        leverage = (C ** 2) @ inv2
+
+    elif mode == "ridge":
+        if a is None or g_sqnorm is None:
+            raise ValueError("mode='ridge' requires both `a` and `g_sqnorm`.")
+        a = float(a)
+        # z_i^T (I + H/a)^{-1} z_i = sum_k C_{ik}^2 / (1 + lambda_k/a)
+        quad = (C ** 2) @ (1.0 / (1.0 + evals_H / a))      # (n,)
+        gsq = np.asarray(g_sqnorm, dtype=np.float64)
+        if gsq.ndim == 0:
+            gsq = np.full(n, float(gsq))
+        leverage = gsq / a - quad / (a ** 2)
+
+    else:
+        raise ValueError(f"Unknown mode {mode!r}; use 'pinv' or 'ridge'.")
+
     return np.maximum(leverage, 0.0)
 
 

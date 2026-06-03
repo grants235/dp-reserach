@@ -426,6 +426,12 @@ def run_scoring(lira_id, cfg, device, runs_dir, lira_dir, seed=None):
     shadow_scores_m_out = [[] for _ in range(n_m)]
     available_shadows   = 0
 
+    # Dense matrices for LT-IQR analysis: shape (n_m, n_shadows), NaN = shadow missing.
+    # shadow_logit_scores[i, m] = log-odds score from shadow m for target i.
+    # shadow_in_mask_combined[i, m] = 1 if target i was IN shadow m's training set.
+    shadow_logit_scores      = np.full((n_m, n_shadows), np.nan,  dtype=np.float32)
+    shadow_in_mask_combined  = np.zeros((n_m, n_shadows),          dtype=bool)
+
     for m in range(n_shadows):
         logit_path = os.path.join(out_dir, f"shadow_{m}_member_logits.npy")
         mask_path  = os.path.join(out_dir, f"shadow_{m}_in_mask.npy")
@@ -434,6 +440,9 @@ def run_scoring(lira_id, cfg, device, runs_dir, lira_dir, seed=None):
         member_logits = np.load(logit_path).astype(np.float32)  # (n_m, C)
         in_mask       = np.load(mask_path)                       # (n_m,) bool
         scores_m      = logit_score(member_logits, member_labels) # (n_m,)
+
+        shadow_logit_scores[:, m]     = scores_m.astype(np.float32)
+        shadow_in_mask_combined[:, m] = in_mask.astype(bool)
 
         for i in range(n_m):
             if in_mask[i]:
@@ -468,6 +477,12 @@ def run_scoring(lira_id, cfg, device, runs_dir, lira_dir, seed=None):
 
     np.save(os.path.join(out_dir, "lira_scores_members.npy"),    in_arr.astype(np.float32))
     np.save(os.path.join(out_dir, "lira_scores_nonmembers.npy"), out_arr.astype(np.float32))
+
+    # Dense combined arrays consumed by LT-IQR in exp_p19_analysis.py.
+    # shadow_logit_scores[i, m]    = log-odds score for target i from shadow m (NaN if missing).
+    # shadow_in_mask_combined[i,m] = True if target i was IN shadow m's training set.
+    np.save(os.path.join(out_dir, "shadow_logit_scores.npy"),     shadow_logit_scores)
+    np.save(os.path.join(out_dir, "shadow_in_mask_combined.npy"), shadow_in_mask_combined)
 
     # Compute global score variance as a data-driven variance floor.
     # A hard 1e-6 floor inflates |D_lira| for easy (head) examples where var_in
