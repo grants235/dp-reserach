@@ -862,6 +862,727 @@ def table_6(cert_dir=CERT_DIR, out_dir=OUT_DIR):
     print(f"\n  [saved] {out_dir}/table6_rank_ablation.json")
 
 
+# ===========================================================================
+# Item 1: Shadow-free baseline rows  (LT-IQR and generalized leverage)
+# ===========================================================================
+
+def _spearman_ci(x, y, n_boot=500, seed=42):
+    """Spearman rho plus bootstrap 95% CI.  Returns (rho, ci_lo, ci_hi)."""
+    from scipy.stats import spearmanr
+    mask = np.isfinite(x) & np.isfinite(y)
+    xm, ym = x[mask], y[mask]
+    if len(xm) < 5:
+        return float("nan"), float("nan"), float("nan")
+    rho_val = float(spearmanr(xm, ym).statistic)
+    rng = np.random.default_rng(seed)
+    n = len(xm); boot_vals = []
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, size=n)
+        try:
+            boot_vals.append(float(spearmanr(xm[idx], ym[idx]).statistic))
+        except Exception:
+            pass
+    if not boot_vals:
+        return rho_val, float("nan"), float("nan")
+    return rho_val, float(np.percentile(boot_vals, 2.5)), float(np.percentile(boot_vals, 97.5))
+
+
+def _rank_r2(x, y):
+    from scipy.stats import rankdata
+    mask = np.isfinite(x) & np.isfinite(y)
+    if mask.sum() < 5:
+        return float("nan")
+    return float(np.corrcoef(rankdata(x[mask]), rankdata(y[mask]))[0, 1] ** 2)
+
+
+def _load_shadow_traces(lira_id, lira_seed, lira_dir=LIRA_DIR):
+    """
+    Load raw per-shadow logit matrix and membership matrix for LT-IQR.
+    Tries several naming conventions used across experiment phases.
+    Returns (logit_matrix, membership_matrix) or (None, None).
+    """
+    base = os.path.join(lira_dir, lira_id, f"seed_{lira_seed}")
+    logit_candidates = [
+        "shadow_logits_members.npy",
+        "logit_matrix.npy",
+        os.path.join("shadows", "logit_matrix.npy"),
+        os.path.join("shadows", "logit_matrix_np.npy"),
+    ]
+    mem_candidates = [
+        "shadow_memberships_members.npy",
+        "membership_matrix.npy",
+        os.path.join("shadows", "membership_matrix.npy"),
+        os.path.join("shadows", "membership_matrix_np.npy"),
+    ]
+    logit_mat = None
+    for name in logit_candidates:
+        p = os.path.join(base, name)
+        if os.path.exists(p):
+            logit_mat = np.load(p).astype(np.float64); break
+    mem_mat = None
+    for name in mem_candidates:
+        p = os.path.join(base, name)
+        if os.path.exists(p):
+            mem_mat = np.load(p); break
+    return logit_mat, mem_mat
+
+
+def _compute_lt_iqr(logit_matrix, membership_matrix, sign_ref_D=None):
+    """
+    LT-IQR (Pollock et al. 2024): IQR of loss values across OUT shadow models.
+
+    For each member target i, collect losses from all OUT-model shadows
+    (membership_matrix[i, m] == 0), then compute Q75 − Q25.
+
+    Sign convention: higher = more vulnerable.  If Spearman(LT-IQR, D^LiRA) < 0
+    on sign_ref_D, flip sign.
+
+    logit_matrix:     (n_targets, n_shadows) scalar confidence (logit) per shadow
+    membership_matrix:(n_targets, n_shadows) 1=IN, 0=OUT
+    Returns: lt_iqr  (n_targets,) — floats, NaN when < 2 OUT-model shadows
+    """
+    from scipy.stats import spearmanr
+    n_targets, n_shadows = logit_matrix.shape
+    lt_iqr = np.full(n_targets, np.nan, dtype=np.float64)
+    for i in range(n_targets):
+        out_mask = membership_matrix[i] == 0
+        if out_mask.sum() < 2:
+            continue
+        logits_out = logit_matrix[i, out_mask]
+        # Cross-entropy proxy: loss = log(1 + exp(−logit)); higher loss = less confident
+        losses_out = np.log1p(np.exp(-np.clip(logits_out, -30, 30)))
+        lt_iqr[i] = float(np.percentile(losses_out, 75) - np.percentile(losses_out, 25))
+
+    # Sign check: verify Spearman(LT-IQR, D^LiRA) ≥ 0
+    if sign_ref_D is not None:
+        n = min(len(lt_iqr), len(sign_ref_D))
+        valid = np.isfinite(lt_iqr[:n]) & np.isfinite(sign_ref_D[:n])
+        if valid.sum() >= 5:
+            rho_sign = float(spearmanr(lt_iqr[:n][valid], sign_ref_D[:n][valid]).statistic)
+            if rho_sign < 0:
+                print(f"    [lt_iqr] Sign flip: Spearman={rho_sign:.4f} < 0 → negating LT-IQR")
+                lt_iqr = -lt_iqr
+            else:
+                print(f"    [lt_iqr] Sign OK: Spearman={rho_sign:.4f} > 0 (no flip)")
+    return lt_iqr
+
+
+def _nystrom_H_from_BM(B, M):
+    """
+    Compute S = B^{−1/2} and H = S M S (the Nystrom H matrix) used in
+    both the eps_dir quadratic form and the generalized leverage computation.
+    """
+    B = np.asarray(B, dtype=np.float64)
+    M = np.asarray(M, dtype=np.float64)
+    evals_B, evecs_B = np.linalg.eigh(B)
+    evals_B = np.maximum(evals_B, 1e-12)
+    S = evecs_B @ np.diag(1.0 / np.sqrt(evals_B)) @ evecs_B.T
+    H = S @ M @ S
+    return S, H
+
+
+def _compute_gen_leverage_batch(Y_proj_final, B_final, M_final):
+    """
+    Generalized leverage h_i = g_i^T Sigma_hat^{+} g_i using the Nystrom
+    pseudoinverse.
+
+    For the Nystrom rank-r approximation Sigma_hat = Y B^{-1} Y^T with
+    W = Y B^{-1/2}:
+        g_i^T (W W^T)^{+} g_i = z_i^T H^{-1} z_i
+    where:
+        z_i = S s_i,  s_i = Y^T g_i  (= Y_proj_final[i]),  S = B^{-1/2}
+        H   = S M S                  (M = Y^T Y)
+
+    This reuses the SAME S and H objects as the eps_dir computation but
+    inverts H directly (a→0 limit) rather than (I + a^{-1} H).
+
+    Y_proj_final: (n, r)  — Y_t^T g_i at the final accounting step
+    B_final:      (r, r)
+    M_final:      (r, r)
+    Returns: leverage (n,) ≥ 0
+    """
+    Y_proj = np.asarray(Y_proj_final, dtype=np.float64)
+    if Y_proj.ndim == 1:
+        Y_proj = Y_proj.reshape(1, -1)
+    n, r = Y_proj.shape
+
+    S, H = _nystrom_H_from_BM(B_final, M_final)
+    evals_H, evecs_H = np.linalg.eigh(H)
+    lmax = evals_H.max() if evals_H.max() > 0 else 1.0
+    evals_H_reg = np.maximum(evals_H, lmax * 1e-8 + 1e-12)
+    H_inv = evecs_H @ np.diag(1.0 / evals_H_reg) @ evecs_H.T
+
+    Z = Y_proj @ S.T          # (n, r)   z_i = S s_i
+    ZH = Z @ H_inv            # (n, r)
+    leverage = np.einsum("ij,ij->i", ZH, Z)   # (n,) quadratic form z_i^T H^{-1} z_i
+    return np.maximum(leverage, 0.0)
+
+
+def _corr_row_p19(label, scores, D_lira, tier_arr=None, n_boot=500):
+    """Return overall + per-tier correlation dicts for a predictor vs D^LiRA."""
+    scores = np.asarray(scores, dtype=np.float64)
+    D = np.asarray(D_lira, dtype=np.float64)
+    n = min(len(scores), len(D))
+    scores, D = scores[:n], D[:n]
+
+    rho, ci_lo, ci_hi = _spearman_ci(scores, D, n_boot=n_boot)
+    r2 = _rank_r2(scores, D)
+    overall = {"label": label, "scope": "overall",
+               "rho": rho, "ci_lo": ci_lo, "ci_hi": ci_hi,
+               "rank_r2": r2, "n": int(np.isfinite(scores).sum())}
+
+    tier_rows = []
+    if tier_arr is not None:
+        tier_names_map = {0: "head", 1: "mid", 2: "tail"}
+        for t_id, t_name in tier_names_map.items():
+            mask = (tier_arr[:n] == t_id) & np.isfinite(scores) & np.isfinite(D)
+            if mask.sum() < 5:
+                continue
+            rho_t, ci_lo_t, ci_hi_t = _spearman_ci(scores[mask], D[mask], n_boot=n_boot)
+            r2_t = _rank_r2(scores[mask], D[mask])
+            tier_rows.append({"label": label, "scope": t_name,
+                               "rho": rho_t, "ci_lo": ci_lo_t, "ci_hi": ci_hi_t,
+                               "rank_r2": r2_t, "n": int(mask.sum())})
+    return overall, tier_rows
+
+
+def table_baselines(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
+                    out_dir=OUT_DIR, setting="F1", lira_id="LF1",
+                    seeds=(0, 1, 2), n_boot=500):
+    """
+    Item 1: Shadow-free baseline rows for table3.
+
+    Computes LT-IQR and generalized leverage for each seed, runs Spearman +
+    bootstrap + three-seed aggregation, and reports the gap (eps_dir rho minus
+    each baseline rho) per tier so prose can state the comparison honestly.
+
+    Appends to {out_dir}/table3_baselines.json (same schema as table3_lira_
+    correlation.json).
+    """
+    print(f"\n{'='*72}")
+    print(f"  Item 1: Shadow-free baselines — {setting} × {lira_id}")
+    print(f"{'='*72}")
+
+    # Collect per-seed results for three-seed aggregate
+    per_seed_lt_iqr   = {}
+    per_seed_leverage = {}
+    per_seed_D        = {}
+    per_seed_tiers    = {}   # tier labels for member targets
+    all_rows          = []
+
+    for seed in seeds:
+        print(f"\n  -- seed {seed} --")
+        lf1  = _load_lira(lira_id, lira_dir, seed=seed)
+        cert = _load_cert(setting, seed, cert_dir)
+        run  = _load_run(setting, seed, runs_dir)
+
+        if not lf1 or "D_lira_members" not in lf1:
+            print(f"    [skip] D_lira_members not found for {lira_id}/seed_{seed}")
+            continue
+
+        D_lira = lf1["D_lira_members"].astype(np.float64)
+        member_local_path = os.path.join(runs_dir, setting, f"seed_{seed}",
+                                         "lira_member_local_idx.npy")
+        if not os.path.exists(member_local_path):
+            print(f"    [skip] lira_member_local_idx.npy not found")
+            continue
+        member_local = np.load(member_local_path)
+
+        n = min(len(D_lira), len(member_local))
+        D_use     = D_lira[:n]
+        idx       = member_local[:n]
+        tier_arr  = run.get("tier_labels")
+        tier_mem  = tier_arr[idx] if tier_arr is not None else None
+
+        per_seed_D[seed]     = D_use
+        per_seed_tiers[seed] = tier_mem
+
+        # ---------------------------------------------------------------
+        # 1a: LT-IQR
+        # ---------------------------------------------------------------
+        logit_mat, mem_mat = _load_shadow_traces(lira_id, seed, lira_dir)
+        lt_iqr = None
+        if logit_mat is not None and mem_mat is not None:
+            n_tgt = min(n, logit_mat.shape[0])
+            lt_iqr = _compute_lt_iqr(logit_mat[:n_tgt], mem_mat[:n_tgt],
+                                      sign_ref_D=D_use[:n_tgt])
+            per_seed_lt_iqr[seed] = lt_iqr
+            print(f"    LT-IQR: {np.isfinite(lt_iqr).sum()}/{n_tgt} targets "
+                  f"(n_shadows={logit_mat.shape[1]})")
+        else:
+            print(f"    LT-IQR: shadow logit/membership matrices not found — skipping.")
+
+        # ---------------------------------------------------------------
+        # 1b: Generalized leverage from final Nystrom step
+        # ---------------------------------------------------------------
+        leverage = None
+        yp_path = os.path.join(runs_dir, setting, f"seed_{seed}", "Y_projections.npy")
+        b_path  = os.path.join(runs_dir, setting, f"seed_{seed}", "B_matrices.npy")
+        m_path  = os.path.join(runs_dir, setting, f"seed_{seed}", "YTY_matrices.npy")
+        if os.path.exists(yp_path) and os.path.exists(b_path) and os.path.exists(m_path):
+            Y_proj = np.load(yp_path)    # (n_priv, T, r)
+            B_mats = np.load(b_path)     # (T, r, r)
+            M_mats = np.load(m_path)     # (T, r, r)
+            # Final accounting step for each member target
+            Y_final = Y_proj[idx, -1, :].astype(np.float64)
+            leverage = _compute_gen_leverage_batch(Y_final,
+                                                   B_mats[-1].astype(np.float64),
+                                                   M_mats[-1].astype(np.float64))
+            per_seed_leverage[seed] = leverage
+            print(f"    Gen-leverage: {len(leverage)} targets (mean={leverage.mean():.4e})")
+        else:
+            print(f"    Gen-leverage: Y_projections/B_matrices/YTY_matrices not found — skipping.")
+
+        # ---------------------------------------------------------------
+        # 1c: Correlation rows for this seed
+        # ---------------------------------------------------------------
+        if lt_iqr is not None:
+            n_use = min(n, len(lt_iqr))
+            row_ov, rows_t = _corr_row_p19(f"[s{seed}] LT-IQR", lt_iqr, D_use[:n_use],
+                                            tier_arr=tier_mem[:n_use] if tier_mem is not None else None,
+                                            n_boot=n_boot)
+            for r in [row_ov] + rows_t:
+                r["seed"] = seed; r["predictor"] = "lt_iqr"
+                all_rows.append(r)
+            print(f"    LT-IQR overall: ρ={row_ov['rho']:+.4f}  "
+                  f"CI=[{row_ov['ci_lo']:.3f},{row_ov['ci_hi']:.3f}]")
+
+        if leverage is not None:
+            n_use = min(n, len(leverage))
+            row_ov, rows_t = _corr_row_p19(f"[s{seed}] gen-leverage", leverage, D_use[:n_use],
+                                            tier_arr=tier_mem[:n_use] if tier_mem is not None else None,
+                                            n_boot=n_boot)
+            for r in [row_ov] + rows_t:
+                r["seed"] = seed; r["predictor"] = "gen_leverage"
+                all_rows.append(r)
+            print(f"    Gen-leverage overall: ρ={row_ov['rho']:+.4f}  "
+                  f"CI=[{row_ov['ci_lo']:.3f},{row_ov['ci_hi']:.3f}]")
+
+    # -------------------------------------------------------------------
+    # Three-seed aggregate rows
+    # -------------------------------------------------------------------
+    print(f"\n  --- Aggregate rows (seeds={list(seeds)}) ---")
+    tier_names_map = {0: "head", 1: "mid", 2: "tail"}
+    scopes = ["overall"] + list(tier_names_map.values())
+
+    for predictor, seed_scores_dict in [("lt_iqr", per_seed_lt_iqr),
+                                         ("gen_leverage", per_seed_leverage)]:
+        if not seed_scores_dict:
+            continue
+        pred_label = {"lt_iqr": "LT-IQR", "gen_leverage": "gen-leverage"}[predictor]
+        for scope in scopes:
+            rho_per_seed = []
+            for seed, scores in seed_scores_dict.items():
+                D_s    = per_seed_D.get(seed, np.array([]))
+                tier_s = per_seed_tiers.get(seed)
+                n_s    = min(len(scores), len(D_s))
+                sc_s, D_s = scores[:n_s], D_s[:n_s]
+                if scope == "overall":
+                    valid = np.isfinite(sc_s) & np.isfinite(D_s)
+                else:
+                    t_id = {v: k for k, v in tier_names_map.items()}.get(scope)
+                    if tier_s is None or t_id is None: continue
+                    valid = (tier_s[:n_s] == t_id) & np.isfinite(sc_s) & np.isfinite(D_s)
+                if valid.sum() < 5: continue
+                rho, _, _ = _spearman_ci(sc_s[valid], D_s[valid], n_boot=0)
+                rho_per_seed.append(float(rho))
+            if not rho_per_seed: continue
+            agg = {"label": f"AGGREGATE {pred_label}",
+                   "predictor": predictor, "scope": scope,
+                   "rho_per_seed": rho_per_seed,
+                   "rho_mean": float(np.mean(rho_per_seed)),
+                   "rho_std":  float(np.std(rho_per_seed)),
+                   "n_seeds":  len(rho_per_seed)}
+            all_rows.append(agg)
+            print(f"  {pred_label:12s} {scope:8s}: "
+                  f"ρ_mean={agg['rho_mean']:+.4f} ±{agg['rho_std']:.4f}  "
+                  f"per_seed={[f'{v:+.4f}' for v in rho_per_seed]}")
+
+    # -------------------------------------------------------------------
+    # 1d: Gap report: eps_dir rho minus each baseline rho, per tier
+    # -------------------------------------------------------------------
+    print(f"\n  --- Gap: eps_dir ρ minus baseline ρ (three-seed range) ---")
+    for pred, seed_dict in [("LT-IQR", per_seed_lt_iqr),
+                              ("gen-leverage", per_seed_leverage)]:
+        if not seed_dict: continue
+        for scope in scopes:
+            gaps = []
+            for seed, base_scores in seed_dict.items():
+                cert = _load_cert(setting, seed, cert_dir)
+                if cert is None or "epsilon_cert_dir_rank_100" not in cert: continue
+                ml = os.path.join(runs_dir, setting, f"seed_{seed}", "lira_member_local_idx.npy")
+                if not os.path.exists(ml): continue
+                midx = np.load(ml)
+                D_s = per_seed_D.get(seed, np.array([]))
+                tier_s = per_seed_tiers.get(seed)
+                n_s = min(len(base_scores), len(midx), len(D_s))
+                ed  = cert["epsilon_cert_dir_rank_100"][midx[:n_s]]
+                if scope == "overall":
+                    valid = np.isfinite(ed) & np.isfinite(base_scores[:n_s]) & np.isfinite(D_s[:n_s])
+                else:
+                    t_id = {v: k for k, v in tier_names_map.items()}.get(scope)
+                    if tier_s is None or t_id is None: continue
+                    valid = ((tier_s[:n_s] == t_id) & np.isfinite(ed)
+                             & np.isfinite(base_scores[:n_s]) & np.isfinite(D_s[:n_s]))
+                if valid.sum() < 5: continue
+                rho_dir,  _, _ = _spearman_ci(ed[valid], D_s[:n_s][valid], n_boot=0)
+                rho_base, _, _ = _spearman_ci(base_scores[:n_s][valid], D_s[:n_s][valid], n_boot=0)
+                gaps.append(rho_dir - rho_base)
+            if not gaps: continue
+            gap_str = f"[{min(gaps):+.4f}, {max(gaps):+.4f}]"
+            print(f"  eps_dir vs {pred:12s} {scope:8s}: gap range={gap_str}  mean={np.mean(gaps):+.4f}")
+
+    # -------------------------------------------------------------------
+    # Save
+    # -------------------------------------------------------------------
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "table3_baselines.json")
+    with open(out_path, "w") as f:
+        json.dump({"setting": setting, "lira_id": lira_id, "seeds": list(seeds),
+                   "rows": all_rows,
+                   "schema": ("Each row: label, predictor, scope, rho, ci_lo, ci_hi, "
+                               "rank_r2, n, seed.  Aggregate rows: rho_per_seed, "
+                               "rho_mean, rho_std instead.")}, f, indent=2)
+    print(f"\n  [saved] {out_path}")
+    return all_rows
+
+
+# ===========================================================================
+# Item 2: Low-variance-direction Gaussianity check
+# ===========================================================================
+
+def _gauss_stats_1d(samples):
+    """KS distance to best-fit Gaussian, |skewness|, |excess kurtosis|."""
+    from scipy.stats import ks_2samp, skew as _skew, kurtosis as _kurt, norm
+    samples = np.asarray(samples, dtype=np.float64)
+    samples = samples[np.isfinite(samples)]
+    if len(samples) < 20:
+        return {"ks": float("nan"), "skewness_abs": float("nan"),
+                "excess_kurtosis_abs": float("nan"), "n": len(samples)}
+    mu, sd = samples.mean(), samples.std()
+    if sd < 1e-12:
+        return {"ks": float("nan"), "skewness_abs": float("nan"),
+                "excess_kurtosis_abs": float("nan"), "n": len(samples)}
+    ref = norm.rvs(loc=mu, scale=sd, size=min(20000, len(samples) * 10), random_state=0)
+    ks_stat, _ = ks_2samp(samples, ref)
+    return {"ks": float(ks_stat),
+            "skewness_abs": float(abs(_skew(samples))),
+            "excess_kurtosis_abs": float(abs(_kurt(samples, fisher=True))),
+            "n": len(samples)}
+
+
+def _poisson_proj(scalars_j, q, n_batches, exclude_idx, rng):
+    """
+    Draw n_batches realisations of <v, G_{-i}> = Σ_{j≠i} I_j (v^T g_j).
+    scalars_j[j] = v^T g_j  for all j (including i).
+    exclude_idx: index of the leave-one-out target (integer).
+    Returns: array of shape (n_batches,).
+    """
+    n = len(scalars_j)
+    mask = np.ones(n, dtype=bool); mask[exclude_idx] = False
+    s = scalars_j[mask]           # (n-1,)
+    chunk = 512
+    out = np.empty(n_batches, dtype=np.float64)
+    for start in range(0, n_batches, chunk):
+        end = min(start + chunk, n_batches)
+        nb  = end - start
+        I   = rng.binomial(1, q, size=(len(s), nb)).astype(np.float64)
+        out[start:end] = s @ I
+    return out
+
+
+def gaussian_validation_lowvar(run_id, seed, runs_dir=RUNS_DIR, out_dir=OUT_DIR,
+                                n_batches=5000, k_top=10, k_bot=5,
+                                eigenvalue_floor_factor=1e-6,
+                                n_targets_per_tier=3):
+    """
+    Item 2: Low-variance-direction Gaussianity check.
+
+    Re-runs the existing batch-sampling loop (same n_batches, target set,
+    early/middle/late steps) but projects onto two complementary families:
+
+    Family (i):  bottom-k eigenvectors of H = B^{-1/2} M B^{-1/2} that have
+                 eigenvalue above eigenvalue_floor_factor * lambda_max.
+                 These are the lowest-variance directions within the Nystrom
+                 subspace.
+
+    Family (ii): for each tail (and mid/head) target, the component of its
+                 clipped gradient direction orthogonal to the top-k subspace.
+                 This is the direction-specific test for how exposed the target
+                 is in non-dominant space.
+
+    The existing gaussian_validation() tests only top-k directions.  This
+    function tests the opposite end, where Gaussianity is least guaranteed
+    and tail examples are most exposed.
+
+    Output: {out_dir}/gaussian_validation_{run_id}_lowvar_seed{seed}.json
+    Same schema as the existing gaussian_validation output plus a "subspace"
+    field in {"top","bottom","tail_orthogonal"}.
+    """
+    print(f"\n{'='*72}")
+    print(f"  Item 2: Low-var Gaussianity — {run_id} seed={seed}")
+    print(f"{'='*72}")
+
+    run_dir   = os.path.join(runs_dir, run_id, f"seed_{seed}")
+    meta_path = os.path.join(run_dir, "metadata.json")
+    if not os.path.exists(meta_path):
+        print(f"  [GV-lowvar] metadata.json not found: {run_dir}"); return
+
+    with open(meta_path) as f:
+        meta = json.load(f)
+    q = float(meta.get("q", meta.get("rho_poisson", 1/9)))
+    T = int(meta.get("T_train", meta.get("T_steps", 100)))
+
+    for fname in ["Y_projections.npy", "B_matrices.npy", "YTY_matrices.npy"]:
+        if not os.path.exists(os.path.join(run_dir, fname)):
+            print(f"  [GV-lowvar] {fname} not found — skipping (need Nystrom matrices).")
+            return
+
+    Y_proj = np.load(os.path.join(run_dir, "Y_projections.npy"))   # (n, T, r)
+    B_mats = np.load(os.path.join(run_dir, "B_matrices.npy"))       # (T, r, r)
+    M_mats = np.load(os.path.join(run_dir, "YTY_matrices.npy"))     # (T, r, r)
+    tier_path = os.path.join(run_dir, "tier_labels.npy")
+    tier_labels = np.load(tier_path) if os.path.exists(tier_path) else None
+
+    n, T_saved, r = Y_proj.shape
+    T = min(T, T_saved)
+
+    steps_map = {
+        "early":  max(0, int(0.1 * T) - 1),
+        "middle": max(0, int(0.5 * T) - 1),
+        "late":   max(0, T - 1),
+    }
+    if run_id == "F5":
+        steps_map = {"middle": steps_map["middle"]}
+
+    # Select representative targets from each tier
+    rng_tgt = np.random.default_rng(seed * 7 + 13)
+    targets = []   # list of (idx, tier_name)
+    tier_map = {0: "head", 1: "mid", 2: "tail"}
+    if tier_labels is not None:
+        for t_id, t_name in tier_map.items():
+            avail = np.where(tier_labels == t_id)[0]
+            if len(avail) == 0: continue
+            chosen = rng_tgt.choice(avail, size=min(n_targets_per_tier, len(avail)), replace=False)
+            for idx in chosen:
+                targets.append((int(idx), t_name))
+    else:
+        for idx in rng_tgt.choice(n, size=min(9, n), replace=False):
+            targets.append((int(idx), "unknown"))
+
+    results = []
+    rng_sam = np.random.default_rng(seed * 31 + 17)
+
+    for phase_name, step_idx in steps_map.items():
+        step_idx = int(np.clip(step_idx, 0, T - 1))
+        print(f"\n  Phase {phase_name} (step {step_idx}/{T}) ...")
+
+        B  = B_mats[step_idx].astype(np.float64)
+        M  = M_mats[step_idx].astype(np.float64)
+        S, H = _nystrom_H_from_BM(B, M)
+
+        # Eigendecompose H (ascending order from eigh → reverse for descending)
+        evals_H, evecs_H = np.linalg.eigh(H)
+        evals_desc  = evals_H[::-1]
+        evecs_desc  = evecs_H[:, ::-1]   # (r, r) columns = eigvecs in descending order
+        lmax        = evals_desc[0] if evals_desc[0] > 0 else 1.0
+        floor       = eigenvalue_floor_factor * lmax
+
+        # Valid directions: eigenvalue > floor
+        valid_mask  = evals_desc > floor
+        n_valid     = int(valid_mask.sum())
+
+        # Bottom-k from valid directions
+        valid_idxs  = np.where(valid_mask)[0]   # positions in desc-ordered evals
+        n_bot_use   = min(k_bot, len(valid_idxs))
+        bot_idxs    = valid_idxs[-n_bot_use:]   # last k of the valid = smallest valid
+
+        # Precompute z_j = S @ Y_proj[j, step, :] for all j
+        Y_step = Y_proj[:, step_idx, :].astype(np.float64)   # (n, r)
+        Z = Y_step @ S.T                                       # (n, r)
+
+        print(f"    H eigenvalues: max={evals_desc[0]:.4e}, "
+              f"floor={floor:.2e}, n_valid={n_valid}/{r}, n_bot={n_bot_use}")
+
+        # -----------------------------------------------------------------
+        # Family (i): bottom-k valid eigenvectors of H
+        # -----------------------------------------------------------------
+        for ki, dir_idx in enumerate(bot_idxs):
+            w      = evecs_desc[:, dir_idx]       # (r,) direction in z-space
+            scalars = Z @ w                        # (n,) scalar projections
+            ev     = float(evals_desc[dir_idx])
+
+            for (i_target, tier_name) in targets:
+                samples = _poisson_proj(scalars, q, n_batches,
+                                        exclude_idx=i_target, rng=rng_sam)
+                stats = _gauss_stats_1d(samples)
+                stats.update({
+                    "run_id": run_id, "seed": seed,
+                    "phase": phase_name, "step": step_idx,
+                    "subspace": "bottom",
+                    "direction_idx": ki,
+                    "eigenvalue": ev,
+                    "tier": tier_name,
+                    "target_idx": i_target,
+                })
+                results.append(stats)
+
+            ks_vals = [r2["ks"] for r2 in results
+                       if r2["subspace"] == "bottom" and r2["phase"] == phase_name
+                       and r2["direction_idx"] == ki and np.isfinite(r2["ks"])]
+            if ks_vals:
+                print(f"    [bottom dir {ki} λ={ev:.3e}] KS med={np.median(ks_vals):.4f}  "
+                      f"max={np.max(ks_vals):.4f}")
+
+        # -----------------------------------------------------------------
+        # Family (ii): tail-orthogonal directions
+        # Defined as z_i projected out of the top-k subspace, then normalized.
+        # -----------------------------------------------------------------
+        top_evecs = evecs_desc[:, :k_top]   # (r, k_top)
+
+        for (i_target, tier_name) in targets:
+            z_i     = Z[i_target]                          # (r,)
+            proj    = top_evecs @ (top_evecs.T @ z_i)
+            z_orth  = z_i - proj
+            norm_orth = float(np.linalg.norm(z_orth))
+
+            if norm_orth < 1e-10:
+                print(f"    [ii] {tier_name} i={i_target}: gradient fully in top-{k_top} "
+                      f"subspace; skipping orthogonal direction.")
+                continue
+
+            w_ii    = z_orth / norm_orth                   # (r,) normalised direction
+            scalars = Z @ w_ii                              # (n,)
+
+            samples = _poisson_proj(scalars, q, n_batches,
+                                    exclude_idx=i_target, rng=rng_sam)
+            stats = _gauss_stats_1d(samples)
+            stats.update({
+                "run_id": run_id, "seed": seed,
+                "phase": phase_name, "step": step_idx,
+                "subspace": "tail_orthogonal",
+                "tier": tier_name,
+                "target_idx": i_target,
+                "z_orth_norm": norm_orth,
+                "frac_orth_of_total": norm_orth / (np.linalg.norm(z_i) + 1e-12),
+            })
+            results.append(stats)
+
+        # Summary for this phase
+        for sub, sub_label in [("bottom", "bottom-k"), ("tail_orthogonal", "tail_orth")]:
+            sub_r = [s for s in results if s["phase"] == phase_name and s["subspace"] == sub]
+            if not sub_r: continue
+            ks_v  = [s["ks"] for s in sub_r if np.isfinite(s["ks"])]
+            sk_v  = [s["skewness_abs"] for s in sub_r if np.isfinite(s.get("skewness_abs", np.nan))]
+            ek_v  = [s["excess_kurtosis_abs"] for s in sub_r if np.isfinite(s.get("excess_kurtosis_abs", np.nan))]
+            if ks_v:
+                print(f"    [{sub_label}] KS: med={np.median(ks_v):.4f}  "
+                      f"max={np.max(ks_v):.4f}  |skew| med={np.median(sk_v) if sk_v else float('nan'):.4f}  "
+                      f"|ekurt| med={np.median(ek_v) if ek_v else float('nan'):.4f}")
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir,
+                            f"gaussian_validation_{run_id}_lowvar_seed{seed}.json")
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"  [GV-lowvar] Saved → {out_path}")
+    return results
+
+
+# ===========================================================================
+# Item 3: Cross-seed rank stability of per-example eps_dir
+# ===========================================================================
+
+def rank_stability(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=OUT_DIR,
+                   setting="F1", seeds=(0, 1, 2)):
+    """
+    Item 3: Cross-seed rank stability of per-example eps_dir rankings.
+
+    For the common set of member examples, computes pairwise Spearman
+    between per-example eps_dir rankings across seeds (0vs1, 0vs2, 1vs2),
+    overall and within each tier.  Reports the median pairwise value and
+    the three individual values.
+
+    If eps_dir values were saved at the per-example level this is pure
+    post-processing; if only tier summaries were saved the function warns
+    and exits early.
+
+    Output: {out_dir}/rank_stability_{setting}.json
+    """
+    print(f"\n{'='*72}")
+    print(f"  Item 3: Cross-seed rank stability — {setting}")
+    print(f"{'='*72}")
+
+    eps_by_seed  = {}
+    tier_by_seed = {}
+
+    for seed in seeds:
+        cert = _load_cert(setting, seed, cert_dir)
+        if cert is None or "epsilon_cert_dir_rank_100" not in cert:
+            print(f"  [skip] eps_dir not found for seed {seed}")
+            continue
+        eps_by_seed[seed]  = cert["epsilon_cert_dir_rank_100"].astype(np.float64)
+        run = _load_run(setting, seed, runs_dir)
+        if "tier_labels" in run:
+            tier_by_seed[seed] = run["tier_labels"]
+        print(f"  Loaded seed {seed}: n={len(eps_by_seed[seed])}  "
+              f"med={np.median(eps_by_seed[seed]):.4f}")
+
+    avail_seeds = sorted(eps_by_seed.keys())
+    if len(avail_seeds) < 2:
+        print(f"  [item3] Need ≥ 2 seeds with saved eps_dir, found {len(avail_seeds)}. Stopping.")
+        return
+
+    n_common  = min(len(eps_by_seed[s]) for s in avail_seeds)
+    tier_ref  = tier_by_seed.get(avail_seeds[0])
+    if tier_ref is not None:
+        tier_ref = tier_ref[:n_common]
+
+    tier_map = {0: "head", 1: "mid", 2: "tail"}
+    scopes   = ["overall"] + list(tier_map.values())
+    pairs    = [(s1, s2) for i, s1 in enumerate(avail_seeds)
+                for s2 in avail_seeds[i+1:]]
+
+    rows = []
+    for scope in scopes:
+        if scope == "overall":
+            scope_mask = np.ones(n_common, dtype=bool)
+        else:
+            if tier_ref is None: continue
+            t_id = {v: k for k, v in tier_map.items()}[scope]
+            scope_mask = (tier_ref == t_id)
+        if scope_mask.sum() < 5: continue
+
+        pair_rhos = []
+        for s1, s2 in pairs:
+            e1 = eps_by_seed[s1][:n_common][scope_mask]
+            e2 = eps_by_seed[s2][:n_common][scope_mask]
+            valid = np.isfinite(e1) & np.isfinite(e2)
+            if valid.sum() < 5: continue
+            rho, _, _ = _spearman_ci(e1[valid], e2[valid], n_boot=0)
+            rows.append({"scope": scope, "pair": f"{s1}vs{s2}",
+                         "spearman": float(rho), "n": int(valid.sum())})
+            pair_rhos.append(float(rho))
+            print(f"  {scope:8s} ({s1},{s2}): Spearman ε^dir = {rho:+.4f}  n={valid.sum()}")
+
+        if pair_rhos:
+            med_rho = float(np.median(pair_rhos))
+            rows.append({"scope": scope, "pair": "median_pairwise",
+                         "spearman": med_rho, "n": int(scope_mask.sum())})
+            print(f"  {scope:8s} median pairwise: {med_rho:+.4f}")
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"rank_stability_{setting}.json")
+    with open(out_path, "w") as f:
+        json.dump({"setting": setting, "seeds_available": avail_seeds,
+                   "n_common": n_common, "rows": rows,
+                   "schema": ("scope ∈ {overall,head,mid,tail}, "
+                               "pair ∈ {0vs1,0vs2,1vs2,median_pairwise}, spearman, n")},
+                  f, indent=2)
+    print(f"\n  [saved] {out_path}")
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -876,7 +1597,7 @@ def main():
     parser.add_argument("--gaussian_validation", action="store_true")
     parser.add_argument("--run",      type=str, default="F1", choices=["F1","F2","F5"])
     parser.add_argument("--seed",     type=int, default=0,
-                        help="Seed for --gaussian_validation")
+                        help="Seed for --gaussian_validation / --gaussian_lowvar")
     parser.add_argument("--lira_seeds", type=int, nargs="+", default=None,
                         help="LiRA seeds to use for Table 3 / Figure 1 (e.g. --lira_seeds 0 1 2)")
     parser.add_argument("--all_lira_seeds", action="store_true",
@@ -885,6 +1606,27 @@ def main():
     parser.add_argument("--cert_dir", type=str, default=CERT_DIR)
     parser.add_argument("--lira_dir", type=str, default=LIRA_DIR)
     parser.add_argument("--out_dir",  type=str, default=OUT_DIR)
+    # ------------------------------------------------------------------
+    # New items 1-3 (phase19_spex.md remaining analysis spec)
+    # ------------------------------------------------------------------
+    parser.add_argument("--baselines", action="store_true",
+                        help="Item 1: shadow-free baseline rows (LT-IQR, gen-leverage)")
+    parser.add_argument("--gaussian_lowvar", action="store_true",
+                        help="Item 2: low-variance-direction Gaussianity check")
+    parser.add_argument("--rank_stability", action="store_true",
+                        help="Item 3: cross-seed rank stability of eps_dir rankings")
+    parser.add_argument("--setting",  type=str, default="F1",
+                        help="Run ID for items 1-3 (default: F1)")
+    parser.add_argument("--lira_id",  type=str, default="LF1",
+                        help="LiRA run ID for item 1 (default: LF1)")
+    parser.add_argument("--seeds",    type=int, nargs="+", default=[0, 1, 2],
+                        help="Seeds for items 1-3 (default: 0 1 2)")
+    parser.add_argument("--n_batches", type=int, default=5000,
+                        help="Poisson batches for item 2 Gaussianity check")
+    parser.add_argument("--k_top",    type=int, default=10,
+                        help="Top eigenvectors defining dominant subspace (item 2)")
+    parser.add_argument("--k_bot",    type=int, default=5,
+                        help="Bottom eigenvectors to test for family (i) (item 2)")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -919,6 +1661,31 @@ def main():
         run_id = args.run if not args.all else "F1"
         seed   = args.seed if not args.all else 0
         gaussian_validation(run_id, seed, args.runs_dir, args.out_dir)
+
+    # ------------------------------------------------------------------
+    # Items 1-3: remaining analysis
+    # ------------------------------------------------------------------
+    if args.baselines or args.all:
+        table_baselines(
+            cert_dir=args.cert_dir, lira_dir=args.lira_dir,
+            runs_dir=args.runs_dir, out_dir=args.out_dir,
+            setting=args.setting, lira_id=args.lira_id,
+            seeds=tuple(args.seeds),
+        )
+
+    if args.gaussian_lowvar or args.all:
+        for s in args.seeds:
+            gaussian_validation_lowvar(
+                run_id=args.setting, seed=s,
+                runs_dir=args.runs_dir, out_dir=args.out_dir,
+                n_batches=args.n_batches, k_top=args.k_top, k_bot=args.k_bot,
+            )
+
+    if args.rank_stability or args.all:
+        rank_stability(
+            cert_dir=args.cert_dir, runs_dir=args.runs_dir, out_dir=args.out_dir,
+            setting=args.setting, seeds=tuple(args.seeds),
+        )
 
     print(f"\n[P19-analysis] Done. Results in {args.out_dir}")
 
