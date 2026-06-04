@@ -1109,6 +1109,57 @@ def _compute_gen_leverage_batch(Y_proj_final, B_final, M_final,
     return np.maximum(leverage, 0.0)
 
 
+def _compute_lt_iqr_from_losses(losses_mem, n_epochs, collapse="mean", q1=0.25, q2=0.75):
+    """
+    LT-IQR per Pollock et al. from a per-step training-loss trace.
+
+    losses_mem : (n_member, T_steps)  per-step CE losses saved during training
+    n_epochs   : number of training epochs (used to group steps into epoch blocks)
+    collapse   : "mean" (primary) or "last" — how to reduce each epoch's steps to one value
+    Returns    : lt_iqr of shape (n_member,), non-negative, no sign flip needed
+    """
+    losses_mem = np.asarray(losses_mem, dtype=np.float64)
+    n_member, T_steps = losses_mem.shape
+    steps_per_epoch = T_steps // n_epochs
+    if steps_per_epoch < 1:
+        return np.full(n_member, np.nan)
+    T_use = steps_per_epoch * n_epochs          # truncate to complete epochs
+    L_epoched = losses_mem[:, :T_use].reshape(n_member, n_epochs, steps_per_epoch)
+    if collapse == "mean":
+        L = L_epoched.mean(axis=2)              # (n_member, n_epochs)
+    else:
+        L = L_epoched[:, :, -1]                 # last step of each epoch
+    return np.quantile(L, q2, axis=1) - np.quantile(L, q1, axis=1)
+
+
+def _precision_at_k(scores, D_lira, ks=(0.01, 0.03, 0.05)):
+    """
+    Precision@k matching Pollock et al.'s headline metric.
+
+    Vulnerable set V = top-k members by D^LiRA score.
+    Predicted set P = top-k members by predictor scores.
+    Precision@k = |V ∩ P| / k.
+
+    ks : fractions of the valid population (0.01 = top-1%)
+    Returns dict with keys prec_at_1pct, k_1pct, prec_at_3pct, k_3pct, prec_at_5pct, k_5pct
+    """
+    scores = np.asarray(scores, dtype=np.float64)
+    D = np.asarray(D_lira, dtype=np.float64)
+    n = min(len(scores), len(D))
+    valid = np.isfinite(scores[:n]) & np.isfinite(D[:n])
+    sv, dv = scores[:n][valid], D[:n][valid]
+    n_v = len(sv)
+    out = {}
+    for k_frac in ks:
+        k = max(1, int(round(k_frac * n_v)))
+        V = set(np.argsort(dv)[-k:])
+        P = set(np.argsort(sv)[-k:])
+        tag = f"{int(round(k_frac * 100))}pct"
+        out[f"prec_at_{tag}"] = float(len(V & P) / k)
+        out[f"k_{tag}"]       = k
+    return out
+
+
 def _corr_row_p19(label, scores, D_lira, tier_arr=None, n_boot=500):
     """Return overall + per-tier correlation dicts for a predictor vs D^LiRA."""
     scores = np.asarray(scores, dtype=np.float64)
@@ -1189,19 +1240,46 @@ def table_baselines(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
         per_seed_tiers[seed] = tier_mem
 
         # ---------------------------------------------------------------
-        # 1a: LT-IQR
+        # 1a: LT-IQR — per-step losses.npy trace (Pollock et al. §4.2)
+        #     No shadow models used.  IQR is computed over per-epoch loss
+        #     values (steps collapsed to epochs first) to match Pollock's
+        #     construction.  Higher IQR = more loss volatility = more
+        #     vulnerable, by construction; no sign flip needed.
         # ---------------------------------------------------------------
-        logit_mat, mem_mat = _load_shadow_traces(lira_id, seed, lira_dir)
         lt_iqr = None
-        if logit_mat is not None and mem_mat is not None:
-            n_tgt = min(n, logit_mat.shape[0])
-            lt_iqr = _compute_lt_iqr(logit_mat[:n_tgt], mem_mat[:n_tgt],
-                                      sign_ref_D=D_use[:n_tgt])
+        lt_iqr_last_collapse = None
+        losses_all_raw = run.get("losses")
+        run_meta = run.get("meta", {})
+        n_epochs_run = int(run_meta.get("n_epochs",
+                           run_meta.get("T_epochs",
+                           run_meta.get("num_epochs", 0))))
+        if n_epochs_run <= 0 and losses_all_raw is not None:
+            T_steps_raw = losses_all_raw.shape[1]
+            spe = int(run_meta.get("steps_per_epoch",
+                      run_meta.get("steps_per_ep", 0)))
+            if spe > 0:
+                n_epochs_run = T_steps_raw // spe
+        if losses_all_raw is not None and n_epochs_run > 0:
+            losses_mem_raw = losses_all_raw[idx, :]           # (n_member, T_steps)
+            lt_iqr_mean        = _compute_lt_iqr_from_losses(
+                losses_mem_raw, n_epochs_run, collapse="mean")
+            lt_iqr_last_collapse = _compute_lt_iqr_from_losses(
+                losses_mem_raw, n_epochs_run, collapse="last")
+            sp_rho_collapse, _, _ = _spearman_ci(lt_iqr_mean, lt_iqr_last_collapse, n_boot=0)
+            n_finite = int(np.isfinite(lt_iqr_mean).sum())
+            n_nonneg = int((lt_iqr_mean[np.isfinite(lt_iqr_mean)] >= 0).sum())
+            print(f"    LT-IQR (mean-collapse): {n_finite}/{len(lt_iqr_mean)} targets finite, "
+                  f"non-neg={n_nonneg}/{n_finite}, "
+                  f"Spearman(mean,last)={sp_rho_collapse:+.4f}  "
+                  f"[n_epochs={n_epochs_run}, T_steps={losses_all_raw.shape[1]}]")
+            if np.isfinite(sp_rho_collapse) and sp_rho_collapse < 0.95:
+                print(f"    [warn] mean/last Spearman={sp_rho_collapse:.4f} < 0.95 — "
+                      f"trace fragile at this operating point; both collapse modes reported.")
+            lt_iqr = lt_iqr_mean
             per_seed_lt_iqr[seed] = lt_iqr
-            print(f"    LT-IQR: {np.isfinite(lt_iqr).sum()}/{n_tgt} targets "
-                  f"(n_shadows={logit_mat.shape[1]})")
         else:
-            print(f"    LT-IQR: shadow logit/membership matrices not found — skipping.")
+            print(f"    LT-IQR: losses.npy not found or n_epochs unknown "
+                  f"(n_epochs_run={n_epochs_run}) — skipping.")
 
         # ---------------------------------------------------------------
         # 1b: Generalized leverage from final Nystrom step
@@ -1229,14 +1307,65 @@ def table_baselines(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
         # ---------------------------------------------------------------
         if lt_iqr is not None:
             n_use = min(n, len(lt_iqr))
-            row_ov, rows_t = _corr_row_p19(f"[s{seed}] LT-IQR", lt_iqr, D_use[:n_use],
+            # Primary: mean-collapse LT-IQR (Pollock §4.2 construction)
+            row_ov, rows_t = _corr_row_p19(f"[s{seed}] LT-IQR (mean)", lt_iqr, D_use[:n_use],
                                             tier_arr=tier_mem[:n_use] if tier_mem is not None else None,
                                             n_boot=n_boot)
+            prec_mean = _precision_at_k(lt_iqr[:n_use], D_use[:n_use])
             for r in [row_ov] + rows_t:
-                r["seed"] = seed; r["predictor"] = "lt_iqr"
+                r["seed"] = seed; r["predictor"] = "lt_iqr"; r["collapse"] = "mean"
+                r["precision_at_k"] = prec_mean
                 all_rows.append(r)
-            print(f"    LT-IQR overall: ρ={row_ov['rho']:+.4f}  "
-                  f"CI=[{row_ov['ci_lo']:.3f},{row_ov['ci_hi']:.3f}]")
+            print(f"    LT-IQR (mean) overall: ρ={row_ov['rho']:+.4f}  "
+                  f"CI=[{row_ov['ci_lo']:.3f},{row_ov['ci_hi']:.3f}]  "
+                  f"Prec@1%={prec_mean.get('prec_at_1pct', float('nan')):.3f}")
+
+            # Sensitivity check: last-collapse
+            if lt_iqr_last_collapse is not None:
+                n_use_l = min(n, len(lt_iqr_last_collapse))
+                row_ov_l, rows_t_l = _corr_row_p19(
+                    f"[s{seed}] LT-IQR (last)", lt_iqr_last_collapse, D_use[:n_use_l],
+                    tier_arr=tier_mem[:n_use_l] if tier_mem is not None else None,
+                    n_boot=n_boot)
+                prec_last = _precision_at_k(lt_iqr_last_collapse[:n_use_l], D_use[:n_use_l])
+                for r in [row_ov_l] + rows_t_l:
+                    r["seed"] = seed; r["predictor"] = "lt_iqr"; r["collapse"] = "last"
+                    r["precision_at_k"] = prec_last
+                    all_rows.append(r)
+                print(f"    LT-IQR (last) overall: ρ={row_ov_l['rho']:+.4f}  "
+                      f"CI=[{row_ov_l['ci_lo']:.3f},{row_ov_l['ci_hi']:.3f}]  "
+                      f"Prec@1%={prec_last.get('prec_at_1pct', float('nan')):.3f}")
+
+            # Reference predictors: Precision@k on the same axis for comparison
+            for pred_name, pred_arr in [
+                ("eps_dir",  cert.get("epsilon_cert_dir_rank_100")),
+                ("eps_norm", cert.get("epsilon_cert_norm")),
+            ]:
+                if pred_arr is None:
+                    continue
+                pred_mem = pred_arr[idx[:n_use]]
+                prec_ref = _precision_at_k(pred_mem, D_use[:n_use])
+                ref_row = {"label": f"[s{seed}] {pred_name} Prec@k",
+                           "seed": seed, "predictor": pred_name, "scope": "overall",
+                           "precision_at_k": prec_ref,
+                           "rho": float("nan"), "ci_lo": float("nan"), "ci_hi": float("nan")}
+                all_rows.append(ref_row)
+                print(f"    {pred_name:10s}  "
+                      f"Prec@1%={prec_ref.get('prec_at_1pct', float('nan')):.3f}  "
+                      f"Prec@3%={prec_ref.get('prec_at_3pct', float('nan')):.3f}  "
+                      f"Prec@5%={prec_ref.get('prec_at_5pct', float('nan')):.3f}")
+            if losses_all_raw is not None:
+                loss_final_mem = losses_all_raw[idx[:n_use], -1]
+                prec_loss = _precision_at_k(loss_final_mem, D_use[:n_use])
+                loss_row = {"label": f"[s{seed}] loss_final Prec@k",
+                            "seed": seed, "predictor": "loss_final", "scope": "overall",
+                            "precision_at_k": prec_loss,
+                            "rho": float("nan"), "ci_lo": float("nan"), "ci_hi": float("nan")}
+                all_rows.append(loss_row)
+                print(f"    loss_final   "
+                      f"Prec@1%={prec_loss.get('prec_at_1pct', float('nan')):.3f}  "
+                      f"Prec@3%={prec_loss.get('prec_at_3pct', float('nan')):.3f}  "
+                      f"Prec@5%={prec_loss.get('prec_at_5pct', float('nan')):.3f}")
 
         if leverage is not None:
             n_use = min(n, len(leverage))
@@ -1332,8 +1461,13 @@ def table_baselines(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
         json.dump({"setting": setting, "lira_id": lira_id, "seeds": list(seeds),
                    "rows": all_rows,
                    "schema": ("Each row: label, predictor, scope, rho, ci_lo, ci_hi, "
-                               "rank_r2, n, seed.  Aggregate rows: rho_per_seed, "
-                               "rho_mean, rho_std instead.")}, f, indent=2)
+                               "rank_r2, n, seed.  LT-IQR rows also carry: collapse "
+                               "(mean|last), precision_at_k {prec_at_1pct, k_1pct, "
+                               "prec_at_3pct, k_3pct, prec_at_5pct, k_5pct}.  "
+                               "Reference-predictor Prec@k rows (eps_dir, eps_norm, "
+                               "loss_final) carry precision_at_k but rho=NaN.  "
+                               "Aggregate rows: rho_per_seed, rho_mean, rho_std instead.")},
+                  f, indent=2)
     print(f"\n  [saved] {out_path}")
     return all_rows
 
