@@ -29,7 +29,7 @@ Usage:
   python experiments/exp_p19_certify.py --table
 """
 
-import os, sys, json, math, argparse
+import os, sys, json, math, argparse, time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 from numpy.polynomial.hermite import hermgauss
@@ -969,7 +969,22 @@ def main():
                 print(f"[P19-cert] {rid}/seed_{seed}: run dir not found: {run_dir}")
                 continue
             print(f"\n[P19-cert] === {rid} seed={seed} ===")
+            _t_cert_start = time.time()
             certify_run(run_dir, args.cert_dir, verbose=True)
+            _t_cert_elapsed = time.time() - _t_cert_start
+            try:
+                import resource as _res
+                _peak_mb = _res.getrusage(_res.RUSAGE_SELF).ru_maxrss / 1024.0
+                _mem_str = f"  peak_mem={_peak_mb:.0f} MB"
+            except Exception:
+                _mem_str = ""
+            print(f"\n  [B2 certify timing] {rid}/seed_{seed}: "
+                  f"wall_clock={_t_cert_elapsed/60:.1f} min ({_t_cert_elapsed:.0f}s){_mem_str}")
+            _timing_path = os.path.join(args.cert_dir, f"p19_{rid}_seed{seed}_certify_timing.json")
+            with open(_timing_path, "w") as _f:
+                json.dump({"run_id": rid, "seed": seed,
+                           "certify_wall_s": float(_t_cert_elapsed),
+                           "certify_wall_min": float(_t_cert_elapsed / 60.0)}, _f, indent=2)
 
         agg = aggregate_seeds(rid, args.cert_dir, n_seeds)
         all_agg[rid] = agg

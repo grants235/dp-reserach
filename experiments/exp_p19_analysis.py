@@ -242,7 +242,7 @@ def table_3(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR, out_dir=OUT
         if HAS_SCIPY:
             rho_val, _pval = spearmanr(y_m, D_m)
             def _spr(x, y): return spearmanr(x, y).statistic
-            bs = bootstrap((y_m, D_m), _spr, n_resamples=1000,
+            bs = bootstrap((y_m, D_m), _spr, n_resamples=2000,
                            paired=True, confidence_level=0.95,
                            random_state=42, method="percentile")
             ci_lo = float(bs.confidence_interval.low)
@@ -1137,11 +1137,18 @@ def _precision_at_k(scores, D_lira, ks=(0.01, 0.03, 0.05)):
     Precision@k matching Pollock et al.'s headline metric.
 
     Vulnerable set V = top-k members by D^LiRA score.
-    Predicted set P = top-k members by predictor scores.
-    Precision@k = |V ∩ P| / k.
+    Predicted set P = top-k members by predictor scores, with tie-aware
+    expected precision under random tie-breaking at the k-th boundary.
+
+    When the k-th largest predictor score is tied across multiple members,
+    using a deterministic argsort would give arbitrary (index-ordered) results.
+    Instead we compute expected precision:
+      - slots filled by strictly-above-threshold predictions count exactly
+      - remaining slots are filled randomly from the tied pool; we use the
+        base rate of vulnerable members in that pool as E[hits from ties]
 
     ks : fractions of the valid population (0.01 = top-1%)
-    Returns dict with keys prec_at_1pct, k_1pct, prec_at_3pct, k_3pct, prec_at_5pct, k_5pct
+    Returns dict with keys prec_at_1pct, k_1pct, tie_fraction_at_k_1pct, ...
     """
     scores = np.asarray(scores, dtype=np.float64)
     D = np.asarray(D_lira, dtype=np.float64)
@@ -1152,11 +1159,38 @@ def _precision_at_k(scores, D_lira, ks=(0.01, 0.03, 0.05)):
     out = {}
     for k_frac in ks:
         k = max(1, int(round(k_frac * n_v)))
-        V = set(np.argsort(dv)[-k:])
-        P = set(np.argsort(sv)[-k:])
         tag = f"{int(round(k_frac * 100))}pct"
-        out[f"prec_at_{tag}"] = float(len(V & P) / k)
-        out[f"k_{tag}"]       = k
+
+        # Vulnerable set V: top-k by D^LiRA (D scores typically continuous; argsort is fine)
+        V = set(np.argsort(dv)[-k:].tolist())
+
+        # Predicted set P: expected precision accounting for ties in sv at the boundary
+        thresh = np.sort(sv)[-k]  # k-th largest value
+        above_thresh_idx = np.where(sv > thresh)[0]
+        tied_idx         = np.where(sv == thresh)[0]
+
+        n_above    = len(above_thresh_idx)
+        n_tied     = len(tied_idx)
+        remaining  = k - n_above  # slots to fill from the tied pool
+
+        if remaining <= 0 or n_tied == 0:
+            # No tie spans the boundary — exact count
+            P = set(above_thresh_idx.tolist())
+            if n_tied > 0:
+                P |= set(tied_idx[:remaining].tolist())
+            prec     = float(len(V & P) / k)
+            tie_frac = 0.0
+        else:
+            # Expected hits: exact above-threshold portion + proportional tie portion
+            exact_hits            = len(V & set(above_thresh_idx.tolist()))
+            vulnerable_in_ties    = len(V & set(tied_idx.tolist()))
+            frac_from_ties        = vulnerable_in_ties * remaining / n_tied
+            prec                  = float((exact_hits + frac_from_ties) / k)
+            tie_frac              = float(remaining / k)
+
+        out[f"prec_at_{tag}"]            = prec
+        out[f"k_{tag}"]                  = k
+        out[f"tie_fraction_at_k_{tag}"]  = tie_frac
     return out
 
 

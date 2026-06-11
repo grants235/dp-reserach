@@ -671,6 +671,10 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
     best_acc     = 0.0
     resume_epoch = 0
 
+    # B2: per-step timing accumulators (wall-clock overhead measurement)
+    _nystrom_times = []   # Nyström block seconds per step
+    _dp_times      = []   # bare DP-update block seconds per step
+
     if resuming:
         ckpt_data = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt_data["model_state"])
@@ -740,6 +744,8 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
                 eig_mm[t, :ne] = top_eigvals_t[:ne]
                 cond_mm[t]     = cond_num_t
 
+            t_nystrom_end = time.time()   # B2: Nyström block ends here
+
             # ===========================================================
             # True Poisson sampling (spec §5.2)
             # ===========================================================
@@ -782,7 +788,12 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
             _set_grads(model, G_noisy)
             optimizer.step()
 
-            t_elapsed   = time.time() - t_start
+            t_elapsed         = time.time() - t_start
+            t_nystrom_elapsed = t_nystrom_end - t_start   # B2: Nyström block
+            t_dp_elapsed      = t_elapsed - t_nystrom_elapsed  # B2: bare DP update
+            _nystrom_times.append(t_nystrom_elapsed)
+            _dp_times.append(t_dp_elapsed)
+
             epoch_loss += losses_t.mean().item()
             n_steps_ep += 1
             step_global += 1
@@ -792,7 +803,8 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
                       f"norm_med={norms_t.median():.4f}  "
                       f"loss_mean={losses_t.mean():.4f}  "
                       f"B_diag_max={float(B_t.diagonal().max()):.4g}  "
-                      f"elapsed={t_elapsed:.2f}s")
+                      f"elapsed={t_elapsed:.2f}s  "
+                      f"(nystrom={t_nystrom_elapsed:.2f}s  dp={t_dp_elapsed:.2f}s)")
 
             del G_sum, xi, G_noisy, norms_t, losses_t, B_t, M_t, Yp_t
             torch.cuda.empty_cache()
@@ -825,6 +837,32 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
             break
 
     T_actual = step_global
+
+    # B2: Print timing summary after training
+    if _nystrom_times:
+        import numpy as _np
+        nyst_arr = _np.array(_nystrom_times)
+        dp_arr   = _np.array(_dp_times)
+        nyst_pct = 100.0 * nyst_arr.mean() / max(nyst_arr.mean() + dp_arr.mean(), 1e-12)
+        print(f"\n  [B2 timing] over {len(nyst_arr)} steps:")
+        print(f"    Nyström block:   mean={nyst_arr.mean():.3f}s  p50={_np.median(nyst_arr):.3f}s  "
+              f"p95={_np.percentile(nyst_arr,95):.3f}s")
+        print(f"    Bare DP update:  mean={dp_arr.mean():.3f}s  p50={_np.median(dp_arr):.3f}s  "
+              f"p95={_np.percentile(dp_arr,95):.3f}s")
+        print(f"    Nyström overhead: {nyst_pct:.1f}% of per-step time "
+              f"({nyst_arr.mean():.3f}s / {nyst_arr.mean()+dp_arr.mean():.3f}s per step)")
+        timing_path = os.path.join(run_dir, "step_timing.json")
+        with open(timing_path, "w") as _f:
+            json.dump({
+                "n_steps": len(nyst_arr),
+                "nystrom_mean_s":   float(nyst_arr.mean()),
+                "nystrom_median_s": float(_np.median(nyst_arr)),
+                "nystrom_p95_s":    float(_np.percentile(nyst_arr, 95)),
+                "dp_update_mean_s": float(dp_arr.mean()),
+                "dp_update_p95_s":  float(_np.percentile(dp_arr, 95)),
+                "nystrom_overhead_pct": float(nyst_pct),
+            }, _f, indent=2)
+        print(f"    [saved] {timing_path}")
 
     # --- Export canonical arrays (sliced to T_actual) ---
     def _mm_save(out_path, arr, slc):
