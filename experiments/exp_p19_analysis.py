@@ -2051,7 +2051,7 @@ def figure_wrn_distribution_s3(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=OUT
         ax_f1.set_xlabel("Tier"); ax_f1.set_title("S1 = CLIP linear head, CIFAR-10-LT(50)")
         ax_f1.legend(fontsize=9); ax_f1.grid(True, axis="y", alpha=0.3)
 
-    fig.suptitle("Figure C (fig:wrn): Masking structure by tier across architectures", fontsize=11)
+    fig.suptitle("Figure C (fig:wrn): S3 = WideResNet-28-2, CIFAR-10-LT(50)", fontsize=11)
     fig.tight_layout()
     path = os.path.join(out_dir, "figure_s3_dir_distribution.png")
     fig.savefig(path, dpi=150)
@@ -2272,16 +2272,42 @@ def accounting_note(runs_dir=RUNS_DIR, cert_dir=CERT_DIR, out_dir=OUT_DIR):
     delta = float(meta.get("delta", 1e-5))
     print(f"  σ={sigma}  q={q}  T={T}  δ={delta:.1e}")
 
-    # ε_norm_fullclip: per-step RDP α/(2σ²), compose T steps, minimize over α
+    # ε_norm_fullclip: subsampled-Gaussian RDP composed T steps, minimized over α.
+    # Must include Poisson subsampling amplification (rate q) — the bare
+    # α/(2σ²) formula without subsampling gives ~145 and is wrong here.
     log_inv_delta = math.log(1.0 / delta)
     best_eps = float("inf"); best_alpha = float("nan")
-    for alpha in ALPHA_GRID:
-        if alpha <= 1.0: continue
-        rdp_total = T * alpha / (2.0 * sigma ** 2)
-        eps_ed    = rdp_total + log_inv_delta / (alpha - 1.0)
-        if eps_ed < best_eps:
-            best_eps = eps_ed; best_alpha = alpha
-    print(f"  ε_norm_fullclip = {best_eps:.4f}  at α* = {best_alpha:.2f}")
+    _rdp_ok = False
+    try:
+        orders = [float(a) for a in ALPHA_GRID if a > 1.0]
+        try:
+            from opacus.accountants.analysis.rdp import compute_rdp as _crdp
+        except ImportError:
+            from opacus.accountants.rdp_accountant import compute_rdp as _crdp
+        rdp_step = _crdp(q=q, noise_multiplier=sigma, steps=1, orders=orders)
+        rdp_composed = T * np.asarray(rdp_step, dtype=np.float64)
+        alpha_arr    = np.asarray(orders, dtype=np.float64)
+        eps_cands    = rdp_composed + log_inv_delta / (alpha_arr - 1.0)
+        best_idx     = int(np.argmin(eps_cands))
+        best_eps     = float(eps_cands[best_idx])
+        best_alpha   = float(alpha_arr[best_idx])
+        _rdp_ok      = True
+        print(f"  ε_norm_fullclip (RDP+subsampling) = {best_eps:.4f}  at α* = {best_alpha:.2f}")
+    except Exception as e:
+        print(f"  [warn] Opacus RDP compute failed ({e}); trying table2 fallback.")
+
+    if not _rdp_ok:
+        # Fallback: read median ε^norm for F1 seed 0 from table2 (same value by construction).
+        t2_path = os.path.join(out_dir, "table2_certified_spread.json")
+        if os.path.exists(t2_path):
+            with open(t2_path) as f:
+                _t2 = json.load(f)
+            _f1s0 = next((r for r in _t2 if r["run_id"] == "F1" and r.get("seed") == 0), None)
+            if _f1s0:
+                best_eps = float(_f1s0["norm_med"])
+                print(f"  ε_norm_fullclip (fallback table2 F1 seed0 norm_med) = {best_eps:.4f}")
+        if best_eps == float("inf"):
+            print("  [warn] ε_norm_fullclip could not be determined.")
 
     # ε_global_prv: try metadata / cert summary first, else PRV accountant
     eps_prv = None
@@ -2361,19 +2387,25 @@ def emit_paper_numbers(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
         if f1r: numbers["sec6_p2_frac_clipped_S1"] = float(f1r[0]["frac_within_1pct_C"])
         if f5r: numbers["sec6_p2_frac_clipped_S3"] = float(np.mean([r["frac_within_1pct_C"] for r in f5r]))
         if f2r: numbers["sec6_p2_S2_norm_CV"]      = float(f2r[0]["cv"])
-        if f5r: numbers["fig_wrn_S3_norm_reference"] = float(np.mean([r["median_norm"] for r in f5r]))
+        # median_norm in table1 is the median clipped norm (~1.0 = C), not ε^norm.
+        # fig_wrn_S3_norm_reference is set from table2 norm_med below.
         prov.append("table1_norm_flatness.json")
 
     # Table 2
     t2 = _load_or_run(os.path.join(out_dir, "table2_certified_spread.json"),
                       lambda: table_2(cert_dir, runs_dir, out_dir))
     if t2:
-        f2r = [r for r in t2 if r["run_id"] == "F2"]
+        f2r    = [r for r in t2 if r["run_id"] == "F2"]
+        f5r_t2 = [r for r in t2 if r["run_id"] == "F5"]
         if f2r:
             numbers["sec6_p2_S2_dir_CV"]         = float(f2r[0]["dir_cv"])
             numbers["fig_degeneracy_norm_value"]  = float(f2r[0]["norm_med"])
             numbers["fig_degeneracy_dir_p5"]      = float(f2r[0]["dir_p5"])
             numbers["fig_degeneracy_dir_p95"]     = float(f2r[0]["dir_p95"])
+        if f5r_t2:
+            # norm_med in table2 = median(ε^norm) for F5 — this is the ~9.50 reference.
+            numbers["fig_wrn_S3_norm_reference"] = float(
+                np.mean([r["norm_med"] for r in f5r_t2]))
         prov.append("table2_certified_spread.json")
 
     # Table 3
@@ -2394,10 +2426,14 @@ def emit_paper_numbers(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
             if "ε^dir cert" in lbl and r.get("tier") == "tail":
                 numbers.setdefault("appendix_dir_CI_tail_lo", float(ci_lo))
                 numbers.setdefault("appendix_dir_CI_tail_hi", float(ci_hi))
+            # Overall loss: table3 labels "final training loss" (no within_tier flag)
             if "final training loss" in lbl and not r.get("within_tier") and "AGGREGATE" not in lbl:
                 numbers.setdefault("appendix_loss_CI_overall_lo", float(ci_lo))
                 numbers.setdefault("appendix_loss_CI_overall_hi", float(ci_hi))
-            if "final training loss" in lbl and r.get("tier") == "tail":
+            # Within-tier tail loss: labels are "[s0]   loss [tail]" — no "final training loss"
+            _is_loss_row = ("final training loss" in lbl or
+                            ("loss" in lbl and "[tail]" in lbl))
+            if _is_loss_row and r.get("tier") == "tail":
                 numbers.setdefault("appendix_loss_CI_tail_lo", float(ci_lo))
                 numbers.setdefault("appendix_loss_CI_tail_hi", float(ci_hi))
         prov.append("table3_lira_correlation.json")
