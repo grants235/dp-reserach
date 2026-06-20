@@ -1842,6 +1842,896 @@ def rank_stability(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=OUT_DIR,
     return rows
 
 
+# ===========================================================================
+# New paper figures (Section 4 rewrite)
+# ===========================================================================
+
+def figure_degeneracy_s2(cert_dir=CERT_DIR, out_dir=OUT_DIR):
+    """Figure A (fig:degeneracy): S2=F2 seed 0. Strip rows for ε^norm vs ε^dir."""
+    plt = _plt()
+    os.makedirs(out_dir, exist_ok=True)
+    if plt is None:
+        return
+
+    cert = _load_cert("F2", 0, cert_dir)
+    if "epsilon_cert_norm" not in cert or "epsilon_cert_dir_rank_100" not in cert:
+        print("  [Fig A] F2 seed 0 cert arrays missing — skipping.")
+        return
+
+    en = cert["epsilon_cert_norm"]
+    ed = cert["epsilon_cert_dir_rank_100"]
+
+    med_norm = float(np.median(en))
+    cv_dir   = float(ed.std() / max(ed.mean(), 1e-15))
+    p5_dir   = float(np.percentile(ed, 5))
+    p95_dir  = float(np.percentile(ed, 95))
+    med_mask = float(np.median(1.0 - ed / np.maximum(en, 1e-15)))
+
+    print(f"\n  [Fig A] F2 seed 0:")
+    print(f"    median(ε^norm)            = {med_norm:.4f}")
+    print(f"    CV(ε^dir)                 = {cv_dir:.4f}")
+    print(f"    p5(ε^dir)                 = {p5_dir:.4f}")
+    print(f"    p95(ε^dir)                = {p95_dir:.4f}")
+    print(f"    median(1 − ε^dir/ε^norm)  = {med_mask:.4f}")
+
+    rng = np.random.default_rng(42)
+    jitter = 0.04
+
+    fig, ax = plt.subplots(figsize=(8, 3.5))
+    y_norm = np.ones(len(en))  + rng.uniform(-jitter, jitter, len(en))
+    y_dir  = np.zeros(len(ed)) + rng.uniform(-jitter, jitter, len(ed))
+    ax.scatter(en, y_norm, s=3, alpha=0.25, color="steelblue", rasterized=True, label="ε^norm")
+    ax.scatter(ed, y_dir,  s=3, alpha=0.25, color="firebrick",  rasterized=True, label="ε^dir")
+    ax.axvline(med_norm, color="steelblue", linestyle="--", linewidth=1.2, alpha=0.8)
+    ax.annotate(f"median ε^norm = {med_norm:.2f}",
+                xy=(med_norm, 1.28), ha="center", fontsize=8, color="steelblue")
+    ax.set_yticks([0, 1])
+    ax.set_yticklabels(["ε^dir", "ε^norm"])
+    ax.set_ylim(-0.35, 1.55)
+    ax.set_xlabel("Certified ε value")
+    ax.set_title("Figure A (fig:degeneracy): S2 — CLIP linear head, balanced CIFAR-10")
+    ax.grid(True, axis="x", alpha=0.3)
+    fig.tight_layout()
+    path = os.path.join(out_dir, "figure_s2_degeneracy.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  [Fig A] saved → {path}")
+
+
+def figure_withintier_s1(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
+                          out_dir=OUT_DIR, paper_seed=0):
+    """Figure B (fig:withintier): S1=F1×LF1, per-tier scatter ε^dir vs D^LiRA."""
+    plt = _plt()
+    os.makedirs(out_dir, exist_ok=True)
+    if plt is None:
+        return
+
+    s = paper_seed
+    lf1  = _load_lira("LF1", lira_dir, seed=s)
+    cert = _load_cert("F1", s, cert_dir)
+    run  = _load_run("F1", s, runs_dir)
+
+    if not lf1 or "D_lira_members" not in lf1:
+        print(f"  [Fig B] LiRA seed={s} not found — skipping.")
+        return
+    if "epsilon_cert_dir_rank_100" not in cert or "epsilon_cert_norm" not in cert:
+        print(f"  [Fig B] F1 seed={s} cert arrays missing — skipping.")
+        return
+
+    ml_path = os.path.join(runs_dir, "F1", f"seed_{s}", "lira_member_local_idx.npy")
+    if not os.path.exists(ml_path):
+        print(f"  [Fig B] lira_member_local_idx.npy missing for seed={s} — skipping.")
+        return
+
+    member_local = np.load(ml_path)
+    tier_all = run.get("tier_labels")
+    if tier_all is None:
+        print(f"  [Fig B] tier_labels.npy missing — skipping.")
+        return
+
+    D_lira = lf1["D_lira_members"]
+    n_m    = min(len(D_lira), len(member_local))
+    D_m    = D_lira[:n_m]
+    idx    = member_local[:n_m]
+    tier_m = tier_all[idx]
+    eps_dir_m  = cert["epsilon_cert_dir_rank_100"][idx]
+    eps_norm_m = cert["epsilon_cert_norm"][idx]
+
+    tier_names  = {0: "head", 1: "mid", 2: "tail"}
+    tier_colors = {0: "steelblue", 1: "orange", 2: "firebrick"}
+
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4.5), sharey=True)
+    for col, (t_id, t_name) in enumerate(tier_names.items()):
+        ax = axes[col]
+        mask = (tier_m == t_id)
+        if mask.sum() == 0:
+            ax.set_title(f"{t_name} (n=0)"); continue
+        ax.scatter(D_m[mask], eps_dir_m[mask], s=8, alpha=0.45,
+                   color=tier_colors[t_id], rasterized=True)
+        en_tier = eps_norm_m[mask]
+        if (en_tier.max() - en_tier.min()) < 0.01:
+            ax.axhline(float(en_tier.mean()), color="gray", linestyle="--",
+                       linewidth=1.2, alpha=0.8, label=f"ε^norm={en_tier.mean():.2f}")
+        else:
+            p5, p95 = float(np.percentile(en_tier, 5)), float(np.percentile(en_tier, 95))
+            ax.axhspan(p5, p95, color="gray", alpha=0.15, label=f"ε^norm p5–p95")
+        ax.set_title(f"{t_name}  (n={mask.sum()})")
+        ax.set_xlabel("D$_i^{\\mathrm{LiRA}}$")
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+    axes[0].set_ylabel("ε^dir cert (r=100)")
+    fig.suptitle("Figure B (fig:withintier): S1 — Within-tier ε^dir vs LiRA score", fontsize=11)
+    fig.tight_layout()
+    path = os.path.join(out_dir, "figure_withintier_scatter.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  [Fig B] saved → {path}")
+
+
+def figure_wrn_distribution_s3(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=OUT_DIR,
+                                 also_f1=False):
+    """Figure C (fig:wrn): S3=F5, pooled seeds 0-2, per-tier ε^dir violin."""
+    plt = _plt()
+    os.makedirs(out_dir, exist_ok=True)
+    if plt is None:
+        return
+
+    tier_names  = {0: "head", 1: "mid", 2: "tail"}
+    tier_colors = {0: "steelblue", 1: "orange", 2: "firebrick"}
+    norm_ref    = 9.50
+
+    ed_by_tier = {0: [], 1: [], 2: []}
+    en_by_tier = {0: [], 1: [], 2: []}
+    found_any = False
+    for seed in [0, 1, 2]:
+        cert = _load_cert("F5", seed, cert_dir)
+        run  = _load_run("F5", seed, runs_dir)
+        if "epsilon_cert_norm" not in cert or "epsilon_cert_dir_rank_100" not in cert:
+            print(f"  [Fig C] F5 seed={seed} cert missing — skipping seed."); continue
+        if "tier_labels" not in run:
+            print(f"  [Fig C] F5 seed={seed} tier_labels missing — skipping seed."); continue
+        found_any = True
+        for t_id in [0, 1, 2]:
+            mask = (run["tier_labels"] == t_id)
+            ed_by_tier[t_id].append(cert["epsilon_cert_dir_rank_100"][mask])
+            en_by_tier[t_id].append(cert["epsilon_cert_norm"][mask])
+
+    if not found_any:
+        print("  [Fig C] No F5 data found — skipping."); return
+
+    ed_pooled = {t: np.concatenate(v) for t, v in ed_by_tier.items() if v}
+    en_pooled = {t: np.concatenate(v) for t, v in en_by_tier.items() if v}
+
+    print(f"\n  [Fig C] F5 per-tier summary (pooled seeds 0-2):")
+    for t_id, t_name in tier_names.items():
+        if t_id not in ed_pooled or len(ed_pooled[t_id]) == 0: continue
+        mean_dir  = float(ed_pooled[t_id].mean())
+        mean_norm = float(en_pooled.get(t_id, np.array([norm_ref])).mean())
+        masking   = 100.0 * (1.0 - mean_dir / max(mean_norm, 1e-15))
+        print(f"    {t_name:6s}: mean(ε^dir)={mean_dir:.4f}  "
+              f"mean(ε^norm)={mean_norm:.4f}  masking={masking:.1f}%")
+
+    n_panels = 2 if also_f1 else 1
+    fig, axes_all = plt.subplots(1, n_panels, figsize=(7 * n_panels, 4.5), squeeze=False)
+    ax_wrn = axes_all[0, 0]
+
+    data_wrn = [ed_pooled.get(t, np.array([0.0])) for t in [0, 1, 2]]
+    parts = ax_wrn.violinplot(data_wrn, positions=[0, 1, 2],
+                               showmedians=True, showextrema=False)
+    for pc, t_id in zip(parts["bodies"], [0, 1, 2]):
+        pc.set_facecolor(tier_colors[t_id]); pc.set_alpha(0.6)
+    ax_wrn.axhline(norm_ref, color="gray", linestyle="--", linewidth=1.2,
+                   alpha=0.8, label=f"ε^norm = {norm_ref:.2f}")
+    ax_wrn.set_xticks([0, 1, 2])
+    ax_wrn.set_xticklabels([tier_names[t] for t in [0, 1, 2]])
+    ax_wrn.set_xlabel("Tier"); ax_wrn.set_ylabel("ε^dir cert (r=100)")
+    ax_wrn.set_title("S3 = WideResNet-28-2, CIFAR-10-LT(50)")
+    ax_wrn.legend(fontsize=9); ax_wrn.grid(True, axis="y", alpha=0.3)
+
+    if also_f1:
+        ax_f1 = axes_all[0, 1]
+        ed_f1 = {0: [], 1: [], 2: []}
+        for seed in [0, 1, 2]:
+            cert = _load_cert("F1", seed, cert_dir)
+            run  = _load_run("F1", seed, runs_dir)
+            if "epsilon_cert_dir_rank_100" not in cert or "tier_labels" not in run: continue
+            for t_id in [0, 1, 2]:
+                mask = (run["tier_labels"] == t_id)
+                ed_f1[t_id].append(cert["epsilon_cert_dir_rank_100"][mask])
+        ed_f1p = {t: np.concatenate(v) for t, v in ed_f1.items() if v}
+        data_f1 = [ed_f1p.get(t, np.array([0.0])) for t in [0, 1, 2]]
+        parts2 = ax_f1.violinplot(data_f1, positions=[0, 1, 2],
+                                   showmedians=True, showextrema=False)
+        for pc, t_id in zip(parts2["bodies"], [0, 1, 2]):
+            pc.set_facecolor(tier_colors[t_id]); pc.set_alpha(0.6)
+        ax_f1.axhline(norm_ref, color="gray", linestyle="--", linewidth=1.2,
+                      alpha=0.8, label=f"ε^norm ≈ {norm_ref:.2f}")
+        ax_f1.set_xticks([0, 1, 2])
+        ax_f1.set_xticklabels([tier_names[t] for t in [0, 1, 2]])
+        ax_f1.set_xlabel("Tier"); ax_f1.set_title("S1 = CLIP linear head, CIFAR-10-LT(50)")
+        ax_f1.legend(fontsize=9); ax_f1.grid(True, axis="y", alpha=0.3)
+
+    fig.suptitle("Figure C (fig:wrn): Masking structure by tier across architectures", fontsize=11)
+    fig.tight_layout()
+    path = os.path.join(out_dir, "figure_s3_dir_distribution.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  [Fig C] saved → {path}")
+
+
+# ===========================================================================
+# Consolidated correlation table for paper (tab:lira)
+# ===========================================================================
+
+def table_lira_paper(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
+                     out_dir=OUT_DIR, seeds=(0, 1, 2)):
+    """
+    Four rows (ε^dir, ε^norm, loss, gen-leverage) × four scopes (overall/head/mid/tail).
+    Mean Spearman across seeds 0,1,2; ε^norm constant in mid/tail → 'undef.'.
+    Outputs table_lira_paper.json and table_lira_paper.tex.
+    """
+    print(f"\n{'='*72}")
+    print(f"  table_lira_paper: consolidated correlation table (tab:lira)")
+    print(f"{'='*72}")
+
+    tier_names_map = {0: "head", 1: "mid", 2: "tail"}
+    scopes         = ["overall", "head", "mid", "tail"]
+    row_keys       = ["eps_dir", "eps_norm", "loss", "gen_leverage"]
+    accum          = {rk: {sc: [] for sc in scopes} for rk in row_keys}
+
+    for seed in seeds:
+        lf1  = _load_lira("LF1", lira_dir, seed=seed)
+        cert = _load_cert("F1",  seed, cert_dir)
+        run  = _load_run("F1",   seed, runs_dir)
+
+        if not lf1 or "D_lira_members" not in lf1:
+            print(f"  [missing] D_lira_members LF1 seed={seed}"); continue
+        if "epsilon_cert_dir_rank_100" not in cert or "epsilon_cert_norm" not in cert:
+            print(f"  [missing] cert arrays F1 seed={seed}"); continue
+        ml_path = os.path.join(runs_dir, "F1", f"seed_{seed}", "lira_member_local_idx.npy")
+        if not os.path.exists(ml_path):
+            print(f"  [missing] lira_member_local_idx.npy seed={seed}"); continue
+
+        member_local = np.load(ml_path)
+        D_lira = lf1["D_lira_members"]
+        n_m    = min(len(D_lira), len(member_local))
+        D_use  = D_lira[:n_m]
+        idx    = member_local[:n_m]
+        tier_all = run.get("tier_labels")
+        tier_m   = tier_all[idx] if tier_all is not None else None
+
+        eps_dir_m  = cert["epsilon_cert_dir_rank_100"][idx]
+        eps_norm_m = cert["epsilon_cert_norm"][idx]
+        losses_all = run.get("losses")
+        loss_m     = losses_all[idx, -1] if losses_all is not None else None
+
+        leverage = None
+        yp_path = os.path.join(runs_dir, "F1", f"seed_{seed}", "Y_projections.npy")
+        b_path  = os.path.join(runs_dir, "F1", f"seed_{seed}", "B_matrices.npy")
+        m_path  = os.path.join(runs_dir, "F1", f"seed_{seed}", "YTY_matrices.npy")
+        if os.path.exists(yp_path) and os.path.exists(b_path) and os.path.exists(m_path):
+            Y_proj  = np.load(yp_path)
+            B_mats  = np.load(b_path)
+            M_mats  = np.load(m_path)
+            Y_final = Y_proj[idx, -1, :].astype(np.float64)
+            leverage = _compute_gen_leverage_batch(
+                Y_final, B_mats[-1].astype(np.float64),
+                M_mats[-1].astype(np.float64), mode="pinv")
+        else:
+            print(f"  [missing] Nystrom matrices F1 seed={seed} — gen-leverage skipped.")
+
+        def _rho(arr, D, mask=None):
+            if arr is None: return float("nan")
+            a, d = (np.asarray(arr, np.float64),
+                    np.asarray(D,   np.float64))
+            if mask is not None: a, d = a[mask], d[mask]
+            rho, _, _ = _spearman_ci(a, d, n_boot=0)
+            return rho
+
+        for scope in scopes:
+            if scope == "overall":
+                mask = None
+                D_sc = D_use
+            else:
+                if tier_m is None: continue
+                t_id = {v: k for k, v in tier_names_map.items()}[scope]
+                mask = (tier_m == t_id)
+                if mask.sum() < 5: continue
+                D_sc = D_use[mask]
+
+            def _apply(arr):
+                if arr is None: return float("nan")
+                a = np.asarray(arr, np.float64)
+                return _rho(a if mask is None else a[mask], D_sc)
+
+            # ε^norm: undef. if constant within mid/tail
+            en_sc = eps_norm_m if mask is None else eps_norm_m[mask]
+            if scope in ("mid", "tail") and (en_sc.max() - en_sc.min()) < 0.01:
+                accum["eps_norm"][scope].append("undef.")
+            else:
+                accum["eps_norm"][scope].append(_apply(eps_norm_m))
+
+            accum["eps_dir"][scope].append(_apply(eps_dir_m))
+            accum["loss"][scope].append(_apply(loss_m))
+            accum["gen_leverage"][scope].append(
+                _rho(leverage if mask is None else leverage[mask], D_sc)
+                if leverage is not None else float("nan"))
+
+    def _mean_or_undef(vals):
+        numeric = [v for v in vals if isinstance(v, float) and np.isfinite(v)]
+        has_undef = any(v == "undef." for v in vals)
+        if has_undef and not numeric: return "undef."
+        if not numeric: return float("nan")
+        return float(np.mean(numeric))
+
+    cells = {(rk, sc): _mean_or_undef(accum[rk][sc])
+             for rk in row_keys for sc in scopes}
+
+    # Print table
+    row_labels = {"eps_dir": "ε^dir", "eps_norm": "ε^norm",
+                  "loss": "loss", "gen_leverage": "gen-leverage"}
+    print(f"\n  {'Row':14s} | {'Overall':8s} | {'Head':8s} | {'Mid':8s} | {'Tail':8s}")
+    print(f"  {'-'*60}")
+    for rk in row_keys:
+        def _f(v):
+            if v == "undef.": return "undef.  "
+            if isinstance(v, float) and not np.isfinite(v): return "nan     "
+            return f"{float(v):8.3f}"
+        print(f"  {row_labels[rk]:14s} | " +
+              " | ".join(_f(cells[(rk, sc)]) for sc in scopes))
+
+    # Footnote scalars from existing outputs
+    ft_tier = float("nan")
+    ft_ltiqr = float("nan")
+    t3_path = os.path.join(out_dir, "table3_lira_correlation.json")
+    if os.path.exists(t3_path):
+        with open(t3_path) as f:
+            t3_rows = json.load(f)
+        for r in t3_rows:
+            if isinstance(r.get("label"), str) and "tier label" in r["label"].lower():
+                v = r.get("rho")
+                if v is not None and np.isfinite(float(v)):
+                    ft_tier = float(v); break
+    bl_path = os.path.join(out_dir, "table3_baselines.json")
+    if os.path.exists(bl_path):
+        with open(bl_path) as f:
+            bl_data = json.load(f)
+        bl_rows = bl_data.get("rows", bl_data) if isinstance(bl_data, dict) else bl_data
+        rhos = [float(r["rho_mean"]) for r in bl_rows
+                if isinstance(r.get("label"), str)
+                and "AGGREGATE" in r["label"] and "LT-IQR" in r["label"]
+                and r.get("scope") == "overall" and "rho_mean" in r]
+        if rhos: ft_ltiqr = float(np.mean(rhos))
+
+    print(f"\n  Footnote: tier-label ρ={ft_tier:.3f}  LT-IQR ρ={ft_ltiqr:.3f}")
+
+    # Serialise
+    cells_json = {f"{rk}|{sc}":
+                  (v if isinstance(v, str) else
+                   (None if isinstance(v, float) and not np.isfinite(v) else v))
+                  for (rk, sc), v in cells.items()}
+    out_json = {
+        "cells": cells_json,
+        "footnote_tier_label_spearman":
+            (float(ft_tier)  if np.isfinite(ft_tier)  else None),
+        "footnote_lt_iqr_spearman":
+            (float(ft_ltiqr) if np.isfinite(ft_ltiqr) else None),
+        "provenance": ("F1×LF1 seeds 0,1,2 — mean Spearman; "
+                       "no new data generated"),
+    }
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "table_lira_paper.json"), "w") as f:
+        json.dump(out_json, f, indent=2)
+    print(f"  [saved] {out_dir}/table_lira_paper.json")
+
+    # LaTeX
+    def _tex(v):
+        if v == "undef.": return r"\text{undef.}"
+        if v is None or (isinstance(v, float) and not np.isfinite(v)): return "--"
+        return f"{float(v):.3f}"
+
+    row_tex = {
+        "eps_dir":      r"$\varepsilon^{\mathrm{dir}}$",
+        "eps_norm":     r"$\varepsilon^{\mathrm{norm}}$",
+        "loss":         r"loss",
+        "gen_leverage": r"gen-leverage",
+    }
+    lines = [r"\begin{tabular}{lrrrr}", r"\toprule",
+             r"Predictor & Overall & Head & Mid & Tail \\", r"\midrule"]
+    for rk in row_keys:
+        vals = " & ".join(_tex(cells[(rk, sc)]) for sc in scopes)
+        lines.append(f"{row_tex[rk]} & {vals} \\\\")
+    lines += [r"\bottomrule", r"\end{tabular}",
+              f"% Footnote: tier-label ρ={ft_tier:.3f}; LT-IQR ρ={ft_ltiqr:.3f}"]
+    tex_path = os.path.join(out_dir, "table_lira_paper.tex")
+    with open(tex_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"  [saved] {tex_path}")
+    return cells, ft_tier, ft_ltiqr
+
+
+# ===========================================================================
+# Accounting note (appendix calibration)
+# ===========================================================================
+
+def accounting_note(runs_dir=RUNS_DIR, cert_dir=CERT_DIR, out_dir=OUT_DIR):
+    """Deterministic RDP/PRV accounting on saved metadata — no retraining."""
+    print(f"\n{'='*72}")
+    print(f"  accounting_note: F1 seed 0")
+    print(f"{'='*72}")
+
+    meta_path = os.path.join(runs_dir, "F1", "seed_0", "metadata.json")
+    if not os.path.exists(meta_path):
+        print(f"  [missing] {meta_path}"); return {}
+    with open(meta_path) as f:
+        meta = json.load(f)
+
+    sigma = float(meta.get("sigma", meta.get("noise_multiplier", 1.484)))
+    q     = float(meta.get("q",     meta.get("sampling_rate",   0.111)))
+    T     = int(  meta.get("T_train", meta.get("T_steps", meta.get("num_steps", 360))))
+    delta = float(meta.get("delta", 1e-5))
+    print(f"  σ={sigma}  q={q}  T={T}  δ={delta:.1e}")
+
+    # ε_norm_fullclip: per-step RDP α/(2σ²), compose T steps, minimize over α
+    log_inv_delta = math.log(1.0 / delta)
+    best_eps = float("inf"); best_alpha = float("nan")
+    for alpha in ALPHA_GRID:
+        if alpha <= 1.0: continue
+        rdp_total = T * alpha / (2.0 * sigma ** 2)
+        eps_ed    = rdp_total + log_inv_delta / (alpha - 1.0)
+        if eps_ed < best_eps:
+            best_eps = eps_ed; best_alpha = alpha
+    print(f"  ε_norm_fullclip = {best_eps:.4f}  at α* = {best_alpha:.2f}")
+
+    # ε_global_prv: try metadata / cert summary first, else PRV accountant
+    eps_prv = None
+    for src_dict in [meta]:
+        for key in ["global_eps_prv", "eps_prv", "epsilon_prv",
+                    "global_epsilon_prv", "epsilon_global", "eps_global"]:
+            if key in src_dict:
+                eps_prv = float(src_dict[key])
+                print(f"  ε_global_prv (metadata) = {eps_prv:.4f}"); break
+        if eps_prv is not None: break
+
+    cert_summ = os.path.join(cert_dir, "p19_F1_seed0_summary.json")
+    if eps_prv is None and os.path.exists(cert_summ):
+        with open(cert_summ) as f:
+            summ = json.load(f)
+        for key in ["global_eps_prv", "eps_prv", "epsilon_prv", "global_epsilon_prv"]:
+            if key in summ:
+                eps_prv = float(summ[key])
+                print(f"  ε_global_prv (cert summary) = {eps_prv:.4f}"); break
+
+    if eps_prv is None:
+        try:
+            from opacus.accountants import PRVAccountant
+            acc = PRVAccountant()
+            acc.history = [(sigma, q, T)]
+            eps_prv = float(acc.get_epsilon(delta=delta))
+            print(f"  ε_global_prv (PRV recompute) = {eps_prv:.4f}")
+        except Exception as e:
+            print(f"  [warn] PRV recompute failed: {e}")
+            eps_prv = float("nan")
+
+    result = {
+        "sigma": sigma, "q": q, "T": T, "delta": delta,
+        "eps_norm_fullclip": float(best_eps),
+        "best_alpha": float(best_alpha),
+        "eps_global_prv": eps_prv,
+        "provenance": "F1 seed_0 metadata.json — deterministic post-processing only",
+    }
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "accounting_note.json")
+    with open(out_path, "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"  [saved] {out_path}")
+    return result
+
+
+# ===========================================================================
+# Numbers manifest
+# ===========================================================================
+
+def emit_paper_numbers(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
+                       out_dir=OUT_DIR):
+    """Assemble paper_numbers.json from all saved JSON outputs."""
+    print(f"\n{'='*72}")
+    print(f"  emit_paper_numbers")
+    print(f"{'='*72}")
+
+    def _load_or_run(path, fn):
+        if not os.path.exists(path):
+            print(f"  [auto-run] {os.path.basename(path)} absent — running prerequisite.")
+            fn()
+        if not os.path.exists(path):
+            print(f"  [missing] {path}"); return None
+        with open(path) as f:
+            return json.load(f)
+
+    numbers = {}
+    prov    = []
+
+    # Table 1
+    t1 = _load_or_run(os.path.join(out_dir, "table1_norm_flatness.json"),
+                      lambda: table_1(runs_dir, out_dir))
+    if t1:
+        f1r = [r for r in t1 if r["run_id"] == "F1"]
+        f2r = [r for r in t1 if r["run_id"] == "F2"]
+        f5r = [r for r in t1 if r["run_id"] == "F5"]
+        if f1r: numbers["sec6_p2_frac_clipped_S1"] = float(f1r[0]["frac_within_1pct_C"])
+        if f5r: numbers["sec6_p2_frac_clipped_S3"] = float(np.mean([r["frac_within_1pct_C"] for r in f5r]))
+        if f2r: numbers["sec6_p2_S2_norm_CV"]      = float(f2r[0]["cv"])
+        if f5r: numbers["fig_wrn_S3_norm_reference"] = float(np.mean([r["median_norm"] for r in f5r]))
+        prov.append("table1_norm_flatness.json")
+
+    # Table 2
+    t2 = _load_or_run(os.path.join(out_dir, "table2_certified_spread.json"),
+                      lambda: table_2(cert_dir, runs_dir, out_dir))
+    if t2:
+        f2r = [r for r in t2 if r["run_id"] == "F2"]
+        if f2r:
+            numbers["sec6_p2_S2_dir_CV"]         = float(f2r[0]["dir_cv"])
+            numbers["fig_degeneracy_norm_value"]  = float(f2r[0]["norm_med"])
+            numbers["fig_degeneracy_dir_p5"]      = float(f2r[0]["dir_p5"])
+            numbers["fig_degeneracy_dir_p95"]     = float(f2r[0]["dir_p95"])
+        prov.append("table2_certified_spread.json")
+
+    # Table 3
+    t3 = _load_or_run(os.path.join(out_dir, "table3_lira_correlation.json"),
+                      lambda: table_3(cert_dir, lira_dir, runs_dir, out_dir))
+    if t3:
+        agg_dir = next((r for r in t3 if isinstance(r.get("label"), str)
+                        and "AGGREGATE ε^dir" in r["label"]), None)
+        if agg_dir:
+            numbers["appendix_overall_seed_std"] = float(agg_dir.get("rho_std", float("nan")))
+        for r in t3:
+            lbl = str(r.get("label", ""))
+            ci_lo = r.get("ci_lo"); ci_hi = r.get("ci_hi")
+            if ci_lo is None or not np.isfinite(float(ci_lo)): continue
+            if "ε^dir cert" in lbl and not r.get("within_tier") and "AGGREGATE" not in lbl:
+                numbers.setdefault("appendix_dir_CI_overall_lo", float(ci_lo))
+                numbers.setdefault("appendix_dir_CI_overall_hi", float(ci_hi))
+            if "ε^dir cert" in lbl and r.get("tier") == "tail":
+                numbers.setdefault("appendix_dir_CI_tail_lo", float(ci_lo))
+                numbers.setdefault("appendix_dir_CI_tail_hi", float(ci_hi))
+            if "final training loss" in lbl and not r.get("within_tier") and "AGGREGATE" not in lbl:
+                numbers.setdefault("appendix_loss_CI_overall_lo", float(ci_lo))
+                numbers.setdefault("appendix_loss_CI_overall_hi", float(ci_hi))
+            if "final training loss" in lbl and r.get("tier") == "tail":
+                numbers.setdefault("appendix_loss_CI_tail_lo", float(ci_lo))
+                numbers.setdefault("appendix_loss_CI_tail_hi", float(ci_hi))
+        prov.append("table3_lira_correlation.json")
+
+    # Table 4
+    t4 = _load_or_run(os.path.join(out_dir, "table4_discretization_overhead.json"),
+                      lambda: table_4(cert_dir, out_dir))
+    if t4:
+        for r in t4:
+            rid = r["run_id"]
+            if rid == "F1":
+                numbers["appendix_filter_S1_med_pct"]  = float(r["dir_overhead_pct_med"])
+                numbers["appendix_filter_S1_p95_pct"]  = float(r["dir_overhead_pct_p95"])
+                numbers["appendix_filter_S1_max"]      = float(r["dir_overhead_max"])
+            if rid == "F5":
+                numbers["appendix_filter_S3_med_pct"]  = float(r["dir_overhead_pct_med"])
+                numbers["appendix_filter_S3_p95_pct"]  = float(r["dir_overhead_pct_p95"])
+        prov.append("table4_discretization_overhead.json")
+
+    # Table 5
+    t5 = _load_or_run(os.path.join(out_dir, "table5_wrn_robustness.json"),
+                      lambda: table_5(cert_dir, lira_dir, runs_dir, out_dir))
+    if t5:
+        tier_mask_acc = {"head": [], "mid": [], "tail": []}
+        for row in t5:
+            for t_name, td in row.get("tiers", {}).items():
+                if t_name in tier_mask_acc:
+                    tier_mask_acc[t_name].append(float(td["masking_pct"]))
+        all_pct = []
+        for t_name, vals in tier_mask_acc.items():
+            if vals:
+                m = float(np.mean(vals))
+                numbers[f"sec6_p4_S3_{t_name}_masking_pct"] = m
+                all_pct.extend(vals)
+        if all_pct:
+            numbers["sec6_p4_S3_masking_range_lo"] = float(min(all_pct))
+            numbers["sec6_p4_S3_masking_range_hi"] = float(max(all_pct))
+        prov.append("table5_wrn_robustness.json")
+
+    # Table 6
+    t6 = _load_or_run(os.path.join(out_dir, "table6_rank_ablation.json"),
+                      lambda: table_6(cert_dir, out_dir))
+    if t6:
+        f5_rank_acc = {}
+        for r in t6:
+            rk = r["rank"]
+            if r["run_id"] == "F1":
+                numbers[f"appendix_minorant_S1_r{rk}_med"] = float(r["eps_dir_med"])
+            if r["run_id"] == "F5":
+                f5_rank_acc.setdefault(rk, []).append(float(r["eps_dir_med"]))
+            if rk == 200:
+                numbers[f"appendix_minorant_{r['run_id']}_r200_delta"] = \
+                    float(r.get("delta_vs_prev_rank", float("nan")))
+        for rk, vals in f5_rank_acc.items():
+            if vals:
+                numbers[f"appendix_minorant_S3_r{rk}_med"] = float(np.mean(vals))
+        prov.append("table6_rank_ablation.json")
+
+    # Table baselines
+    tb_raw = _load_or_run(os.path.join(out_dir, "table3_baselines.json"),
+                          lambda: table_baselines(cert_dir, lira_dir, runs_dir, out_dir))
+    if tb_raw:
+        bl_rows = tb_raw.get("rows", tb_raw) if isinstance(tb_raw, dict) else tb_raw
+        prec_acc: dict = {}
+        for r in bl_rows:
+            pred  = r.get("predictor", "")
+            scope = r.get("scope", "")
+            for k_tag in ["prec_at_1pct", "prec_at_3pct", "prec_at_5pct"]:
+                val = (r.get("precision_at_k") or {}).get(k_tag)
+                if val is not None and np.isfinite(float(val)):
+                    prec_acc.setdefault((pred, scope, k_tag), []).append(float(val))
+        for pred, nlabel in [("eps_dir","dir"), ("eps_norm","norm"),
+                              ("loss_final","loss"), ("lt_iqr","ltiqr")]:
+            for k_tag, k_lbl in [("prec_at_1pct","1"), ("prec_at_3pct","3"), ("prec_at_5pct","5")]:
+                key = (pred, "overall", k_tag)
+                if key in prec_acc:
+                    numbers[f"appendix_prec_{nlabel}_at_{k_lbl}pct"] = \
+                        float(np.mean(prec_acc[key]))
+        # Expose eps_dir precision also under sec6 key
+        for k_tag, k_lbl in [("prec_at_1pct","1"), ("prec_at_3pct","3"), ("prec_at_5pct","5")]:
+            src = f"appendix_prec_dir_at_{k_lbl}pct"
+            if src in numbers:
+                numbers[f"sec6_p3_precision_dir_at_{k_lbl}pct"] = numbers[src]
+            src2 = f"appendix_prec_norm_at_{k_lbl}pct"
+            if src2 in numbers:
+                numbers[f"sec6_p3_precision_norm_at_{k_lbl}pct"] = numbers[src2]
+        for r in bl_rows:
+            if (isinstance(r.get("label"), str) and "AGGREGATE" in r["label"]
+                    and "gen-leverage" in r["label"] and "rho_mean" in r):
+                sc  = r.get("scope", "")
+                val = float(r["rho_mean"])
+                if np.isfinite(val):
+                    numbers[f"sec6_p3_gen_leverage_{sc}"] = val
+        prov.append("table3_baselines.json")
+
+    # table_lira_paper.json
+    tlp = _load_or_run(os.path.join(out_dir, "table_lira_paper.json"),
+                       lambda: table_lira_paper(cert_dir, lira_dir, runs_dir, out_dir))
+    if tlp:
+        for rk, rl in [("eps_dir","dir"), ("eps_norm","norm"),
+                        ("loss","loss"), ("gen_leverage","gen_leverage")]:
+            for sc in ["overall", "head", "mid", "tail"]:
+                v = tlp.get("cells", {}).get(f"{rk}|{sc}")
+                if v == "undef.":
+                    numbers[f"tab_lira_{rl}_{sc}"] = "undef."
+                elif v is not None:
+                    try:
+                        fv = float(v)
+                        if np.isfinite(fv):
+                            numbers[f"tab_lira_{rl}_{sc}"] = fv
+                    except (TypeError, ValueError):
+                        pass
+        numbers["footnote_tier_label_spearman"] = tlp.get("footnote_tier_label_spearman")
+        numbers["footnote_lt_iqr_spearman"]     = tlp.get("footnote_lt_iqr_spearman")
+        prov.append("table_lira_paper.json")
+
+    # Rank stability F1
+    rs_raw = _load_or_run(os.path.join(out_dir, "rank_stability_F1.json"),
+                          lambda: rank_stability(cert_dir, runs_dir, out_dir, "F1"))
+    if rs_raw:
+        rs_rows = rs_raw.get("rows", rs_raw) if isinstance(rs_raw, dict) else rs_raw
+        for r in rs_rows:
+            if r.get("pair") == "median_pairwise":
+                numbers[f"appendix_rank_stability_median_pairwise_{r.get('scope','')}"] = \
+                    float(r["spearman"])
+        prov.append("rank_stability_F1.json")
+
+    # Gaussian validation dominant (F1 seed 0)
+    gv = _load_or_run(os.path.join(out_dir, "gaussian_validation_F1_seed0.json"),
+                      lambda: gaussian_validation("F1", 0, runs_dir, out_dir))
+    if gv:
+        ks_med  = [r["ks_median"] for r in gv if np.isfinite(r.get("ks_median", float("nan")))]
+        ks_max  = [r["ks_max"]    for r in gv if np.isfinite(r.get("ks_max",    float("nan")))]
+        sk_meds = [r["skewness_abs_med"] for r in gv
+                   if np.isfinite(r.get("skewness_abs_med", float("nan")))]
+        ku_meds = [r["excess_kurtosis_abs_med"] for r in gv
+                   if np.isfinite(r.get("excess_kurtosis_abs_med", float("nan")))]
+        if ks_med:
+            numbers["appendix_gauss_dom_ks_median"] = float(np.median(ks_med))
+            numbers["appendix_gauss_dom_ks_max"]    = float(np.max(ks_max)) if ks_max else float("nan")
+        if sk_meds: numbers["appendix_gauss_dom_skew_max"]  = float(np.max(sk_meds))
+        if ku_meds: numbers["appendix_gauss_dom_kurt_max"]  = float(np.max(ku_meds))
+        prov.append("gaussian_validation_F1_seed0.json")
+
+    # Gaussian validation lowvar F1 seeds 0-2
+    for sub, nlabel in [("bottom", "bot"), ("tail_orthogonal", "tail_orth")]:
+        all_ks: list = []
+        for seed in [0, 1, 2]:
+            gvlv = _load_or_run(
+                os.path.join(out_dir, f"gaussian_validation_F1_lowvar_seed{seed}.json"),
+                lambda s=seed: gaussian_validation_lowvar("F1", s, runs_dir, out_dir))
+            if gvlv:
+                all_ks.extend(r["ks"] for r in gvlv
+                               if r.get("subspace") == sub
+                               and np.isfinite(r.get("ks", float("nan"))))
+        if all_ks:
+            numbers[f"appendix_gauss_{nlabel}_ks_median"] = float(np.median(all_ks))
+            numbers[f"appendix_gauss_{nlabel}_ks_max"]    = float(np.max(all_ks))
+        prov.append(f"gaussian_validation_F1_lowvar_seed{{0,1,2}}.json subspace={sub}")
+
+    # Tier populations and member-target counts
+    run_f1 = _load_run("F1", 0, runs_dir)
+    if "tier_labels" in run_f1:
+        tl = run_f1["tier_labels"]
+        counts = np.bincount(tl.astype(int), minlength=3)
+        numbers["data_tier_pop_head"] = int(counts[0])
+        numbers["data_tier_pop_mid"]  = int(counts[1])
+        numbers["data_tier_pop_tail"] = int(counts[2])
+        print(f"  Tier populations (F1 seed 0): {counts[0]}/{counts[1]}/{counts[2]}")
+        ml_path = os.path.join(runs_dir, "F1", "seed_0", "lira_member_local_idx.npy")
+        if os.path.exists(ml_path):
+            ml = np.load(ml_path)
+            mc = np.bincount(tl[ml].astype(int), minlength=3)
+            numbers["data_member_tier_count_head"]  = int(mc[0])
+            numbers["data_member_tier_count_mid"]   = int(mc[1])
+            numbers["data_member_tier_count_tail"]  = int(mc[2])
+            numbers["data_member_tier_count_total"] = int(mc.sum())
+            print(f"  Member-target counts: {mc[0]}/{mc[1]}/{mc[2]} (total={mc.sum()})")
+        prov.append("tier_labels.npy + lira_member_local_idx.npy F1 seed 0")
+
+    # Accounting note
+    acc = _load_or_run(os.path.join(out_dir, "accounting_note.json"),
+                       lambda: accounting_note(runs_dir, cert_dir, out_dir))
+    if acc:
+        numbers["appendix_accounting_sigma"] = acc.get("sigma")
+        numbers["appendix_accounting_q"]     = acc.get("q")
+        numbers["appendix_accounting_T"]     = acc.get("T")
+        numbers["appendix_fullclip_eps"]     = acc.get("eps_norm_fullclip")
+        numbers["appendix_fullclip_alpha"]   = acc.get("best_alpha")
+        numbers["appendix_prv_eps"]          = acc.get("eps_global_prv")
+        prov.append("accounting_note.json")
+
+    # Write
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "paper_numbers.json")
+    with open(out_path, "w") as f:
+        json.dump({"numbers": numbers, "provenance_log": prov,
+                   "note": "All values from saved arrays; no training/cert/LiRA calls."},
+                  f, indent=2, default=str)
+    print(f"\n  [saved] {out_path}")
+
+    # Pretty-print groups
+    groups = [
+        ("§6 ¶2", ["sec6_p2_frac_clipped_S1","sec6_p2_frac_clipped_S3",
+                    "sec6_p2_S2_dir_CV","sec6_p2_S2_norm_CV"]),
+        ("§6 ¶3", ["tab_lira_dir_mid","tab_lira_dir_tail","tab_lira_norm_mid","tab_lira_norm_tail",
+                    "sec6_p3_precision_dir_at_1pct","sec6_p3_precision_norm_at_1pct",
+                    "sec6_p3_gen_leverage_overall","sec6_p3_gen_leverage_head",
+                    "sec6_p3_gen_leverage_mid","sec6_p3_gen_leverage_tail"]),
+        ("§6 ¶4", ["sec6_p4_S3_head_masking_pct","sec6_p4_S3_mid_masking_pct",
+                    "sec6_p4_S3_tail_masking_pct",
+                    "sec6_p4_S3_masking_range_lo","sec6_p4_S3_masking_range_hi"]),
+        ("Fig captions", ["fig_degeneracy_norm_value","fig_degeneracy_dir_p5",
+                           "fig_degeneracy_dir_p95","fig_wrn_S3_norm_reference"]),
+        ("tab:lira",    [k for k in numbers if k.startswith("tab_lira_")
+                         or k.startswith("footnote_")]),
+        ("Tier counts", ["data_tier_pop_head","data_tier_pop_mid","data_tier_pop_tail",
+                          "data_member_tier_count_head","data_member_tier_count_mid",
+                          "data_member_tier_count_tail","data_member_tier_count_total"]),
+        ("Appendix CIs", ["appendix_overall_seed_std",
+                           "appendix_dir_CI_overall_lo","appendix_dir_CI_overall_hi",
+                           "appendix_dir_CI_tail_lo","appendix_dir_CI_tail_hi",
+                           "appendix_loss_CI_overall_lo","appendix_loss_CI_overall_hi",
+                           "appendix_loss_CI_tail_lo","appendix_loss_CI_tail_hi"]),
+        ("Rank stability", [k for k in numbers if "rank_stability" in k]),
+        ("Precision grids", [k for k in numbers if "prec_" in k or "precision_" in k]),
+        ("Accounting",  ["appendix_accounting_sigma","appendix_accounting_q",
+                          "appendix_accounting_T","appendix_fullclip_eps",
+                          "appendix_fullclip_alpha","appendix_prv_eps"]),
+        ("Minorant ranks", [k for k in numbers if "minorant" in k]),
+        ("Filter",      [k for k in numbers if "filter" in k]),
+        ("Gaussianity", [k for k in numbers if "gauss" in k]),
+    ]
+    for grp, keys in groups:
+        found = {k: numbers[k] for k in keys if k in numbers}
+        if not found: continue
+        print(f"\n  [{grp}]")
+        for k, v in found.items():
+            print(f"    {k}: {v:.4f}" if isinstance(v, float) else f"    {k}: {v}")
+
+    return numbers
+
+
+# ===========================================================================
+# Acceptance check
+# ===========================================================================
+
+def paper_check(out_dir=OUT_DIR):
+    """--paper_check: compare paper_numbers.json to §9 draft targets."""
+    path = os.path.join(out_dir, "paper_numbers.json")
+    if not os.path.exists(path):
+        print(f"  [paper_check] paper_numbers.json not found. Run --paper first.")
+        return
+
+    with open(path) as f:
+        pn = json.load(f)
+    numbers = pn.get("numbers", pn)
+
+    DRAFT = {
+        "sec6_p2_frac_clipped_S1":            (0.54,   0.05),
+        "sec6_p2_frac_clipped_S3":            (0.78,   0.05),
+        "sec6_p2_S2_dir_CV":                  (0.169,  0.02),
+        "tab_lira_dir_overall":               (0.700,  0.01),
+        "tab_lira_dir_head":                  (0.313,  0.01),
+        "tab_lira_dir_mid":                   (0.548,  0.01),
+        "tab_lira_dir_tail":                  (0.718,  0.01),
+        "tab_lira_norm_overall":              (0.467,  0.01),
+        "tab_lira_norm_head":                 (0.290,  0.01),
+        "tab_lira_loss_overall":              (0.682,  0.01),
+        "tab_lira_loss_head":                 (0.312,  0.01),
+        "tab_lira_loss_mid":                  (0.497,  0.01),
+        "tab_lira_loss_tail":                 (0.596,  0.01),
+        "tab_lira_gen_leverage_overall":      (0.57,   0.01),
+        "tab_lira_gen_leverage_head":         (0.29,   0.01),
+        "tab_lira_gen_leverage_mid":          (0.42,   0.01),
+        "tab_lira_gen_leverage_tail":         (0.38,   0.01),
+        "sec6_p3_precision_dir_at_1pct":      (0.29,   0.01),
+        "sec6_p3_precision_norm_at_1pct":     (0.013,  0.01),
+        "fig_degeneracy_norm_value":          (9.53,   0.05),
+        "appendix_accounting_sigma":          (1.484,  0.001),
+        "appendix_accounting_q":              (0.111,  0.005),
+        "appendix_accounting_T":              (360,    1),
+        "appendix_fullclip_eps":              (9.53,   0.05),
+        "appendix_fullclip_alpha":            (3.5,    0.5),
+        "appendix_prv_eps":                   (7.99,   0.1),
+        "appendix_gauss_dom_ks_median":       (0.013,  0.002),
+        "appendix_gauss_dom_ks_max":          (0.029,  0.002),
+        "appendix_gauss_bot_ks_median":       (0.011,  0.002),
+        "appendix_gauss_bot_ks_max":          (0.024,  0.002),
+        "appendix_gauss_tail_orth_ks_median": (0.011,  0.002),
+        "appendix_gauss_tail_orth_ks_max":    (0.021,  0.002),
+        "data_tier_pop_head":                 (9301,   100),
+        "data_tier_pop_mid":                  (2857,   100),
+        "data_tier_pop_tail":                 (444,    50),
+        "data_member_tier_count_head":        (544,    50),
+        "data_member_tier_count_mid":         (512,    50),
+        "data_member_tier_count_tail":        (444,    50),
+        "data_member_tier_count_total":       (1500,   10),
+    }
+    UNDEF_EXPECTED = {"tab_lira_norm_mid", "tab_lira_norm_tail"}
+
+    print(f"\n{'='*72}")
+    print(f"  paper_check: §9 draft comparison")
+    print(f"{'='*72}")
+    n_pass = n_fail = n_miss = 0
+
+    for key, (draft, tol) in sorted(DRAFT.items()):
+        actual = numbers.get(key)
+        if actual is None:
+            print(f"  [MISSING] {key:55s}  draft={draft}")
+            n_miss += 1; continue
+        try:
+            af = float(actual)
+        except (TypeError, ValueError):
+            print(f"  [SKIP]    {key:55s}  actual={actual!r}"); continue
+        diff = abs(af - float(draft))
+        tag = "PASS" if diff <= tol else "FAIL"
+        print(f"  [{tag}]    {key:55s}  actual={af:.4f}  draft={draft}  |Δ|={diff:.4f}"
+              + (f"  tol={tol}" if tag == "FAIL" else ""))
+        if tag == "PASS": n_pass += 1
+        else:             n_fail += 1
+
+    for key in sorted(UNDEF_EXPECTED):
+        actual = numbers.get(key)
+        if actual == "undef.":
+            print(f"  [PASS]    {key:55s}  = undef. (expected)")
+            n_pass += 1
+        else:
+            print(f"  [FAIL]    {key:55s}  = {actual!r} (expected undef.)")
+            n_fail += 1
+
+    print(f"\n  Summary: {n_pass} PASS / {n_fail} FAIL / {n_miss} MISSING")
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -1886,6 +2776,21 @@ def main():
                         help="Top eigenvectors defining dominant subspace (item 2)")
     parser.add_argument("--k_bot",    type=int, default=5,
                         help="Bottom eigenvectors to test for family (i) (item 2)")
+    # ------------------------------------------------------------------
+    # Paper-mode flags (Section 4 / 5 rewrite artifacts)
+    # ------------------------------------------------------------------
+    parser.add_argument("--paper",         action="store_true",
+                        help="Produce all paper artifacts: figures A/B/C, tab:lira, paper_numbers.json")
+    parser.add_argument("--paper_figures", action="store_true",
+                        help="Figures A (fig:degeneracy), B (fig:withintier), C (fig:wrn)")
+    parser.add_argument("--paper_table",   action="store_true",
+                        help="table_lira_paper() — consolidated 4×4 correlation table")
+    parser.add_argument("--paper_numbers", action="store_true",
+                        help="emit_paper_numbers() — paper_numbers.json manifest")
+    parser.add_argument("--paper_seed",    type=int, default=0,
+                        help="Seed for Figure B (default 0)")
+    parser.add_argument("--paper_check",   action="store_true",
+                        help="Compare paper_numbers.json to §9 draft targets; print PASS/FAIL")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -1945,6 +2850,28 @@ def main():
             cert_dir=args.cert_dir, runs_dir=args.runs_dir, out_dir=args.out_dir,
             setting=args.setting, seeds=tuple(args.seeds),
         )
+
+    # ------------------------------------------------------------------
+    # Paper-mode dispatch
+    # ------------------------------------------------------------------
+    do_figures  = args.paper or args.paper_figures
+    do_table    = args.paper or args.paper_table
+    do_numbers  = args.paper or args.paper_numbers
+
+    if do_figures:
+        figure_degeneracy_s2(args.cert_dir, args.out_dir)
+        figure_withintier_s1(args.cert_dir, args.lira_dir, args.runs_dir,
+                              args.out_dir, paper_seed=args.paper_seed)
+        figure_wrn_distribution_s3(args.cert_dir, args.runs_dir, args.out_dir)
+
+    if do_table:
+        table_lira_paper(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir)
+
+    if do_numbers:
+        emit_paper_numbers(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir)
+
+    if args.paper_check:
+        paper_check(args.out_dir)
 
     print(f"\n[P19-analysis] Done. Results in {args.out_dir}")
 
