@@ -2095,12 +2095,25 @@ def table_lira_paper(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
             print(f"  [missing] D_lira_members {lira_id} seed={seed}"); continue
         if "epsilon_cert_dir_rank_100" not in cert or "epsilon_cert_norm" not in cert:
             print(f"  [missing] cert arrays {setting} seed={seed}"); continue
-        ml_path = os.path.join(runs_dir, setting, f"seed_{seed}", "lira_member_local_idx.npy")
-        if not os.path.exists(ml_path):
-            print(f"  [missing] lira_member_local_idx.npy seed={seed}"); continue
 
-        member_local = np.load(ml_path)
+        # targets_members from the LiRA output is co-indexed with D_lira_members by
+        # construction.  Prefer it over lira_member_local_idx.npy from the run
+        # directory, which may have been saved in a different target order.
         D_lira = lf1["D_lira_members"]
+        if lf1.get("targets_members") is not None:
+            member_local = lf1["targets_members"].astype(int)
+            print(f"  [idx src] targets_members from {lira_id} seed={seed} "
+                  f"(n={len(member_local)})")
+        else:
+            ml_path = os.path.join(runs_dir, setting, f"seed_{seed}",
+                                   "lira_member_local_idx.npy")
+            if not os.path.exists(ml_path):
+                print(f"  [missing] targets_members and lira_member_local_idx.npy "
+                      f"for {setting} seed={seed}"); continue
+            member_local = np.load(ml_path)
+            print(f"  [idx src] lira_member_local_idx.npy from {setting} seed={seed} "
+                  f"(n={len(member_local)})")
+
         n_m    = min(len(D_lira), len(member_local))
         D_use  = D_lira[:n_m]
         idx    = member_local[:n_m]
