@@ -24,9 +24,11 @@ Usage:
   python experiments/exp_p19_analysis.py --table 2
   python experiments/exp_p19_analysis.py --gaussian_validation --run F1 --seed 0
   python experiments/exp_p19_analysis.py --paper_table_s3                # S3 correlation table (F5×LF5)
+  python experiments/exp_p19_analysis.py --minorant_check                 # Nystrom minorant soundness
 """
 
 import os, sys, json, argparse, math
+from collections import defaultdict
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -861,6 +863,211 @@ def table_6(cert_dir=CERT_DIR, out_dir=OUT_DIR):
     with open(os.path.join(out_dir, "table6_rank_ablation.json"), "w") as f:
         json.dump(all_rows, f, indent=2)
     print(f"\n  [saved] {out_dir}/table6_rank_ablation.json")
+
+
+# ===========================================================================
+# Nystrom minorant numerical-soundness check
+# ===========================================================================
+
+def nystrom_minorant_check(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=OUT_DIR,
+                            settings=None, eigenvalue_floor_factor=1e-8,
+                            eps_machine=2.22e-16):
+    """
+    Empirical numerical-soundness check for the Nystrom minorant (L_Q ≼ Σ).
+
+    Three complementary checks:
+
+    (a) Bound consistency — necessary condition for L_Q ≼ Σ:
+        ε^dir_i ≤ ε^norm_i must hold for every (run, seed, example).
+        Any violation means the certificate overstates privacy for that example.
+
+    (b) Sketch conditioning — sufficient evidence that the pseudoinverse is stable:
+        For each saved step in B_matrices / YTY_matrices, report:
+          • min eigenvalue of B before the np.maximum(·,1e-12) clip in
+            _nystrom_H_from_BM (pre-clip negatives would silently corrupt H)
+          • min/max eigenvalue of H = B^{-1/2} M B^{-1/2} (must be ≥ 0)
+          • floor fraction: #{λ_k(H) ≤ floor_factor·λ_max} / r
+            (floored directions are dropped — conservative but sound if all
+            pre-floor eigenvalues of H are non-negative)
+          • perturbation slack ratio ρ = κ(B) · ε_machine / (λ_min_valid / λ_max)
+            where λ_min_valid is the smallest eigenvalue kept above the floor.
+            ρ ≪ 1 → floating-point errors are negligible relative to the
+            smallest eigenvalue used in the pseudoinverse.
+            ρ ≫ 1 → conditioning may corrupt the pseudoinverse significantly,
+            and a provable perturbation correction is needed.
+
+    (c) Rank convergence — monotone decrease of median ε^dir with rank r,
+        read from table6_rank_ablation.json.  Monotone non-increase confirms
+        the Nystrom series tightens from below toward the true direction-aware
+        bound as r grows (the minorant improves with rank).
+
+    Outputs nystrom_minorant_check.json.
+    """
+    print(f"\n{'='*72}")
+    print(f"  nystrom_minorant_check: Nystrom minorant soundness")
+    print(f"{'='*72}")
+
+    if settings is None:
+        settings = [("F1", [0, 1, 2]), ("F5", [0, 1, 2])]
+
+    all_results = []
+    any_bound_violation = False
+
+    # ------------------------------------------------------------------
+    # (a) Bound consistency: ε^dir ≤ ε^norm for all examples
+    # ------------------------------------------------------------------
+    print(f"\n  (a) Bound consistency: ε^dir ≤ ε^norm")
+    print(f"  {'Run':4s} {'S':1s}  {'n':6s}  {'n_viol':6s}  "
+          f"{'max_excess':10s}  {'sound':5s}")
+
+    for run_id, seeds in settings:
+        for seed in seeds:
+            cert = _load_cert(run_id, seed, cert_dir)
+            if "epsilon_cert_norm" not in cert or "epsilon_cert_dir_rank_100" not in cert:
+                continue
+            en = cert["epsilon_cert_norm"]
+            ed = cert["epsilon_cert_dir_rank_100"]
+            excess     = ed - en                                # > 0 means violation
+            n_viol     = int((excess > 0).sum())
+            max_excess = float(excess.max())
+            sound      = n_viol == 0
+            if not sound:
+                any_bound_violation = True
+            print(f"  {run_id:4s} {seed:1d}  {len(en):6d}  {n_viol:6d}  "
+                  f"{max_excess:10.2e}  {'OK' if sound else '!! FAIL !!'}")
+            all_results.append({
+                "check": "bound_consistency", "run_id": run_id, "seed": seed,
+                "n_total": len(en), "n_violations": n_viol,
+                "max_excess": max_excess, "sound": sound,
+            })
+
+    if any_bound_violation:
+        print(f"\n  !! At least one ε^dir > ε^norm violation — certificate UNSOUND !!")
+    else:
+        print(f"\n  All (run, seed) pairs: ε^dir ≤ ε^norm. Bound consistency OK.")
+
+    # ------------------------------------------------------------------
+    # (b) Sketch conditioning
+    # ------------------------------------------------------------------
+    print(f"\n  (b) Sketch conditioning (B and H eigenvalue health)")
+    hdr = (f"  {'Run':4s} {'S':1s} {'step':5s}  "
+           f"{'B_lmin_preclip':14s}  {'H_lmin':8s}  {'H_lmax':8s}  "
+           f"{'kappa_eff':10s}  {'floor_frac':10s}  {'slack_ratio':11s}")
+    print(hdr)
+
+    for run_id, seeds in settings:
+        for seed in seeds:
+            run_dir = os.path.join(runs_dir, run_id, f"seed_{seed}")
+            b_path  = os.path.join(run_dir, "B_matrices.npy")
+            m_path  = os.path.join(run_dir, "YTY_matrices.npy")
+            if not (os.path.exists(b_path) and os.path.exists(m_path)):
+                print(f"  {run_id:4s} {seed:1d}  [B/M matrices not found — skipping conditioning check]")
+                continue
+
+            B_mats = np.load(b_path)   # (T, r, r)
+            M_mats = np.load(m_path)   # (T, r, r)
+            T_saved, r, _ = B_mats.shape
+
+            # Sample representative steps: 0, 25%, 50%, 75%, 100%
+            step_idxs = sorted(set(
+                int(round(f * (T_saved - 1))) for f in [0.0, 0.25, 0.5, 0.75, 1.0]
+            ))
+
+            for t_idx in step_idxs:
+                B = B_mats[t_idx].astype(np.float64)
+                M = M_mats[t_idx].astype(np.float64)
+
+                # --- B eigenvalues BEFORE the 1e-12 clip ---
+                evals_B_raw = np.linalg.eigvalsh(B)
+                B_lmin_preclip = float(evals_B_raw.min())
+                B_lmax         = float(evals_B_raw.max())
+                kappa_B        = B_lmax / max(abs(B_lmin_preclip), 1e-300)
+
+                # --- H = B^{-1/2} M B^{-1/2} (uses clipped B internally) ---
+                _, H = _nystrom_H_from_BM(B, M)
+                evals_H = np.linalg.eigvalsh(H)
+                H_lmin  = float(evals_H.min())
+                H_lmax  = float(evals_H.max()) if evals_H.max() > 0 else 0.0
+                floor   = eigenvalue_floor_factor * max(H_lmax, 1e-300)
+                n_above = int((evals_H > floor).sum())
+                floor_frac = float(1.0 - n_above / r)
+
+                # Effective condition number (only eigenvalues kept above floor)
+                valid_evals = evals_H[evals_H > floor]
+                lmin_valid  = float(valid_evals.min()) if len(valid_evals) > 0 else float("nan")
+                kappa_eff   = (H_lmax / lmin_valid) if np.isfinite(lmin_valid) and lmin_valid > 0 \
+                              else float("inf")
+
+                # Perturbation slack: κ(B) · ε_machine / (λ_min_valid / λ_max)
+                # Measures how large floating-point errors in H are relative to
+                # the smallest eigenvalue used in the pseudoinverse.
+                rel_lmin  = lmin_valid / max(H_lmax, 1e-300) if np.isfinite(lmin_valid) else 0.0
+                slack_ratio = (kappa_B * eps_machine / rel_lmin) if rel_lmin > 0 else float("inf")
+
+                h_neg = H_lmin < -1e-10  # H should be PSD; negatives indicate issues
+                flag  = " !! H<0 !!" if h_neg else ("  !! B<0 !!" if B_lmin_preclip < -1e-10 else "")
+
+                print(f"  {run_id:4s} {seed:1d} {t_idx:5d}  "
+                      f"{B_lmin_preclip:14.3e}  {H_lmin:8.3e}  {H_lmax:8.3e}  "
+                      f"{kappa_eff:10.2e}  {floor_frac:10.4f}  {slack_ratio:11.2e}{flag}")
+
+                all_results.append({
+                    "check": "conditioning", "run_id": run_id, "seed": seed,
+                    "step": t_idx, "r": r,
+                    "B_lmin_preclip": B_lmin_preclip,
+                    "B_lmax": B_lmax, "kappa_B": kappa_B,
+                    "H_lmin": H_lmin, "H_lmax": H_lmax,
+                    "H_n_negative": int((evals_H < -1e-10).sum()),
+                    "floor_frac": floor_frac,
+                    "kappa_eff": kappa_eff if np.isfinite(kappa_eff) else None,
+                    "lmin_valid": lmin_valid if np.isfinite(lmin_valid) else None,
+                    "slack_ratio": slack_ratio if np.isfinite(slack_ratio) else None,
+                    "B_preclip_negative": B_lmin_preclip < -1e-10,
+                    "H_negative_eigenvalue": h_neg,
+                })
+
+    # ------------------------------------------------------------------
+    # (c) Rank convergence: median ε^dir monotone in r
+    # ------------------------------------------------------------------
+    print(f"\n  (c) Rank convergence: median ε^dir non-increasing in r")
+    t6_path = os.path.join(out_dir, "table6_rank_ablation.json")
+    if os.path.exists(t6_path):
+        with open(t6_path) as f:
+            t6 = json.load(f)
+
+        for run_id in ["F1", "F5"]:
+            rows_run = [r for r in t6 if r["run_id"] == run_id]
+            if not rows_run:
+                continue
+            # Aggregate median ε^dir per rank (mean across seeds)
+            rank_meds = defaultdict(list)
+            for r in rows_run:
+                rank_meds[r["rank"]].append(r["eps_dir_med"])
+            ranks_sorted = sorted(rank_meds.keys())
+            med_seq = [float(np.mean(rank_meds[rk])) for rk in ranks_sorted]
+            monotone = all(med_seq[i] >= med_seq[i + 1] - 1e-6
+                           for i in range(len(med_seq) - 1))
+            seq_str = "  ".join(f"r={rk}: {v:.4f}" for rk, v in zip(ranks_sorted, med_seq))
+            status = "monotone (OK)" if monotone else "!! NON-MONOTONE !!"
+            print(f"  {run_id}: {seq_str}  → {status}")
+            all_results.append({
+                "check": "rank_convergence", "run_id": run_id,
+                "ranks": ranks_sorted, "median_eps_dir": med_seq,
+                "monotone_nonincreasing": monotone,
+            })
+    else:
+        print(f"  [skip] table6_rank_ablation.json not found — "
+              f"run --table 6 first to enable rank convergence check.")
+
+    # ------------------------------------------------------------------
+    # Save
+    # ------------------------------------------------------------------
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "nystrom_minorant_check.json")
+    with open(out_path, "w") as f:
+        json.dump(all_results, f, indent=2)
+    print(f"\n  [saved] {out_path}")
+    return all_results
 
 
 # ===========================================================================
@@ -2096,23 +2303,39 @@ def table_lira_paper(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
         if "epsilon_cert_dir_rank_100" not in cert or "epsilon_cert_norm" not in cert:
             print(f"  [missing] cert arrays {setting} seed={seed}"); continue
 
-        # targets_members from the LiRA output is co-indexed with D_lira_members by
-        # construction.  Prefer it over lira_member_local_idx.npy from the run
-        # directory, which may have been saved in a different target order.
+        # Resolve target→cert-array index mapping.  Priority (most to least reliable):
+        #   1. targets_members.npy in LiRA output dir  (saved in same pass as D_lira)
+        #   2. lira_member_local_idx.npy in LiRA output dir  (same pass, older naming)
+        #   3. lira_member_local_idx.npy in run dir  (may have been written at train time
+        #      with a different target set or ordering than the actual LiRA run)
         D_lira = lf1["D_lira_members"]
+        lira_seed_dir = os.path.join(lira_dir, lira_id, f"seed_{seed}")
+        lira_ml_path  = os.path.join(lira_seed_dir, "lira_member_local_idx.npy")
+        run_ml_path   = os.path.join(runs_dir, setting, f"seed_{seed}",
+                                     "lira_member_local_idx.npy")
+
         if lf1.get("targets_members") is not None:
             member_local = lf1["targets_members"].astype(int)
-            print(f"  [idx src] targets_members from {lira_id} seed={seed} "
-                  f"(n={len(member_local)})")
+            idx_src = f"targets_members in {lira_id} dir"
+        elif os.path.exists(lira_ml_path):
+            member_local = np.load(lira_ml_path).astype(int)
+            idx_src = f"lira_member_local_idx in {lira_id} dir"
+        elif os.path.exists(run_ml_path):
+            member_local = np.load(run_ml_path).astype(int)
+            idx_src = f"lira_member_local_idx in {setting} run dir"
         else:
-            ml_path = os.path.join(runs_dir, setting, f"seed_{seed}",
-                                   "lira_member_local_idx.npy")
-            if not os.path.exists(ml_path):
-                print(f"  [missing] targets_members and lira_member_local_idx.npy "
-                      f"for {setting} seed={seed}"); continue
-            member_local = np.load(ml_path)
-            print(f"  [idx src] lira_member_local_idx.npy from {setting} seed={seed} "
-                  f"(n={len(member_local)})")
+            print(f"  [missing] no member-index file found for {setting}/{lira_id} "
+                  f"seed={seed}"); continue
+
+        n_cert = len(cert["epsilon_cert_dir_rank_100"])
+        print(f"  [diag s{seed}] idx_src={idx_src}")
+        print(f"  [diag s{seed}] D_lira n={len(D_lira)}  "
+              f"member_local n={len(member_local)} "
+              f"range=[{member_local.min()},{member_local.max()}]  "
+              f"cert n={n_cert}")
+        if member_local.max() >= n_cert:
+            print(f"  [WARN s{seed}] member_local.max()={member_local.max()} >= "
+                  f"cert array len={n_cert} — index out of range, wrong source!")
 
         n_m    = min(len(D_lira), len(member_local))
         D_use  = D_lira[:n_m]
@@ -2851,6 +3074,14 @@ def main():
                         help="Seed for Figure B (default 0)")
     parser.add_argument("--paper_check",   action="store_true",
                         help="Compare paper_numbers.json to §9 draft targets; print PASS/FAIL")
+    # ------------------------------------------------------------------
+    # Nystrom minorant soundness check
+    # ------------------------------------------------------------------
+    parser.add_argument("--minorant_check", action="store_true",
+                        help=("Nystrom minorant numerical-soundness check: "
+                              "(a) ε^dir ≤ ε^norm for all examples, "
+                              "(b) B/H conditioning and perturbation slack, "
+                              "(c) rank-convergence monotonicity"))
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -2909,6 +3140,14 @@ def main():
         rank_stability(
             cert_dir=args.cert_dir, runs_dir=args.runs_dir, out_dir=args.out_dir,
             setting=args.setting, seeds=tuple(args.seeds),
+        )
+
+    # ------------------------------------------------------------------
+    # Nystrom minorant soundness check
+    # ------------------------------------------------------------------
+    if args.minorant_check or args.all:
+        nystrom_minorant_check(
+            cert_dir=args.cert_dir, runs_dir=args.runs_dir, out_dir=args.out_dir,
         )
 
     # ------------------------------------------------------------------
