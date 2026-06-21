@@ -2371,6 +2371,20 @@ def table_lira_paper(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
             rho, _, _ = _spearman_ci(a, d, n_boot=0)
             return rho
 
+        # Cross-consistency check: Spearman(ε^dir, loss_final) within member targets.
+        # If the cert and run are from the same model, this should be strongly
+        # positive (high training loss → large gradient → high ε^dir).
+        # Near-zero or negative means the cert was computed from a different model
+        # or checkpoint than the run (the most common source of S3 cert issues).
+        if loss_m is not None:
+            rho_dir_loss = _rho(eps_dir_m, loss_m)
+            rho_norm_loss = _rho(eps_norm_m, loss_m)
+            flag = ("  !! cert/run MISMATCH — check that certs/p19/{setting} "
+                    "and runs/p19/{setting} are from the same training run !!"
+                    .format(setting=setting)) if rho_dir_loss < 0.1 else ""
+            print(f"  [consistency s{seed}] Spearman(ε^dir, loss)={rho_dir_loss:+.3f}  "
+                  f"Spearman(ε^norm, loss)={rho_norm_loss:+.3f}{flag}")
+
         for scope in scopes:
             if scope == "overall":
                 mask = None
