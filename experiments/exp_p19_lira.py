@@ -59,7 +59,7 @@ LIRA_SETTINGS = {
     "LF2": dict(matched_run="F2", seeds=[0, 1, 2], dataset="cifar10",      regime="R3",
                 n_targets=1000, n_shadows=64,  shadow_epochs=20),
     "LF5": dict(matched_run="F5", seeds=[0, 1, 2], dataset="cifar10_lt50", regime="R2",
-                n_targets=300,  n_shadows=24,  shadow_epochs=30),
+                n_targets=300,  n_shadows=128, shadow_epochs=30),
 }
 
 DATA_ROOT  = "./data"
