@@ -23,6 +23,7 @@ Usage:
   python experiments/exp_p19_analysis.py --table 1
   python experiments/exp_p19_analysis.py --table 2
   python experiments/exp_p19_analysis.py --gaussian_validation --run F1 --seed 0
+  python experiments/exp_p19_analysis.py --paper_table_s3                # S3 correlation table (F5×LF5)
 """
 
 import os, sys, json, argparse, math
@@ -1889,7 +1890,7 @@ def figure_degeneracy_s2(cert_dir=CERT_DIR, out_dir=OUT_DIR):
     ax.set_yticklabels(["ε^dir", "ε^norm"])
     ax.set_ylim(-0.35, 1.55)
     ax.set_xlabel("Certified ε value")
-    ax.set_title("Figure A (fig:degeneracy): S2 — CLIP linear head, balanced CIFAR-10")
+    ax.set_title("S2 — CLIP linear head, balanced CIFAR-10")
     ax.grid(True, axis="x", alpha=0.3)
     fig.tight_layout()
     path = os.path.join(out_dir, "figure_s2_degeneracy.png")
@@ -1960,7 +1961,7 @@ def figure_withintier_s1(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR
         ax.legend(fontsize=7)
         ax.grid(True, alpha=0.3)
     axes[0].set_ylabel("ε^dir cert (r=100)")
-    fig.suptitle("Figure B (fig:withintier): S1 — Within-tier ε^dir vs LiRA score", fontsize=11)
+    # fig.suptitle("Figure B (fig:withintier): S1 — Within-tier ε^dir vs LiRA score", fontsize=11)
     fig.tight_layout()
     path = os.path.join(out_dir, "figure_withintier_scatter.png")
     fig.savefig(path, dpi=150)
@@ -2051,7 +2052,7 @@ def figure_wrn_distribution_s3(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=OUT
         ax_f1.set_xlabel("Tier"); ax_f1.set_title("S1 = CLIP linear head, CIFAR-10-LT(50)")
         ax_f1.legend(fontsize=9); ax_f1.grid(True, axis="y", alpha=0.3)
 
-    fig.suptitle("Figure C (fig:wrn): S3 = WideResNet-28-2, CIFAR-10-LT(50)", fontsize=11)
+    # fig.suptitle("Figure C (fig:wrn): S3 = WideResNet-28-2, CIFAR-10-LT(50)", fontsize=11)
     fig.tight_layout()
     path = os.path.join(out_dir, "figure_s3_dir_distribution.png")
     fig.savefig(path, dpi=150)
@@ -2064,14 +2065,20 @@ def figure_wrn_distribution_s3(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=OUT
 # ===========================================================================
 
 def table_lira_paper(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
-                     out_dir=OUT_DIR, seeds=(0, 1, 2)):
+                     out_dir=OUT_DIR, seeds=(0, 1, 2),
+                     setting="F1", lira_id="LF1"):
     """
     Four rows (ε^dir, ε^norm, loss, gen-leverage) × four scopes (overall/head/mid/tail).
     Mean Spearman across seeds 0,1,2; ε^norm constant in mid/tail → 'undef.'.
-    Outputs table_lira_paper.json and table_lira_paper.tex.
+    Outputs table_lira_paper[_<setting>].json and .tex.
+
+    setting: run ID for certs/runs (default "F1"; use "F5" for S3).
+    lira_id: LiRA run ID (default "LF1"; use "LF5" for S3).
     """
+    tag_label  = f"{setting}×{lira_id}"
+    out_suffix = "" if setting == "F1" else f"_{setting.lower()}"
     print(f"\n{'='*72}")
-    print(f"  table_lira_paper: consolidated correlation table (tab:lira)")
+    print(f"  table_lira_paper ({tag_label}): consolidated correlation table (tab:lira)")
     print(f"{'='*72}")
 
     tier_names_map = {0: "head", 1: "mid", 2: "tail"}
@@ -2080,15 +2087,15 @@ def table_lira_paper(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
     accum          = {rk: {sc: [] for sc in scopes} for rk in row_keys}
 
     for seed in seeds:
-        lf1  = _load_lira("LF1", lira_dir, seed=seed)
-        cert = _load_cert("F1",  seed, cert_dir)
-        run  = _load_run("F1",   seed, runs_dir)
+        lf1  = _load_lira(lira_id, lira_dir, seed=seed)
+        cert = _load_cert(setting, seed, cert_dir)
+        run  = _load_run(setting,  seed, runs_dir)
 
         if not lf1 or "D_lira_members" not in lf1:
-            print(f"  [missing] D_lira_members LF1 seed={seed}"); continue
+            print(f"  [missing] D_lira_members {lira_id} seed={seed}"); continue
         if "epsilon_cert_dir_rank_100" not in cert or "epsilon_cert_norm" not in cert:
-            print(f"  [missing] cert arrays F1 seed={seed}"); continue
-        ml_path = os.path.join(runs_dir, "F1", f"seed_{seed}", "lira_member_local_idx.npy")
+            print(f"  [missing] cert arrays {setting} seed={seed}"); continue
+        ml_path = os.path.join(runs_dir, setting, f"seed_{seed}", "lira_member_local_idx.npy")
         if not os.path.exists(ml_path):
             print(f"  [missing] lira_member_local_idx.npy seed={seed}"); continue
 
@@ -2106,9 +2113,9 @@ def table_lira_paper(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
         loss_m     = losses_all[idx, -1] if losses_all is not None else None
 
         leverage = None
-        yp_path = os.path.join(runs_dir, "F1", f"seed_{seed}", "Y_projections.npy")
-        b_path  = os.path.join(runs_dir, "F1", f"seed_{seed}", "B_matrices.npy")
-        m_path  = os.path.join(runs_dir, "F1", f"seed_{seed}", "YTY_matrices.npy")
+        yp_path = os.path.join(runs_dir, setting, f"seed_{seed}", "Y_projections.npy")
+        b_path  = os.path.join(runs_dir, setting, f"seed_{seed}", "B_matrices.npy")
+        m_path  = os.path.join(runs_dir, setting, f"seed_{seed}", "YTY_matrices.npy")
         if os.path.exists(yp_path) and os.path.exists(b_path) and os.path.exists(m_path):
             Y_proj  = np.load(yp_path)
             B_mats  = np.load(b_path)
@@ -2118,7 +2125,7 @@ def table_lira_paper(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
                 Y_final, B_mats[-1].astype(np.float64),
                 M_mats[-1].astype(np.float64), mode="pinv")
         else:
-            print(f"  [missing] Nystrom matrices F1 seed={seed} — gen-leverage skipped.")
+            print(f"  [missing] Nystrom matrices {setting} seed={seed} — gen-leverage skipped.")
 
         def _rho(arr, D, mask=None):
             if arr is None: return float("nan")
@@ -2216,13 +2223,14 @@ def table_lira_paper(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
             (float(ft_tier)  if np.isfinite(ft_tier)  else None),
         "footnote_lt_iqr_spearman":
             (float(ft_ltiqr) if np.isfinite(ft_ltiqr) else None),
-        "provenance": ("F1×LF1 seeds 0,1,2 — mean Spearman; "
+        "provenance": (f"{tag_label} seeds {list(seeds)} — mean Spearman; "
                        "no new data generated"),
     }
     os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "table_lira_paper.json"), "w") as f:
+    json_name = f"table_lira_paper{out_suffix}.json"
+    with open(os.path.join(out_dir, json_name), "w") as f:
         json.dump(out_json, f, indent=2)
-    print(f"  [saved] {out_dir}/table_lira_paper.json")
+    print(f"  [saved] {out_dir}/{json_name}")
 
     # LaTeX
     def _tex(v):
@@ -2243,7 +2251,8 @@ def table_lira_paper(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
         lines.append(f"{row_tex[rk]} & {vals} \\\\")
     lines += [r"\bottomrule", r"\end{tabular}",
               f"% Footnote: tier-label ρ={ft_tier:.3f}; LT-IQR ρ={ft_ltiqr:.3f}"]
-    tex_path = os.path.join(out_dir, "table_lira_paper.tex")
+    tex_name = f"table_lira_paper{out_suffix}.tex"
+    tex_path = os.path.join(out_dir, tex_name)
     with open(tex_path, "w") as f:
         f.write("\n".join(lines) + "\n")
     print(f"  [saved] {tex_path}")
@@ -2819,8 +2828,10 @@ def main():
                         help="Produce all paper artifacts: figures A/B/C, tab:lira, paper_numbers.json")
     parser.add_argument("--paper_figures", action="store_true",
                         help="Figures A (fig:degeneracy), B (fig:withintier), C (fig:wrn)")
-    parser.add_argument("--paper_table",   action="store_true",
-                        help="table_lira_paper() — consolidated 4×4 correlation table")
+    parser.add_argument("--paper_table",    action="store_true",
+                        help="table_lira_paper() — consolidated 4×4 correlation table (S1/F1×LF1)")
+    parser.add_argument("--paper_table_s3", action="store_true",
+                        help="table_lira_paper(setting=F5,lira_id=LF5) — same table for S3")
     parser.add_argument("--paper_numbers", action="store_true",
                         help="emit_paper_numbers() — paper_numbers.json manifest")
     parser.add_argument("--paper_seed",    type=int, default=0,
@@ -2890,9 +2901,10 @@ def main():
     # ------------------------------------------------------------------
     # Paper-mode dispatch
     # ------------------------------------------------------------------
-    do_figures  = args.paper or args.paper_figures
-    do_table    = args.paper or args.paper_table
-    do_numbers  = args.paper or args.paper_numbers
+    do_figures   = args.paper or args.paper_figures
+    do_table     = args.paper or args.paper_table
+    do_table_s3  = args.paper or args.paper_table_s3
+    do_numbers   = args.paper or args.paper_numbers
 
     if do_figures:
         figure_degeneracy_s2(args.cert_dir, args.out_dir)
@@ -2901,7 +2913,12 @@ def main():
         figure_wrn_distribution_s3(args.cert_dir, args.runs_dir, args.out_dir)
 
     if do_table:
-        table_lira_paper(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir)
+        table_lira_paper(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,
+                         setting="F1", lira_id="LF1")
+
+    if do_table_s3:
+        table_lira_paper(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,
+                         setting="F5", lira_id="LF5")
 
     if do_numbers:
         emit_paper_numbers(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir)
