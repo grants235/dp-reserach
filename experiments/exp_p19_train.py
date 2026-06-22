@@ -16,11 +16,14 @@ Run matrix:
   F1: CLIP ViT-B/32 frozen + linear head, CIFAR-10-LT(50), ε=8, seeds 0,1,2
   F2: CLIP ViT-B/32 frozen + linear head, CIFAR-10,         ε=8, seeds 0,1,2
   F5: WRN-28-2 + GroupNorm, warm-started, CIFAR-10-LT(50), ε=8, seeds 0,1,2
+  F6: WRN-28-2 + GroupNorm, warm-started, CIFAR-10-LT(10), ε=8, seeds 0,1,2
+      [moderate LT control — model learns tail; tests ε^dir validity at lower IR]
 
 Usage:
   python experiments/exp_p19_train.py --run F1 --seed 0 --gpu 0
   python experiments/exp_p19_train.py --run F2 --seed 0 --gpu 0
   python experiments/exp_p19_train.py --run F5 --seed 0 --gpu 0
+  python experiments/exp_p19_train.py --run F6 --seed 0 --gpu 0
   python experiments/exp_p19_train.py --run F1 --all_seeds --gpu 0
 """
 
@@ -46,10 +49,11 @@ RUNS = {
     "F1": dict(dataset="cifar10_lt50", regime="R3", eps=8.0, B_expected=1400, n_seeds=3, epochs=40),
     "F2": dict(dataset="cifar10",      regime="R3", eps=8.0, B_expected=5000, n_seeds=3, epochs=40),
     "F5": dict(dataset="cifar10_lt50", regime="R2", eps=8.0, B_expected=1400, n_seeds=3, epochs=60),
+    "F6": dict(dataset="cifar10_lt10", regime="R2", eps=8.0, B_expected=2000, n_seeds=3, epochs=50),
 }
 
 # LiRA targets per run
-LIRA_N_TARGETS = {"F1": 1500, "F2": 1000, "F5": 300}
+LIRA_N_TARGETS = {"F1": 1500, "F2": 1000, "F5": 300, "F6": 600}
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -154,10 +158,17 @@ def _load_clip_features(data_root, cache_dir, device):
     return tf_f, tf_l, te_f, te_l
 
 
+def _parse_lt_ir(dataset_name):
+    """Extract imbalance ratio from dataset name, e.g. 'cifar10_lt10' → 10."""
+    import re
+    m = re.search(r'lt(\d+)', dataset_name)
+    return int(m.group(1)) if m else 1
+
+
 def build_dataset_clip(dataset_name, data_root, cache_dir, device):
     """Returns dataset for CLIP linear-probe runs (F1, F2)."""
     is_lt  = "lt" in dataset_name
-    lt_ir  = 50 if "lt50" in dataset_name else (100 if "lt100" in dataset_name else 1)
+    lt_ir  = _parse_lt_ir(dataset_name)
     tf_f, tf_l, te_f, te_l = _load_clip_features(data_root, cache_dir, device)
     full_targets = tf_l.numpy(); all_idx = np.arange(len(full_targets))
     lt_idx   = make_cifar10_lt_indices(full_targets, lt_ir, seed=42) if is_lt else all_idx
@@ -174,9 +185,9 @@ def build_dataset_clip(dataset_name, data_root, cache_dir, device):
 
 
 def build_dataset_wrn(dataset_name, data_root):
-    """Returns dataset for WRN runs (F5). NO random augmentation."""
+    """Returns dataset for WRN runs (F5, F6). NO random augmentation."""
     is_lt = "lt" in dataset_name
-    lt_ir = 50 if "lt50" in dataset_name else (100 if "lt100" in dataset_name else 1)
+    lt_ir = _parse_lt_ir(dataset_name)
     # Use no-augmentation dataset for both private training and accounting
     train_noaug = _cifar10_noaug(data_root, train=True)
     test_noaug  = _cifar10_noaug(data_root, train=False)
@@ -626,7 +637,7 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
     a            = (sigma * CLIP_C) ** 2
 
     print(f"  n={n_priv}  q={q:.5f}  T_train={T_train}  σ={sigma:.4f}  a={a:.6f}")
-    _q_spec = {"F1": 1/9, "F2": 1/9, "F5": 1/9}
+    _q_spec = {"F1": 1/9, "F2": 1/9, "F5": 1/9, "F6": 1/9}
     if run_id in _q_spec and abs(q - _q_spec[run_id]) > 0.02:
         print(f"  [WARN] q={q:.5f} deviates from spec value {_q_spec[run_id]:.5f} "
               f"for {run_id} — n_priv={n_priv} vs spec n≈{round(B_exp/_q_spec[run_id])}. "
