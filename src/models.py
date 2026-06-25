@@ -278,13 +278,52 @@ class PurchaseFC(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# MNISTConvNet — Tramer & Boneh 2021 "SampleConvNet" for MNIST/FashionMNIST
+# ---------------------------------------------------------------------------
+
+class MNISTConvNet(nn.Module):
+    """
+    SampleConvNet from Tramer & Boneh ICLR 2021 ("Differentially private learning
+    needs better features"). Standard DP-SGD MNIST benchmark CNN.
+
+    Architecture: Conv→Tanh→MaxPool→Conv→Tanh→MaxPool→FC→Tanh→FC
+    Tanh activations: no BatchNorm/GroupNorm needed — inherently DP-compatible.
+    ~26k parameters. Input: (B, 1, 28, 28) for MNIST or FashionMNIST.
+    """
+
+    def __init__(self, num_classes: int = 10):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 16, kernel_size=8, stride=2, padding=3)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=4, stride=2)
+        self.fc1   = nn.Linear(32 * 4 * 4, 32)
+        self.fc2   = nn.Linear(32, num_classes)
+
+    def forward(self, x):
+        x = torch.tanh(self.conv1(x))
+        x = F.max_pool2d(x, kernel_size=2, stride=1)
+        x = torch.tanh(self.conv2(x))
+        x = F.max_pool2d(x, kernel_size=2, stride=1)
+        x = x.reshape(x.size(0), -1)
+        x = torch.tanh(self.fc1(x))
+        return self.fc2(x)
+
+    def features(self, x):
+        x = torch.tanh(self.conv1(x))
+        x = F.max_pool2d(x, kernel_size=2, stride=1)
+        x = torch.tanh(self.conv2(x))
+        x = F.max_pool2d(x, kernel_size=2, stride=1)
+        x = x.reshape(x.size(0), -1)
+        return torch.tanh(self.fc1(x))
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
 def make_model(arch: str, num_classes: int, n_groups: int = N_GROUPS) -> nn.Module:
     """
-    arch: 'wrn28-2' | 'resnet20' | 'tinycnn' | 'purchase_fc'
-    Returns model with GroupNorm instead of BatchNorm.
+    arch: 'wrn28-2' | 'resnet20' | 'tinycnn' | 'purchase_fc' | 'dpconv'
+    Returns model with GroupNorm instead of BatchNorm (except Tanh-based models).
     """
     if arch == "wrn28-2":
         return WideResNet(depth=28, widen_factor=2, dropout_rate=0.0,
@@ -295,6 +334,8 @@ def make_model(arch: str, num_classes: int, n_groups: int = N_GROUPS) -> nn.Modu
         return TinyCNN(num_classes=num_classes)
     elif arch == "purchase_fc":
         return PurchaseFC(num_classes=num_classes)
+    elif arch == "dpconv":
+        return MNISTConvNet(num_classes=num_classes)
     else:
         raise ValueError(f"Unknown architecture: {arch}")
 

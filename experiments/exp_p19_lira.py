@@ -44,7 +44,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.datasets import make_public_private_split, make_cifar10_lt_indices, make_lt_indices, load_purchase100
-from src.models import WideResNet, PurchaseFC
+from src.models import WideResNet, PurchaseFC, MNISTConvNet
 
 import torchvision
 import torchvision.transforms as T
@@ -60,9 +60,9 @@ LIRA_SETTINGS = {
                 n_targets=1000, n_shadows=64,  shadow_epochs=20),
     "LF5": dict(matched_run="F5", seeds=[0, 1, 2], dataset="cifar10_lt50", regime="R2",
                 n_targets=300,  n_shadows=128, shadow_epochs=30),
-    "LF7": dict(matched_run="F7", seeds=[0, 1, 2], dataset="purchase100_lt10", regime="R2",
-                arch="purchase_fc", num_classes=100,
-                n_targets=600,  n_shadows=64,  shadow_epochs=15),
+    "LF7": dict(matched_run="F7", seeds=[0, 1, 2], dataset="mnist_lt10", regime="R2",
+                arch="dpconv", num_classes=10,
+                n_targets=600,  n_shadows=64,  shadow_epochs=20),
 }
 
 DATA_ROOT  = "./data"
@@ -106,6 +106,16 @@ def _cifar10_test(data_root):
     m, s = (0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)
     tf = T.Compose([T.ToTensor(), T.Normalize(m, s)])
     return torchvision.datasets.CIFAR10(root=data_root, train=False, download=True, transform=tf)
+
+
+def _mnist_noaug_train(data_root):
+    tf = T.Compose([T.ToTensor(), T.Normalize((0.1307,), (0.3081,))])
+    return torchvision.datasets.MNIST(root=data_root, train=True, download=True, transform=tf)
+
+
+def _mnist_noaug_test(data_root):
+    tf = T.Compose([T.ToTensor(), T.Normalize((0.1307,), (0.3081,))])
+    return torchvision.datasets.MNIST(root=data_root, train=False, download=True, transform=tf)
 
 
 def _load_clip_features(data_root, cache_dir):
@@ -203,6 +213,8 @@ def make_shadow_model(regime, num_classes, arch="wrn28-2"):
         return LinearHead(num_classes, feat_dim=512)
     if arch == "purchase_fc":
         return PurchaseFC(num_classes=num_classes)
+    if arch == "dpconv":
+        return MNISTConvNet(num_classes=num_classes)
     return WideResNet(depth=28, widen_factor=2, num_classes=num_classes, n_groups=N_GROUPS)
 
 
@@ -387,6 +399,7 @@ def run_lira(lira_id, cfg, shadow_start, shadow_end, device,
     n_epochs    = cfg["shadow_epochs"]
     is_clip     = (regime == "R3")
     is_purchase = "purchase" in dataset
+    is_mnist    = "mnist" in dataset and "fmnist" not in dataset
 
     out_dir = os.path.join(lira_dir, lira_id, f"seed_{run_seed}")
     os.makedirs(out_dir, exist_ok=True)
@@ -415,6 +428,12 @@ def run_lira(lira_id, cfg, shadow_start, shadow_end, device,
         X_all, y_all, X_test, y_test, _, full_targets = build_full_dataset_purchase(
             dataset, data_root)
         nonmember_labels = y_test[nonmember_test]
+    elif is_mnist:
+        train_ds  = _mnist_noaug_train(data_root)
+        noaug_priv = train_ds  # no augmentation for MNIST
+        test_ds   = _mnist_noaug_test(data_root)
+        full_targets = np.array(train_ds.targets)
+        nonmember_labels = np.array(test_ds.targets)[nonmember_test]
     else:
         train_ds_aug = _cifar10_aug(data_root)
         noaug_priv   = _cifar10_noaug(data_root)
@@ -464,6 +483,15 @@ def run_lira(lira_id, cfg, shadow_start, shadow_end, device,
 
             member_logits    = eval_logits_purchase(model, X_all[priv_idx[member_local]], device)
             nonmember_logits = eval_logits_purchase(model, X_test[nonmember_test], device)
+
+        elif is_mnist:
+            shadow_train_global = priv_idx[shadow_in_local]
+            model = make_shadow_model(regime, num_classes, arch).to(device)
+            train_shadow_wrn(model, shadow_train_global, noaug_priv, n_epochs, device, seed=m)
+
+            member_global    = priv_idx[member_local]
+            member_logits    = eval_logits_wrn(model, noaug_priv, member_global, device)
+            nonmember_logits = eval_logits_wrn(model, test_ds, nonmember_test, device)
 
         else:
             shadow_train_global = priv_idx[shadow_in_local]

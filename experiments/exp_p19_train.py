@@ -18,8 +18,8 @@ Run matrix:
   F5: WRN-28-2 + GroupNorm, warm-started, CIFAR-10-LT(50), ε=8, seeds 0,1,2
   F6: ResNet-20 + GroupNorm, warm-started, CIFAR-10-LT(10), ε=8, seeds 0,1,2
       [~270k params — still too large for DP at ε=8 to converge]
-  F7: PurchaseFC (~180k params), from-scratch, Purchase-100-LT(50), ε=8, seeds 0,1,2
-      [tabular data; n~36k large batches → strong SNR; FC gradient rank ≤ 100 → effective noise low]
+  F7: MNISTConvNet (~26k params, Tramer-Boneh ICLR2021 SampleConvNet), from-scratch,
+      MNIST-LT(10), ε=8, seeds 0,1,2  [Tanh CNN, no GroupNorm needed, B=512, LR=0.6]
 
 Usage:
   python experiments/exp_p19_train.py --run F1 --seed 0 --gpu 0
@@ -39,7 +39,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.datasets import make_public_private_split, make_cifar10_lt_indices, make_lt_indices, load_purchase100
-from src.models import WideResNet, ResNet20, TinyCNN, PurchaseFC
+from src.models import WideResNet, ResNet20, TinyCNN, PurchaseFC, MNISTConvNet
 
 import torchvision
 import torchvision.transforms as T
@@ -53,8 +53,8 @@ RUNS = {
     "F2": dict(dataset="cifar10",      regime="R3", arch="clip_linear", eps=8.0, B_expected=5000, n_seeds=3, epochs=40),
     "F5": dict(dataset="cifar10_lt50", regime="R2", arch="wrn28-2",     eps=8.0, B_expected=1400, n_seeds=3, epochs=60),
     "F6": dict(dataset="cifar10_lt10", regime="R2", arch="resnet20",    eps=8.0, B_expected=2000, n_seeds=3, epochs=60),
-    "F7": dict(dataset="purchase100_lt10", regime="R2", arch="purchase_fc", eps=8.0,
-               B_expected=10000, n_seeds=3, epochs=25, r_max=100),
+    "F7": dict(dataset="mnist_lt10", regime="R2", arch="dpconv", eps=8.0,
+               B_expected=512, n_seeds=3, epochs=80, lr=0.6, r_max=100),
 }
 
 # LiRA targets per run
@@ -71,6 +71,7 @@ CHUNK_WRN      = 32      # WRN-28-2 per-sample grad chunk size (memory-limited)
 CHUNK_RN20     = 128     # ResNet-20 per-sample grad chunk size (~270k params, lighter)
 CHUNK_TINY     = 512     # TinyCNN per-sample grad chunk size (~24k params, very light)
 CHUNK_PURCHASE = 1024    # PurchaseFC per-sample grad chunk size (linear layers, very light)
+CHUNK_DPCONV   = 512     # MNISTConvNet per-sample grad chunk size (~26k params, conv+Tanh)
 DATA_ROOT   = "./data"
 CACHE_DIR   = "./data/clip_features"
 RUNS_DIR    = "./runs/p19"
@@ -265,6 +266,41 @@ def build_dataset_fmnist(dataset_name, data_root):
             class_counts, pub_x, pub_y, pub_idx, test_ds, test_labels_np)
 
 
+def _mnist_noaug(data_root, train=True):
+    """MNIST without augmentation (deterministic grads required for accounting)."""
+    tf = T.Compose([T.ToTensor(), T.Normalize((0.1307,), (0.3081,))])
+    return torchvision.datasets.MNIST(root=data_root, train=train,
+                                      download=True, transform=tf)
+
+
+def build_dataset_mnist(dataset_name, data_root):
+    """Returns dataset for MNISTConvNet runs (F7). Matches Tramer-Boneh ICLR2021 setup.
+
+    No augmentation (Tanh CNN, from-scratch training; warm-start skipped via pub_x=None).
+    Returns same 12-tuple format as build_dataset_wrn for uniform downstream handling.
+    """
+    is_lt = "lt" in dataset_name
+    lt_ir = _parse_lt_ir(dataset_name) if is_lt else 1
+    train_ds    = _mnist_noaug(data_root, train=True)
+    test_ds     = _mnist_noaug(data_root, train=False)
+    full_targets = np.array(train_ds.targets)
+    lt_idx = make_lt_indices(full_targets, lt_ir, num_classes=10, seed=42) if is_lt \
+             else np.arange(len(train_ds))
+    lt_targets = full_targets[lt_idx]
+    pub_idx, priv_idx = make_public_private_split(lt_idx, lt_targets, public_frac=0.1, seed=42)
+    priv_ds = _IndexedSubset(train_ds, priv_idx)
+    tier_labels = (np.array([class_to_tier(c) for c in full_targets[priv_idx]], dtype=np.int32)
+                   if is_lt else None)
+    class_counts = np.bincount(full_targets[priv_idx], minlength=10)
+    priv_labels_np = full_targets[priv_idx].astype(np.int32)
+    test_labels_np = np.array(test_ds.targets)
+    print(f"  [MNIST] n_priv={len(priv_idx)}  n_pub={len(pub_idx)}  "
+          f"n_test={len(test_ds)}  lt_ir={lt_ir}")
+    # pub_x=None → warm-start skipped automatically; pub_idx retained for metadata
+    return (priv_ds, priv_idx, priv_labels_np, tier_labels, 10, 1e-5,
+            class_counts, None, None, pub_idx, test_ds, test_labels_np)
+
+
 def build_dataset_purchase(dataset_name, data_root):
     """
     Returns dataset for PurchaseFC runs (F7). No augmentation (tabular data).
@@ -355,6 +391,8 @@ def make_model(regime, num_classes, arch="wrn28-2"):
         return TinyCNN(num_classes=num_classes)
     if arch == "purchase_fc":
         return PurchaseFC(num_classes=num_classes)
+    if arch == "dpconv":
+        return MNISTConvNet(num_classes=num_classes)
     return WideResNet(depth=28, widen_factor=2, num_classes=num_classes, n_groups=N_GROUPS)
 
 
@@ -730,9 +768,12 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
     epochs  = cfg["epochs"]
     is_clip    = (regime == "R3")
     is_purchase = "purchase" in dataset
+    is_mnist   = "mnist" in dataset and "fmnist" not in dataset
     chunk_size = (CHUNK_PURCHASE if arch == "purchase_fc" else
+                  CHUNK_DPCONV  if arch == "dpconv"      else
                   CHUNK_TINY    if arch == "tinycnn"     else
                   CHUNK_RN20    if arch == "resnet20"    else CHUNK_WRN)
+    lr = cfg.get("lr", LR)
     r_max = cfg.get("r_max", R_MAX)
 
     run_dir = os.path.join(runs_dir, run_id, f"seed_{seed}")
@@ -769,6 +810,12 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
         pub_x = pub_y = None
         pub_idx = np.array([], dtype=np.int32)
         n_priv = len(priv_idx)
+    elif is_mnist:
+        (priv_ds, priv_idx, priv_labels_np, tier_labels, num_classes, delta,
+         class_counts, pub_x, pub_y, pub_idx_wrn, test_ds, test_labels_np) = \
+            build_dataset_mnist(dataset, data_root)
+        n_priv = len(priv_idx)
+        pub_idx = pub_idx_wrn
     elif "fmnist" in dataset:
         (priv_ds, priv_idx, priv_labels_np, tier_labels, num_classes, delta,
          class_counts, pub_x, pub_y, pub_idx_wrn, test_ds, test_labels_np) = \
@@ -791,7 +838,7 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
     a            = (sigma * CLIP_C) ** 2
 
     print(f"  n={n_priv}  q={q:.5f}  T_train={T_train}  σ={sigma:.4f}  a={a:.6f}")
-    _q_spec = {"F1": 1/9, "F2": 1/9, "F5": 1/9, "F6": 1/9, "F7": 1/9}
+    _q_spec = {"F1": 1/9, "F2": 1/9, "F5": 1/9, "F6": 1/9}
     if run_id in _q_spec and abs(q - _q_spec[run_id]) > 0.02:
         print(f"  [WARN] q={q:.5f} deviates from spec value {_q_spec[run_id]:.5f} "
               f"for {run_id} — n_priv={n_priv} vs spec n≈{round(B_exp/_q_spec[run_id])}. "
@@ -804,7 +851,7 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
     d_params = sum(p.numel() for p in model.parameters())
     print(f"  d_params={d_params:,}")
 
-    optimizer = torch.optim.SGD(model.parameters(), lr=LR, momentum=0.0, weight_decay=0.0)
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.0, weight_decay=0.0)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     # --- Pre-allocate accounting arrays (always memmapped for resume safety) ---
@@ -865,8 +912,8 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
             rng_p = np.random.default_rng(_step_seed(run_id, seed, t_past))
             all_inclusions[t_past] = rng_p.random(n_priv) < q
     else:
-        # WRN/FashionMNIST warm-start only on fresh run; Purchase-100 trains from scratch
-        if not is_clip and not is_purchase:
+        # WRN/FashionMNIST warm-start only on fresh run; Purchase-100/MNIST train from scratch
+        if not is_clip and not is_purchase and not is_mnist and pub_x is not None:
             pretrain_wrn(model, pub_x.to(device), pub_y.to(device), device)
 
     # For CLIP, keep features on device
@@ -1147,11 +1194,12 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
         "seed":             seed,
         "dataset":          dataset,
         "regime":           regime,
-        "architecture":     ("CLIP_ViT_B_32_linear"  if is_clip
-                             else ("PurchaseFC_256"      if arch == "purchase_fc"
-                                   else ("TinyCNN_GroupNorm"   if arch == "tinycnn"
-                                         else ("ResNet-20_GroupNorm16" if arch == "resnet20"
-                                               else "WRN-28-2_GroupNorm16")))),
+        "architecture":     ("CLIP_ViT_B_32_linear"    if is_clip
+                             else ("PurchaseFC_256"       if arch == "purchase_fc"
+                                   else ("MNISTConvNet_dpconv" if arch == "dpconv"
+                                         else ("TinyCNN_GroupNorm"    if arch == "tinycnn"
+                                               else ("ResNet-20_GroupNorm16" if arch == "resnet20"
+                                                     else "WRN-28-2_GroupNorm16"))))),
         "n_train":          int(n_priv),
         "B_expected":       int(B_exp),
         "q":                float(q),
