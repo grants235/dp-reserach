@@ -53,7 +53,7 @@ RUNS = {
     "F2": dict(dataset="cifar10",      regime="R3", arch="clip_linear", eps=8.0, B_expected=5000, n_seeds=3, epochs=40),
     "F5": dict(dataset="cifar10_lt50", regime="R2", arch="wrn28-2",     eps=8.0, B_expected=1400, n_seeds=3, epochs=60),
     "F6": dict(dataset="cifar10_lt10", regime="R2", arch="resnet20",    eps=8.0, B_expected=2000, n_seeds=3, epochs=60),
-    "F7": dict(dataset="purchase100_lt50", regime="R2", arch="purchase_fc", eps=8.0,
+    "F7": dict(dataset="purchase100_lt10", regime="R2", arch="purchase_fc", eps=8.0,
                B_expected=10000, n_seeds=3, epochs=25, r_max=100),
 }
 

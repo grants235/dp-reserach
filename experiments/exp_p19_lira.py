@@ -60,7 +60,7 @@ LIRA_SETTINGS = {
                 n_targets=1000, n_shadows=64,  shadow_epochs=20),
     "LF5": dict(matched_run="F5", seeds=[0, 1, 2], dataset="cifar10_lt50", regime="R2",
                 n_targets=300,  n_shadows=128, shadow_epochs=30),
-    "LF7": dict(matched_run="F7", seeds=[0, 1, 2], dataset="purchase100_lt50", regime="R2",
+    "LF7": dict(matched_run="F7", seeds=[0, 1, 2], dataset="purchase100_lt10", regime="R2",
                 arch="purchase_fc", num_classes=100,
                 n_targets=600,  n_shadows=64,  shadow_epochs=15),
 }
