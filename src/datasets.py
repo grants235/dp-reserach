@@ -337,30 +337,50 @@ def load_purchase100(data_root: str):
     Load Purchase-100 dataset (Shokri et al. 2017, Carlini et al. 2022 LiRA benchmark).
 
     Dataset: 197,324 records × 600 binary purchase-category features, 100 classes.
-    Expected files (either is fine):
-      - purchase100.npz  (cached numpy arrays)
-      - dataset_purchase (raw CSV: first column = class label 1-indexed)
+    Auto-downloads from the NUS server if not present locally. Caches as .npz.
 
     Returns (X, y) where:
       X: np.float32 array of shape (N, 600)
       y: np.int64 array of shape (N,) with values in [0, 99]
     """
+    import urllib.request
+    import tarfile
+
+    os.makedirs(data_root, exist_ok=True)
     npz_path = os.path.join(data_root, "purchase100.npz")
+    txt_path = os.path.join(data_root, "dataset_purchase")
+    tgz_path = os.path.join(data_root, "dataset_purchase.tgz")
+    url      = "https://www.comp.nus.edu.sg/~reza/files/dataset_purchase.tgz"
+
     if os.path.exists(npz_path):
         d = np.load(npz_path)
         return d["X"].astype(np.float32), d["y"].astype(np.int64)
 
-    txt_path = os.path.join(data_root, "dataset_purchase")
+    if not os.path.exists(txt_path):
+        if not os.path.exists(tgz_path):
+            print(f"  [Purchase-100] Downloading from {url} ...")
+            def _progress(count, block_size, total_size):
+                pct = min(100.0, count * block_size * 100.0 / total_size)
+                print(f"\r    {pct:.1f}%", end="", flush=True)
+            urllib.request.urlretrieve(url, tgz_path, reporthook=_progress)
+            print()
+        print(f"  [Purchase-100] Extracting {tgz_path} ...")
+        with tarfile.open(tgz_path, "r:gz") as tar:
+            tar.extractall(path=data_root)
+        if os.path.exists(tgz_path):
+            os.remove(tgz_path)
+
     if not os.path.exists(txt_path):
         raise FileNotFoundError(
-            f"Purchase-100 not found. Expected one of:\n"
-            f"  {npz_path}\n"
-            f"  {txt_path}\n"
-            f"Download from: https://www.comp.nus.edu.sg/~reza/files/dataset_purchase.tgz"
+            f"Extraction succeeded but 'dataset_purchase' not found under {data_root}. "
+            f"Check the archive contents."
         )
+
+    print(f"  [Purchase-100] Parsing CSV (this takes ~30s) ...")
     data = np.loadtxt(txt_path, delimiter=",", dtype=np.float32)
     y = (data[:, 0] - 1).astype(np.int64)
     X = data[:, 1:]
+    print(f"  [Purchase-100] Saving cache to {npz_path} ...")
     np.savez_compressed(npz_path, X=X, y=y)
     return X, y
 
