@@ -17,7 +17,9 @@ Run matrix:
   F2: CLIP ViT-B/32 frozen + linear head, CIFAR-10,         ε=8, seeds 0,1,2
   F5: WRN-28-2 + GroupNorm, warm-started, CIFAR-10-LT(50), ε=8, seeds 0,1,2
   F6: ResNet-20 + GroupNorm, warm-started, CIFAR-10-LT(10), ε=8, seeds 0,1,2
-      [~270k params; moderate LT; small enough for DP to leave signal]
+      [~270k params — still too large for DP at ε=8 to converge]
+  F7: TinyCNN (~24k params), warm-started, FashionMNIST-LT(10), ε=8, seeds 0,1,2
+      [from-scratch; small enough for DP noise to leave gradient signal]
 
 Usage:
   python experiments/exp_p19_train.py --run F1 --seed 0 --gpu 0
@@ -35,8 +37,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, Subset
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from src.datasets import make_public_private_split, make_cifar10_lt_indices
-from src.models import WideResNet, ResNet20
+from src.datasets import make_public_private_split, make_cifar10_lt_indices, make_lt_indices
+from src.models import WideResNet, ResNet20, TinyCNN
 
 import torchvision
 import torchvision.transforms as T
@@ -50,10 +52,11 @@ RUNS = {
     "F2": dict(dataset="cifar10",      regime="R3", arch="clip_linear", eps=8.0, B_expected=5000, n_seeds=3, epochs=40),
     "F5": dict(dataset="cifar10_lt50", regime="R2", arch="wrn28-2",     eps=8.0, B_expected=1400, n_seeds=3, epochs=60),
     "F6": dict(dataset="cifar10_lt10", regime="R2", arch="resnet20",    eps=8.0, B_expected=2000, n_seeds=3, epochs=60),
+    "F7": dict(dataset="fmnist_lt10",  regime="R2", arch="tinycnn",     eps=8.0, B_expected=2500, n_seeds=3, epochs=40),
 }
 
 # LiRA targets per run
-LIRA_N_TARGETS = {"F1": 1500, "F2": 1000, "F5": 300, "F6": 600}
+LIRA_N_TARGETS = {"F1": 1500, "F2": 1000, "F5": 300, "F6": 600, "F7": 600}
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -64,6 +67,7 @@ R_MAX       = 200        # Nyström rank
 CHUNK_R3    = 512        # CLIP per-sample grad chunk size
 CHUNK_WRN   = 32         # WRN-28-2 per-sample grad chunk size (memory-limited)
 CHUNK_RN20  = 128        # ResNet-20 per-sample grad chunk size (~270k params, lighter)
+CHUNK_TINY  = 512        # TinyCNN per-sample grad chunk size (~24k params, very light)
 DATA_ROOT   = "./data"
 CACHE_DIR   = "./data/clip_features"
 RUNS_DIR    = "./runs/p19"
@@ -211,6 +215,37 @@ def build_dataset_wrn(dataset_name, data_root):
             class_counts, pub_x, pub_y, pub_idx, test_noaug, test_labels_np)
 
 
+def _fmnist_noaug(data_root, train=True):
+    """FashionMNIST without augmentation (deterministic grads required)."""
+    tf = T.Compose([T.ToTensor(), T.Normalize((0.2860,), (0.3530,))])
+    return torchvision.datasets.FashionMNIST(root=data_root, train=train,
+                                              download=True, transform=tf)
+
+
+def build_dataset_fmnist(dataset_name, data_root):
+    """Returns dataset for TinyCNN FashionMNIST runs (F7). No augmentation."""
+    is_lt = "lt" in dataset_name
+    lt_ir = _parse_lt_ir(dataset_name)
+    train_ds    = _fmnist_noaug(data_root, train=True)
+    test_ds     = _fmnist_noaug(data_root, train=False)
+    full_targets = np.array(train_ds.targets)
+    lt_idx = make_lt_indices(full_targets, lt_ir, seed=42) if is_lt else np.arange(len(train_ds))
+    lt_targets = full_targets[lt_idx]
+    pub_idx, priv_idx = make_public_private_split(lt_idx, lt_targets, public_frac=0.1, seed=42)
+    rng_pub = np.random.default_rng(42)
+    pub_use = pub_idx[rng_pub.permutation(len(pub_idx))[:N_PUB_WRN]]
+    priv_ds = _IndexedSubset(train_ds, priv_idx)
+    pub_x = torch.stack([train_ds[int(i)][0] for i in pub_use])
+    pub_y = torch.tensor([int(full_targets[i]) for i in pub_use], dtype=torch.long)
+    tier_labels = (np.array([class_to_tier(c) for c in full_targets[priv_idx]], dtype=np.int32)
+                   if is_lt else None)
+    class_counts = np.bincount(full_targets[priv_idx], minlength=10)
+    priv_labels_np = full_targets[priv_idx].astype(np.int32)
+    test_labels_np = np.array(test_ds.targets)
+    return (priv_ds, priv_idx, priv_labels_np, tier_labels, 10, 1e-5,
+            class_counts, pub_x, pub_y, pub_idx, test_ds, test_labels_np)
+
+
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
@@ -227,6 +262,8 @@ def make_model(regime, num_classes, arch="wrn28-2"):
         return LinearHead(num_classes, feat_dim=512)
     if arch == "resnet20":
         return ResNet20(num_classes=num_classes, n_groups=N_GROUPS)
+    if arch == "tinycnn":
+        return TinyCNN(num_classes=num_classes)
     return WideResNet(depth=28, widen_factor=2, num_classes=num_classes, n_groups=N_GROUPS)
 
 
@@ -597,7 +634,8 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
     B_exp   = cfg["B_expected"]
     epochs  = cfg["epochs"]
     is_clip = (regime == "R3")
-    chunk_size = CHUNK_RN20 if arch == "resnet20" else CHUNK_WRN
+    chunk_size = (CHUNK_TINY if arch == "tinycnn" else
+                  CHUNK_RN20 if arch == "resnet20" else CHUNK_WRN)
 
     run_dir = os.path.join(runs_dir, run_id, f"seed_{seed}")
     os.makedirs(run_dir, exist_ok=True)
@@ -626,6 +664,12 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
         test_labels_np = te_labels.numpy()
         priv_labels_np = priv_labels.numpy().astype(np.int32)
         n_priv = len(priv_idx)
+    elif "fmnist" in dataset:
+        (priv_ds, priv_idx, priv_labels_np, tier_labels, num_classes, delta,
+         class_counts, pub_x, pub_y, pub_idx_wrn, test_ds, test_labels_np) = \
+            build_dataset_fmnist(dataset, data_root)
+        n_priv = len(priv_idx)
+        pub_idx = pub_idx_wrn
     else:
         (priv_ds, priv_idx, priv_labels_np, tier_labels, num_classes, delta,
          class_counts, pub_x, pub_y, pub_idx_wrn, test_ds, test_labels_np) = \
@@ -642,7 +686,7 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
     a            = (sigma * CLIP_C) ** 2
 
     print(f"  n={n_priv}  q={q:.5f}  T_train={T_train}  σ={sigma:.4f}  a={a:.6f}")
-    _q_spec = {"F1": 1/9, "F2": 1/9, "F5": 1/9, "F6": 1/9}
+    _q_spec = {"F1": 1/9, "F2": 1/9, "F5": 1/9, "F6": 1/9, "F7": 1/9}
     if run_id in _q_spec and abs(q - _q_spec[run_id]) > 0.02:
         print(f"  [WARN] q={q:.5f} deviates from spec value {_q_spec[run_id]:.5f} "
               f"for {run_id} — n_priv={n_priv} vs spec n≈{round(B_exp/_q_spec[run_id])}. "
@@ -999,8 +1043,9 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
         "dataset":          dataset,
         "regime":           regime,
         "architecture":     ("CLIP_ViT_B_32_linear" if is_clip
-                             else ("ResNet-20_GroupNorm16" if arch == "resnet20"
-                                   else "WRN-28-2_GroupNorm16")),
+                             else ("TinyCNN_GroupNorm" if arch == "tinycnn"
+                                   else ("ResNet-20_GroupNorm16" if arch == "resnet20"
+                                         else "WRN-28-2_GroupNorm16"))),
         "n_train":          int(n_priv),
         "B_expected":       int(B_exp),
         "q":                float(q),

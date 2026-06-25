@@ -80,6 +80,30 @@ class IndexedDataset(Dataset):
         return [self.dataset.targets[idx] for idx in self.indices]
 
 
+def make_lt_indices(full_targets, imbalance_ratio: float, num_classes: int = 10,
+                    seed: int = 42):
+    """
+    Generic long-tailed index builder for any balanced dataset.
+
+    Derives n_max from the class with the most examples, then applies
+    n_c = n_max * IR^{-c/(num_classes-1)} for c in {0, ..., num_classes-1}.
+    Works for CIFAR-10 (n_max=5000) and FashionMNIST (n_max=6000) alike.
+    """
+    rng = np.random.default_rng(seed)
+    targets = np.asarray(full_targets)
+    class_counts = np.bincount(targets, minlength=num_classes)
+    n_max = int(class_counts.max())
+
+    selected = []
+    for c in range(num_classes):
+        n_c = max(1, int(n_max * (imbalance_ratio ** (-c / (num_classes - 1)))))
+        n_c = min(n_c, int(class_counts[c]))
+        class_idx = np.where(targets == c)[0]
+        chosen = rng.choice(class_idx, size=n_c, replace=False)
+        selected.append(chosen)
+    return np.concatenate(selected)
+
+
 def make_cifar10_lt_indices(full_targets, imbalance_ratio: float, seed: int = 42):
     """
     Compute per-class sample indices for long-tailed CIFAR-10.

@@ -7,6 +7,7 @@ compatibility. Verified via Opacus ModuleValidator.
 Architectures:
 - WideResNet-28-2  (~1.5M params)  primary model
 - ResNet-20        (~0.27M params) secondary model
+- TinyCNN          (~24k params)   FashionMNIST from-scratch DP model
 """
 
 import torch
@@ -196,12 +197,58 @@ class ResNet20(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# TinyCNN — FashionMNIST from-scratch DP model (~24k params)
+# ---------------------------------------------------------------------------
+
+class TinyCNN(nn.Module):
+    """
+    3-conv network for FashionMNIST (1×28×28 input). ~24k parameters.
+
+    Small enough for DP-SGD at ε=8 to leave a usable gradient signal,
+    unlike WRN-28-2 (~1.5M) or ResNet-20 (~270k) on CIFAR-10.
+    GroupNorm throughout for DP compatibility.
+    """
+
+    def __init__(self, num_classes: int = 10, n_groups: int = 4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1, 16, 3, padding=1, bias=False),   # 1×28×28 → 16×28×28
+            nn.GroupNorm(4, 16), nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),                                # → 16×14×14
+
+            nn.Conv2d(16, 32, 3, padding=1, bias=False),  # → 32×14×14
+            nn.GroupNorm(8, 32), nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),                                # → 32×7×7
+
+            nn.Conv2d(32, 64, 3, padding=1, bias=False),  # → 64×7×7
+            nn.GroupNorm(8, 64), nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),                        # → 64×1×1
+        )
+        self.fc = nn.Linear(64, num_classes)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        return self.fc(self.net(x).flatten(1))
+
+    def features(self, x):
+        return self.net(x).flatten(1)
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
 def make_model(arch: str, num_classes: int, n_groups: int = N_GROUPS) -> nn.Module:
     """
-    arch: 'wrn28-2' | 'resnet20'
+    arch: 'wrn28-2' | 'resnet20' | 'tinycnn'
     Returns model with GroupNorm instead of BatchNorm.
     """
     if arch == "wrn28-2":
@@ -209,6 +256,8 @@ def make_model(arch: str, num_classes: int, n_groups: int = N_GROUPS) -> nn.Modu
                           num_classes=num_classes, n_groups=n_groups)
     elif arch == "resnet20":
         return ResNet20(num_classes=num_classes, n_groups=n_groups)
+    elif arch == "tinycnn":
+        return TinyCNN(num_classes=num_classes)
     else:
         raise ValueError(f"Unknown architecture: {arch}")
 
