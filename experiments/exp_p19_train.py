@@ -16,14 +16,14 @@ Run matrix:
   F1: CLIP ViT-B/32 frozen + linear head, CIFAR-10-LT(50), ε=8, seeds 0,1,2
   F2: CLIP ViT-B/32 frozen + linear head, CIFAR-10,         ε=8, seeds 0,1,2
   F5: WRN-28-2 + GroupNorm, warm-started, CIFAR-10-LT(50), ε=8, seeds 0,1,2
-  F6: WRN-28-2 + GroupNorm, warm-started, CIFAR-10-LT(10), ε=8, seeds 0,1,2
-      [moderate LT control — model learns tail; tests ε^dir validity at lower IR]
+  F6: ResNet-20 + GroupNorm, warm-started, CIFAR-10-LT(10), ε=8, seeds 0,1,2
+      [~270k params; moderate LT; small enough for DP to leave signal]
 
 Usage:
   python experiments/exp_p19_train.py --run F1 --seed 0 --gpu 0
   python experiments/exp_p19_train.py --run F2 --seed 0 --gpu 0
   python experiments/exp_p19_train.py --run F5 --seed 0 --gpu 0
-  python experiments/exp_p19_train.py --run F6 --seed 0 --gpu 0
+  python experiments/exp_p19_train.py --run F6 --seed 0 --gpu 0   # ResNet-20 LT(10)
   python experiments/exp_p19_train.py --run F1 --all_seeds --gpu 0
 """
 
@@ -36,7 +36,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.datasets import make_public_private_split, make_cifar10_lt_indices
-from src.models import WideResNet
+from src.models import WideResNet, ResNet20
 
 import torchvision
 import torchvision.transforms as T
@@ -46,10 +46,10 @@ import torchvision.transforms as T
 # ---------------------------------------------------------------------------
 
 RUNS = {
-    "F1": dict(dataset="cifar10_lt50", regime="R3", eps=8.0, B_expected=1400, n_seeds=3, epochs=40),
-    "F2": dict(dataset="cifar10",      regime="R3", eps=8.0, B_expected=5000, n_seeds=3, epochs=40),
-    "F5": dict(dataset="cifar10_lt50", regime="R2", eps=8.0, B_expected=1400, n_seeds=3, epochs=60),
-    "F6": dict(dataset="cifar10_lt10", regime="R2", eps=8.0, B_expected=2000, n_seeds=3, epochs=50),
+    "F1": dict(dataset="cifar10_lt50", regime="R3", arch="clip_linear", eps=8.0, B_expected=1400, n_seeds=3, epochs=40),
+    "F2": dict(dataset="cifar10",      regime="R3", arch="clip_linear", eps=8.0, B_expected=5000, n_seeds=3, epochs=40),
+    "F5": dict(dataset="cifar10_lt50", regime="R2", arch="wrn28-2",     eps=8.0, B_expected=1400, n_seeds=3, epochs=60),
+    "F6": dict(dataset="cifar10_lt10", regime="R2", arch="resnet20",    eps=8.0, B_expected=2000, n_seeds=3, epochs=60),
 }
 
 # LiRA targets per run
@@ -62,7 +62,8 @@ LIRA_N_TARGETS = {"F1": 1500, "F2": 1000, "F5": 300, "F6": 600}
 CLIP_C      = 1.0        # clipping norm
 R_MAX       = 200        # Nyström rank
 CHUNK_R3    = 512        # CLIP per-sample grad chunk size
-CHUNK_WRN   = 32         # WRN per-sample grad chunk size (memory-limited)
+CHUNK_WRN   = 32         # WRN-28-2 per-sample grad chunk size (memory-limited)
+CHUNK_RN20  = 128        # ResNet-20 per-sample grad chunk size (~270k params, lighter)
 DATA_ROOT   = "./data"
 CACHE_DIR   = "./data/clip_features"
 RUNS_DIR    = "./runs/p19"
@@ -221,9 +222,11 @@ class LinearHead(nn.Module):
     def forward(self, x): return self.fc(x.float())
 
 
-def make_model(regime, num_classes):
+def make_model(regime, num_classes, arch="wrn28-2"):
     if regime == "R3":
         return LinearHead(num_classes, feat_dim=512)
+    if arch == "resnet20":
+        return ResNet20(num_classes=num_classes, n_groups=N_GROUPS)
     return WideResNet(depth=28, widen_factor=2, num_classes=num_classes, n_groups=N_GROUPS)
 
 
@@ -326,9 +329,9 @@ def nystrom_stats_r3(model, priv_feats, priv_labels, rho, r_max, device):
 # Nyström sufficient statistics (WRN, R2) — 4-pass rSVD + streaming
 # ---------------------------------------------------------------------------
 
-def nystrom_stats_wrn(model, priv_ds, rho, r_max, device):
+def nystrom_stats_wrn(model, priv_ds, rho, r_max, device, chunk_size=CHUNK_WRN):
     """
-    Compute Nyström stats for WRN via 4-pass randomized SVD.
+    Compute Nyström stats for WRN/ResNet-20 via 4-pass randomized SVD.
 
     No random augmentation — priv_ds must use deterministic transforms.
 
@@ -340,7 +343,7 @@ def nystrom_stats_wrn(model, priv_ds, rho, r_max, device):
     model.eval()
     N = len(priv_ds)
     d = sum(p.numel() for p in model.parameters())
-    loader = DataLoader(priv_ds, batch_size=CHUNK_WRN, shuffle=False,
+    loader = DataLoader(priv_ds, batch_size=chunk_size, shuffle=False,
                         num_workers=2, pin_memory=True, drop_last=False)
     k = r_max + 20
 
@@ -442,11 +445,11 @@ def nystrom_stats_wrn(model, priv_ds, rho, r_max, device):
 # Compute G_sum for Poisson-selected examples (WRN pass 5)
 # ---------------------------------------------------------------------------
 
-def compute_poisson_G_sum_wrn(model, priv_ds, inclusion_mask, device):
+def compute_poisson_G_sum_wrn(model, priv_ds, inclusion_mask, device, chunk_size=CHUNK_WRN):
     """
     Compute G_sum = Σ_{i: I_i=1} ḡ_{i,t}.
 
-    Uses the FULL dataset loader (batch_size=CHUNK_WRN, shuffle=False) — the
+    Uses the FULL dataset loader (batch_size=chunk_size, shuffle=False) — the
     same configuration as nystrom_stats_wrn passes 1–4.  Per-sample gradients
     are computed over full batches and only the included rows are summed.
     Because per-sample vmap has no cross-example state, the clipped gradient
@@ -454,7 +457,7 @@ def compute_poisson_G_sum_wrn(model, priv_ds, inclusion_mask, device):
     pass regardless of which other examples share the same batch, satisfying
     G_t^{update} ≡ G_t^{accounting} exactly (spec §8.2 soundness requirement).
     """
-    loader = DataLoader(priv_ds, batch_size=CHUNK_WRN, shuffle=False,
+    loader = DataLoader(priv_ds, batch_size=chunk_size, shuffle=False,
                         num_workers=2, pin_memory=True, drop_last=False)
     d     = sum(p.numel() for p in model.parameters())
     G_sum = torch.zeros(d, device=device)
@@ -589,10 +592,12 @@ def _open_mm(path, dtype, shape):
 def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_steps=None):
     regime  = cfg["regime"]
     dataset = cfg["dataset"]
+    arch    = cfg.get("arch", "wrn28-2")
     eps     = cfg["eps"]
     B_exp   = cfg["B_expected"]
     epochs  = cfg["epochs"]
     is_clip = (regime == "R3")
+    chunk_size = CHUNK_RN20 if arch == "resnet20" else CHUNK_WRN
 
     run_dir = os.path.join(runs_dir, run_id, f"seed_{seed}")
     os.makedirs(run_dir, exist_ok=True)
@@ -646,7 +651,7 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
           f"(σ={sigma:.4f} calibrated for exactly {T_train} steps)")
 
     # --- Model + optimizer (always constructed before checkpoint load) ---
-    model    = make_model(regime, num_classes).to(device)
+    model    = make_model(regime, num_classes, arch).to(device)
     d_params = sum(p.numel() for p in model.parameters())
     print(f"  d_params={d_params:,}")
 
@@ -742,7 +747,7 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
                     model, priv_feats_dev, priv_labels_dev, rho, R_MAX, device)
             else:
                 norms_t, losses_t, B_t, M_t, Yp_t, top_eigvals_t, cond_num_t = \
-                    nystrom_stats_wrn(model, priv_ds, rho, R_MAX, device)
+                    nystrom_stats_wrn(model, priv_ds, rho, R_MAX, device, chunk_size)
 
             # Persist accounting statistics
             cn_mm[:, t]        = norms_t.numpy().astype(np.float32)
@@ -780,7 +785,7 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
             else:
                 # Full-dataset pass with same batch_size/ordering as accounting passes —
                 # per-sample grads are bitwise-identical (spec §8.2 soundness).
-                G_sum = compute_poisson_G_sum_wrn(model, priv_ds, inclusion, device)
+                G_sum = compute_poisson_G_sum_wrn(model, priv_ds, inclusion, device, chunk_size)
 
             gnorm_mm[t] = G_sum.norm().item()
 
@@ -993,7 +998,9 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
         "seed":             seed,
         "dataset":          dataset,
         "regime":           regime,
-        "architecture":     "CLIP_ViT_B_32_linear" if is_clip else "WRN-28-2_GroupNorm16",
+        "architecture":     ("CLIP_ViT_B_32_linear" if is_clip
+                             else ("ResNet-20_GroupNorm16" if arch == "resnet20"
+                                   else "WRN-28-2_GroupNorm16")),
         "n_train":          int(n_priv),
         "B_expected":       int(B_exp),
         "q":                float(q),
