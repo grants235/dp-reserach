@@ -43,8 +43,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, Subset
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from src.datasets import make_public_private_split, make_cifar10_lt_indices
-from src.models import WideResNet
+from src.datasets import make_public_private_split, make_cifar10_lt_indices, make_lt_indices, load_purchase100
+from src.models import WideResNet, PurchaseFC
 
 import torchvision
 import torchvision.transforms as T
@@ -60,6 +60,9 @@ LIRA_SETTINGS = {
                 n_targets=1000, n_shadows=64,  shadow_epochs=20),
     "LF5": dict(matched_run="F5", seeds=[0, 1, 2], dataset="cifar10_lt50", regime="R2",
                 n_targets=300,  n_shadows=128, shadow_epochs=30),
+    "LF7": dict(matched_run="F7", seeds=[0, 1, 2], dataset="purchase100_lt50", regime="R2",
+                arch="purchase_fc", num_classes=100,
+                n_targets=600,  n_shadows=64,  shadow_epochs=15),
 }
 
 DATA_ROOT  = "./data"
@@ -69,8 +72,9 @@ LIRA_DIR   = "./lira/p19"
 N_GROUPS   = 16
 SHADOW_LR  = 0.05
 SHADOW_BS  = 256
-CHUNK_R3   = 512
-CHUNK_WRN  = 64
+CHUNK_R3       = 512
+CHUNK_WRN      = 64
+CHUNK_PURCHASE = 512
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +117,65 @@ def _load_clip_features(data_root, cache_dir):
     raise FileNotFoundError("CLIP features not cached. Run exp_p19_train.py --run F1 first.")
 
 
+class _NumpyDataset(Dataset):
+    """Wraps numpy (X, y) arrays; yields (x_tensor, y_int, global_idx)."""
+    def __init__(self, X, y, global_idx=None):
+        self.X   = np.asarray(X, dtype=np.float32)
+        self.y   = np.asarray(y, dtype=np.int64)
+        self.gidx = (np.arange(len(y), dtype=np.int64)
+                     if global_idx is None else np.asarray(global_idx, dtype=np.int64))
+
+    def __len__(self): return len(self.y)
+
+    def __getitem__(self, i):
+        return (torch.from_numpy(self.X[i]).float(), int(self.y[i]), int(self.gidx[i]))
+
+
+def build_full_dataset_purchase(dataset_name, data_root):
+    """
+    Reconstruct the Purchase-100 train/test split identical to exp_p19_train.py.
+
+    Returns (X_all, y_all, X_test, y_test, priv_idx, full_train_targets).
+    X_all: full dataset arrays (N, 600).  priv_idx: global indices of private training examples.
+    X_test, y_test: held-out test split (for nonmember logits).
+    """
+    is_lt = "lt" in dataset_name
+    lt_ir_str = dataset_name.split("lt")[-1] if is_lt else "1"
+    lt_ir = int("".join(filter(str.isdigit, lt_ir_str))) if is_lt else 1
+    num_classes = 100
+
+    X_all, y_all = load_purchase100(data_root)
+    N = len(y_all)
+
+    # Same 80/20 stratified split as train.py (seed=42)
+    rng_split = np.random.default_rng(42)
+    train_mask = np.zeros(N, dtype=bool)
+    for c in range(num_classes):
+        cls_idx = np.where(y_all == c)[0]
+        n_train_c = max(1, int(len(cls_idx) * 0.8))
+        chosen = rng_split.choice(cls_idx, size=n_train_c, replace=False)
+        train_mask[chosen] = True
+    train_idx = np.where(train_mask)[0]
+    test_idx  = np.where(~train_mask)[0]
+
+    y_train = y_all[train_idx]
+    if is_lt and lt_ir > 1:
+        lt_local = make_lt_indices(y_train, float(lt_ir), num_classes=num_classes, seed=42)
+        lt_train_idx = train_idx[lt_local]
+    else:
+        lt_train_idx = train_idx
+
+    y_lt = y_all[lt_train_idx]
+    _, priv_local = make_public_private_split(
+        np.arange(len(lt_train_idx)), y_lt, public_frac=0.1, seed=42)
+    priv_global = lt_train_idx[priv_local]
+
+    return (X_all, y_all,
+            X_all[test_idx], y_all[test_idx].astype(np.int32),
+            priv_global.astype(np.int32),
+            y_all[train_idx])
+
+
 def build_full_dataset_clip(dataset_name, data_root, cache_dir):
     """Return full CLIP feature dataset (all training examples used for shadows)."""
     is_lt = "lt" in dataset_name
@@ -135,9 +198,11 @@ class LinearHead(nn.Module):
     def forward(self, x): return self.fc(x.float())
 
 
-def make_shadow_model(regime, num_classes):
+def make_shadow_model(regime, num_classes, arch="wrn28-2"):
     if regime == "R3":
         return LinearHead(num_classes, feat_dim=512)
+    if arch == "purchase_fc":
+        return PurchaseFC(num_classes=num_classes)
     return WideResNet(depth=28, widen_factor=2, num_classes=num_classes, n_groups=N_GROUPS)
 
 
@@ -176,9 +241,37 @@ def train_shadow_wrn(model, shadow_indices, train_ds_aug, n_epochs, device, seed
         sch.step()
 
 
+def train_shadow_purchase(model, X_shadow, y_shadow, n_epochs, device, seed):
+    """Train shadow PurchaseFC on in-memory numpy arrays (no DataLoader overhead)."""
+    torch.manual_seed(seed); np.random.seed(seed); random.seed(seed)
+    model.train()
+    X_t = torch.from_numpy(X_shadow).float()
+    y_t = torch.from_numpy(y_shadow.astype(np.int64))
+    N   = len(y_t)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs)
+    for ep in range(n_epochs):
+        perm = torch.randperm(N)
+        for i in range(0, N, SHADOW_BS):
+            idx = perm[i:i + SHADOW_BS]; opt.zero_grad()
+            F.cross_entropy(model(X_t[idx].to(device)), y_t[idx].to(device)).backward()
+            opt.step()
+        sch.step()
+
+
 # ---------------------------------------------------------------------------
 # Logit evaluation
 # ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def eval_logits_purchase(model, X, device, chunk=CHUNK_PURCHASE):
+    """Evaluate PurchaseFC on a numpy array of features."""
+    model.eval(); parts = []
+    for i in range(0, len(X), chunk):
+        h = torch.from_numpy(X[i:i + chunk].astype(np.float32)).to(device)
+        parts.append(model(h).cpu())
+    return torch.cat(parts).numpy().astype(np.float32)
+
 
 @torch.no_grad()
 def eval_logits_clip(model, feats, indices, device, chunk=CHUNK_R3):
@@ -288,9 +381,12 @@ def run_lira(lira_id, cfg, shadow_start, shadow_end, device,
     run_seed    = seed if seed is not None else cfg["seeds"][0]
     dataset     = cfg["dataset"]
     regime      = cfg["regime"]
+    arch        = cfg.get("arch", "wrn28-2")
+    num_classes = cfg.get("num_classes", 10)
     n_shadows   = cfg["n_shadows"]
     n_epochs    = cfg["shadow_epochs"]
     is_clip     = (regime == "R3")
+    is_purchase = "purchase" in dataset
 
     out_dir = os.path.join(lira_dir, lira_id, f"seed_{run_seed}")
     os.makedirs(out_dir, exist_ok=True)
@@ -315,6 +411,10 @@ def run_lira(lira_id, cfg, shadow_start, shadow_end, device,
         tf_f, tf_l, te_f, te_l, _, full_targets = build_full_dataset_clip(
             dataset, data_root, cache_dir)
         nonmember_labels = te_l.numpy()[nonmember_test]
+    elif is_purchase:
+        X_all, y_all, X_test, y_test, _, full_targets = build_full_dataset_purchase(
+            dataset, data_root)
+        nonmember_labels = y_test[nonmember_test]
     else:
         train_ds_aug = _cifar10_aug(data_root)
         noaug_priv   = _cifar10_noaug(data_root)
@@ -348,16 +448,26 @@ def run_lira(lira_id, cfg, shadow_start, shadow_end, device,
             shadow_in_global = priv_idx[shadow_in_local]
             shadow_feats  = tf_f[shadow_in_global]
             shadow_labels = tf_l[shadow_in_global].long()
-            model = make_shadow_model(regime, 10).to(device)
+            model = make_shadow_model(regime, num_classes).to(device)
             train_shadow_clip(model, shadow_feats, shadow_labels, n_epochs, device, seed=m)
 
             # Evaluate on targets
             member_logits    = eval_logits_clip(model, tf_f, priv_idx[member_local], device)
             nonmember_logits = eval_logits_clip(model, te_f, nonmember_test, device)
 
+        elif is_purchase:
+            shadow_in_global = priv_idx[shadow_in_local]
+            X_shadow = X_all[shadow_in_global]
+            y_shadow = y_all[shadow_in_global].astype(np.int64)
+            model = make_shadow_model(regime, num_classes, arch).to(device)
+            train_shadow_purchase(model, X_shadow, y_shadow, n_epochs, device, seed=m)
+
+            member_logits    = eval_logits_purchase(model, X_all[priv_idx[member_local]], device)
+            nonmember_logits = eval_logits_purchase(model, X_test[nonmember_test], device)
+
         else:
             shadow_train_global = priv_idx[shadow_in_local]
-            model = make_shadow_model(regime, 10).to(device)
+            model = make_shadow_model(regime, num_classes, arch).to(device)
             train_shadow_wrn(model, shadow_train_global, train_ds_aug, n_epochs, device, seed=m)
 
             # Evaluate on targets (using no-aug transform)

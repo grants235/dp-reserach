@@ -332,6 +332,39 @@ def make_poisson_loader(dataset, sample_rate: float, num_workers: int = 4):
     )
 
 
+def load_purchase100(data_root: str):
+    """
+    Load Purchase-100 dataset (Shokri et al. 2017, Carlini et al. 2022 LiRA benchmark).
+
+    Dataset: 197,324 records × 600 binary purchase-category features, 100 classes.
+    Expected files (either is fine):
+      - purchase100.npz  (cached numpy arrays)
+      - dataset_purchase (raw CSV: first column = class label 1-indexed)
+
+    Returns (X, y) where:
+      X: np.float32 array of shape (N, 600)
+      y: np.int64 array of shape (N,) with values in [0, 99]
+    """
+    npz_path = os.path.join(data_root, "purchase100.npz")
+    if os.path.exists(npz_path):
+        d = np.load(npz_path)
+        return d["X"].astype(np.float32), d["y"].astype(np.int64)
+
+    txt_path = os.path.join(data_root, "dataset_purchase")
+    if not os.path.exists(txt_path):
+        raise FileNotFoundError(
+            f"Purchase-100 not found. Expected one of:\n"
+            f"  {npz_path}\n"
+            f"  {txt_path}\n"
+            f"Download from: https://www.comp.nus.edu.sg/~reza/files/dataset_purchase.tgz"
+        )
+    data = np.loadtxt(txt_path, delimiter=",", dtype=np.float32)
+    y = (data[:, 0] - 1).astype(np.int64)
+    X = data[:, 1:]
+    np.savez_compressed(npz_path, X=X, y=y)
+    return X, y
+
+
 class TieredDataset(Dataset):
     """
     Wraps any dataset and appends per-sample tier labels to each batch.

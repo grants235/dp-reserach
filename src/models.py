@@ -243,12 +243,47 @@ class TinyCNN(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# PurchaseFC — tabular FC for Purchase-100 (~180k params)
+# ---------------------------------------------------------------------------
+
+class PurchaseFC(nn.Module):
+    """
+    2-layer fully-connected network for Purchase-100 tabular data.
+
+    Input: 600 binary features. No normalization needed (tabular, no BatchNorm issue).
+    Tanh activation matches the MIA literature standard for this dataset.
+    ~180k parameters; trains from scratch under DP at ε=8 with n~142k.
+    """
+
+    def __init__(self, num_classes: int = 100, hidden_dim: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(600, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, num_classes),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        return self.net(x.float())
+
+    def features(self, x):
+        return self.net[:-1](x.float())
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
 def make_model(arch: str, num_classes: int, n_groups: int = N_GROUPS) -> nn.Module:
     """
-    arch: 'wrn28-2' | 'resnet20' | 'tinycnn'
+    arch: 'wrn28-2' | 'resnet20' | 'tinycnn' | 'purchase_fc'
     Returns model with GroupNorm instead of BatchNorm.
     """
     if arch == "wrn28-2":
@@ -258,6 +293,8 @@ def make_model(arch: str, num_classes: int, n_groups: int = N_GROUPS) -> nn.Modu
         return ResNet20(num_classes=num_classes, n_groups=n_groups)
     elif arch == "tinycnn":
         return TinyCNN(num_classes=num_classes)
+    elif arch == "purchase_fc":
+        return PurchaseFC(num_classes=num_classes)
     else:
         raise ValueError(f"Unknown architecture: {arch}")
 

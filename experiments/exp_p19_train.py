@@ -18,14 +18,15 @@ Run matrix:
   F5: WRN-28-2 + GroupNorm, warm-started, CIFAR-10-LT(50), ε=8, seeds 0,1,2
   F6: ResNet-20 + GroupNorm, warm-started, CIFAR-10-LT(10), ε=8, seeds 0,1,2
       [~270k params — still too large for DP at ε=8 to converge]
-  F7: TinyCNN (~24k params), warm-started, FashionMNIST-LT(10), ε=8, seeds 0,1,2
-      [from-scratch; small enough for DP noise to leave gradient signal]
+  F7: PurchaseFC (~180k params), from-scratch, Purchase-100-LT(50), ε=8, seeds 0,1,2
+      [tabular data; n~36k large batches → strong SNR; FC gradient rank ≤ 100 → effective noise low]
 
 Usage:
   python experiments/exp_p19_train.py --run F1 --seed 0 --gpu 0
   python experiments/exp_p19_train.py --run F2 --seed 0 --gpu 0
   python experiments/exp_p19_train.py --run F5 --seed 0 --gpu 0
   python experiments/exp_p19_train.py --run F6 --seed 0 --gpu 0   # ResNet-20 LT(10)
+  python experiments/exp_p19_train.py --run F7 --seed 0 --gpu 0   # Purchase-100 LT(50)
   python experiments/exp_p19_train.py --run F1 --all_seeds --gpu 0
 """
 
@@ -37,8 +38,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, Subset
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from src.datasets import make_public_private_split, make_cifar10_lt_indices, make_lt_indices
-from src.models import WideResNet, ResNet20, TinyCNN
+from src.datasets import make_public_private_split, make_cifar10_lt_indices, make_lt_indices, load_purchase100
+from src.models import WideResNet, ResNet20, TinyCNN, PurchaseFC
 
 import torchvision
 import torchvision.transforms as T
@@ -52,7 +53,8 @@ RUNS = {
     "F2": dict(dataset="cifar10",      regime="R3", arch="clip_linear", eps=8.0, B_expected=5000, n_seeds=3, epochs=40),
     "F5": dict(dataset="cifar10_lt50", regime="R2", arch="wrn28-2",     eps=8.0, B_expected=1400, n_seeds=3, epochs=60),
     "F6": dict(dataset="cifar10_lt10", regime="R2", arch="resnet20",    eps=8.0, B_expected=2000, n_seeds=3, epochs=60),
-    "F7": dict(dataset="fmnist_lt10",  regime="R2", arch="tinycnn",     eps=8.0, B_expected=2500, n_seeds=3, epochs=10),
+    "F7": dict(dataset="purchase100_lt50", regime="R2", arch="purchase_fc", eps=8.0,
+               B_expected=10000, n_seeds=3, epochs=25, r_max=100),
 }
 
 # LiRA targets per run
@@ -64,10 +66,11 @@ LIRA_N_TARGETS = {"F1": 1500, "F2": 1000, "F5": 300, "F6": 600, "F7": 600}
 
 CLIP_C      = 1.0        # clipping norm
 R_MAX       = 200        # Nyström rank
-CHUNK_R3    = 512        # CLIP per-sample grad chunk size
-CHUNK_WRN   = 32         # WRN-28-2 per-sample grad chunk size (memory-limited)
-CHUNK_RN20  = 128        # ResNet-20 per-sample grad chunk size (~270k params, lighter)
-CHUNK_TINY  = 512        # TinyCNN per-sample grad chunk size (~24k params, very light)
+CHUNK_R3       = 512     # CLIP per-sample grad chunk size
+CHUNK_WRN      = 32      # WRN-28-2 per-sample grad chunk size (memory-limited)
+CHUNK_RN20     = 128     # ResNet-20 per-sample grad chunk size (~270k params, lighter)
+CHUNK_TINY     = 512     # TinyCNN per-sample grad chunk size (~24k params, very light)
+CHUNK_PURCHASE = 1024    # PurchaseFC per-sample grad chunk size (linear layers, very light)
 DATA_ROOT   = "./data"
 CACHE_DIR   = "./data/clip_features"
 RUNS_DIR    = "./runs/p19"
@@ -118,6 +121,22 @@ class _FeatureDataset(Dataset):
 
     def __getitem__(self, i):
         return self.feats[i], int(self.labels[i]), int(self.idx[i])
+
+
+class _NumpyDataset(Dataset):
+    """Wraps numpy (X, y) arrays; yields (x_tensor, y_int, global_idx)."""
+    def __init__(self, X, y, global_idx=None):
+        self.X   = np.asarray(X, dtype=np.float32)
+        self.y   = np.asarray(y, dtype=np.int64)
+        self.gidx = (np.arange(len(y), dtype=np.int64)
+                     if global_idx is None else np.asarray(global_idx, dtype=np.int64))
+
+    def __len__(self): return len(self.y)
+
+    def __getitem__(self, i):
+        return (torch.from_numpy(self.X[i]).float(),
+                int(self.y[i]),
+                int(self.gidx[i]))
 
 
 def _cifar10_noaug(data_root, train=True):
@@ -246,6 +265,76 @@ def build_dataset_fmnist(dataset_name, data_root):
             class_counts, pub_x, pub_y, pub_idx, test_ds, test_labels_np)
 
 
+def build_dataset_purchase(dataset_name, data_root):
+    """
+    Returns dataset for PurchaseFC runs (F7). No augmentation (tabular data).
+
+    Workflow:
+      1. Load Purchase-100 (197k × 600 binary features, 100 classes)
+      2. Stratified 80/20 train/test split (seed=42)
+      3. LT subsampling on train split (using make_lt_indices, generic 100-class version)
+      4. 10% public / 90% private split
+      5. Tier labels: head/mid/tail by class-count rank (top/mid/bottom third)
+
+    Returns (priv_ds, priv_idx, priv_labels_np, tier_labels, num_classes, delta,
+             class_counts, test_ds, test_labels_np).  No pub_x/pub_y — no warm-start.
+    """
+    is_lt = "lt" in dataset_name
+    lt_ir = _parse_lt_ir(dataset_name) if is_lt else 1
+    num_classes = 100
+    delta = 1e-5
+
+    X_all, y_all = load_purchase100(data_root)
+    N = len(y_all)
+
+    # Stratified 80/20 train/test split
+    rng_split = np.random.default_rng(42)
+    train_mask = np.zeros(N, dtype=bool)
+    for c in range(num_classes):
+        cls_idx = np.where(y_all == c)[0]
+        n_train_c = max(1, int(len(cls_idx) * 0.8))
+        chosen = rng_split.choice(cls_idx, size=n_train_c, replace=False)
+        train_mask[chosen] = True
+    train_idx = np.where(train_mask)[0]
+    test_idx  = np.where(~train_mask)[0]
+
+    # LT subsampling on training split
+    y_train = y_all[train_idx]
+    if is_lt and lt_ir > 1:
+        lt_local = make_lt_indices(y_train, float(lt_ir), num_classes=num_classes, seed=42)
+        lt_train_idx = train_idx[lt_local]
+    else:
+        lt_train_idx = train_idx
+
+    # Pub/priv split (10% public, 90% private)
+    y_lt = y_all[lt_train_idx]
+    pub_local, priv_local = make_public_private_split(
+        np.arange(len(lt_train_idx)), y_lt, public_frac=0.1, seed=42)
+    priv_global = lt_train_idx[priv_local]
+    pub_global  = lt_train_idx[pub_local]
+
+    priv_labels_np = y_all[priv_global].astype(np.int32)
+    class_counts   = np.bincount(priv_labels_np, minlength=num_classes)
+
+    # Tier labels: head / mid / tail by class frequency rank
+    sorted_by_count = np.argsort(class_counts)[::-1]  # most frequent first
+    tier_map = np.zeros(num_classes, dtype=np.int32)
+    n3 = num_classes // 3
+    for rank, c in enumerate(sorted_by_count):
+        tier_map[c] = 0 if rank < n3 else (1 if rank < 2 * n3 else 2)
+    tier_labels = tier_map[priv_labels_np]
+
+    priv_ds    = _NumpyDataset(X_all[priv_global], y_all[priv_global], global_idx=priv_global)
+    test_ds    = _NumpyDataset(X_all[test_idx],    y_all[test_idx],    global_idx=test_idx)
+    test_labels_np = y_all[test_idx].astype(np.int32)
+
+    print(f"  [Purchase-100] n_priv={len(priv_global)}  n_pub={len(pub_global)}  "
+          f"n_test={len(test_idx)}  lt_ir={lt_ir}")
+    return (priv_ds, priv_global.astype(np.int32), priv_labels_np,
+            tier_labels, num_classes, delta, class_counts,
+            test_ds, test_labels_np)
+
+
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
@@ -264,6 +353,8 @@ def make_model(regime, num_classes, arch="wrn28-2"):
         return ResNet20(num_classes=num_classes, n_groups=N_GROUPS)
     if arch == "tinycnn":
         return TinyCNN(num_classes=num_classes)
+    if arch == "purchase_fc":
+        return PurchaseFC(num_classes=num_classes)
     return WideResNet(depth=28, widen_factor=2, num_classes=num_classes, n_groups=N_GROUPS)
 
 
@@ -558,7 +649,8 @@ def evaluate_wrn(model, test_ds, device):
     model.eval()
     loader = DataLoader(test_ds, batch_size=512, shuffle=False, num_workers=2)
     correct = total = 0
-    for x, y in loader:
+    for batch in loader:
+        x, y = batch[0], batch[1]
         correct += (model(x.to(device)).argmax(1) == y.to(device)).sum().item()
         total   += y.shape[0]
     return correct / total
@@ -589,9 +681,10 @@ def select_lira_targets(priv_idx, priv_labels_np, tier_labels,
             member_idx.append(extra)
         member_local = np.concatenate(member_idx)
     else:
-        n_per_class = n_targets // 10
+        unique_cls = np.unique(priv_labels_np)
+        n_per_class = n_targets // max(1, len(unique_cls))
         member_idx = []
-        for c in range(10):
+        for c in unique_cls:
             mask  = (priv_labels_np == c)
             avail = np.where(mask)[0]
             n_sel = min(n_per_class, len(avail))
@@ -601,11 +694,13 @@ def select_lira_targets(priv_idx, priv_labels_np, tier_labels,
 
     n_nm = len(member_local)
     test_labels_np = np.asarray(test_labels_np)
+    unique_test_cls = np.unique(test_labels_np)
+    n_per_cls_nm    = max(1, n_nm // len(unique_test_cls))
     nm_idx = []
-    for c in range(10):
+    for c in unique_test_cls:
         mask  = (test_labels_np == c)
         avail = np.where(mask)[0]
-        n_sel = min(n_nm // 10, len(avail))
+        n_sel = min(n_per_cls_nm, len(avail))
         chosen = rng.choice(avail, size=n_sel, replace=False)
         nm_idx.append(chosen)
     nonmember_test = np.concatenate(nm_idx)
@@ -633,9 +728,12 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
     eps     = cfg["eps"]
     B_exp   = cfg["B_expected"]
     epochs  = cfg["epochs"]
-    is_clip = (regime == "R3")
-    chunk_size = (CHUNK_TINY if arch == "tinycnn" else
-                  CHUNK_RN20 if arch == "resnet20" else CHUNK_WRN)
+    is_clip    = (regime == "R3")
+    is_purchase = "purchase" in dataset
+    chunk_size = (CHUNK_PURCHASE if arch == "purchase_fc" else
+                  CHUNK_TINY    if arch == "tinycnn"     else
+                  CHUNK_RN20    if arch == "resnet20"    else CHUNK_WRN)
+    r_max = cfg.get("r_max", R_MAX)
 
     run_dir = os.path.join(runs_dir, run_id, f"seed_{seed}")
     os.makedirs(run_dir, exist_ok=True)
@@ -663,6 +761,13 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
             build_dataset_clip(dataset, data_root, cache_dir, device)
         test_labels_np = te_labels.numpy()
         priv_labels_np = priv_labels.numpy().astype(np.int32)
+        n_priv = len(priv_idx)
+    elif is_purchase:
+        (priv_ds, priv_idx, priv_labels_np, tier_labels, num_classes, delta,
+         class_counts, test_ds, test_labels_np) = \
+            build_dataset_purchase(dataset, data_root)
+        pub_x = pub_y = None
+        pub_idx = np.array([], dtype=np.int32)
         n_priv = len(priv_idx)
     elif "fmnist" in dataset:
         (priv_ds, priv_idx, priv_labels_np, tier_labels, num_classes, delta,
@@ -705,22 +810,22 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
     # --- Pre-allocate accounting arrays (always memmapped for resume safety) ---
     Yproj_path    = os.path.join(run_dir, "Y_projections.npy")
     Y_proj_mm     = _open_mm(Yproj_path,
-                             np.float32, (n_priv, T_train, R_MAX))
+                             np.float32, (n_priv, T_train, r_max))
     cn_mm         = _open_mm(os.path.join(run_dir, "_clipped_norms_mm.npy"),
                              np.float32, (n_priv, T_train))
     losses_mm     = _open_mm(os.path.join(run_dir, "_losses_mm.npy"),
                              np.float32, (n_priv, T_train))
     B_mm          = _open_mm(os.path.join(run_dir, "_B_matrices_mm.npy"),
-                             np.float64, (T_train, R_MAX, R_MAX))
+                             np.float64, (T_train, r_max, r_max))
     YTY_mm        = _open_mm(os.path.join(run_dir, "_YTY_matrices_mm.npy"),
-                             np.float64, (T_train, R_MAX, R_MAX))
+                             np.float64, (T_train, r_max, r_max))
     gnorm_mm      = _open_mm(os.path.join(run_dir, "_grad_sum_norms_mm.npy"),
                              np.float32, (T_train,))
     rbs_mm        = _open_mm(os.path.join(run_dir, "_realized_bs_mm.npy"),
                              np.int32,   (T_train,))
     if not is_clip:
         eig_mm  = _open_mm(os.path.join(run_dir, "_sketch_eigs_mm.npy"),
-                            np.float32, (T_train, R_MAX))
+                            np.float32, (T_train, r_max))
         cond_mm = _open_mm(os.path.join(run_dir, "_sketch_cond_mm.npy"),
                             np.float32, (T_train,))
 
@@ -760,8 +865,8 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
             rng_p = np.random.default_rng(_step_seed(run_id, seed, t_past))
             all_inclusions[t_past] = rng_p.random(n_priv) < q
     else:
-        # WRN warm-start only on fresh run
-        if not is_clip:
+        # WRN/FashionMNIST warm-start only on fresh run; Purchase-100 trains from scratch
+        if not is_clip and not is_purchase:
             pretrain_wrn(model, pub_x.to(device), pub_y.to(device), device)
 
     # For CLIP, keep features on device
@@ -788,10 +893,10 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
             model.eval()
             if is_clip:
                 G_cpu, norms_t, losses_t, B_t, M_t, Yp_t = nystrom_stats_r3(
-                    model, priv_feats_dev, priv_labels_dev, rho, R_MAX, device)
+                    model, priv_feats_dev, priv_labels_dev, rho, r_max, device)
             else:
                 norms_t, losses_t, B_t, M_t, Yp_t, top_eigvals_t, cond_num_t = \
-                    nystrom_stats_wrn(model, priv_ds, rho, R_MAX, device, chunk_size)
+                    nystrom_stats_wrn(model, priv_ds, rho, r_max, device, chunk_size)
 
             # Persist accounting statistics
             cn_mm[:, t]        = norms_t.numpy().astype(np.float32)
@@ -800,7 +905,7 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
             YTY_mm[t]          = M_t.numpy().astype(np.float64)
             Y_proj_mm[:, t, :] = Yp_t.numpy().astype(np.float32)
             if not is_clip:
-                ne = min(len(top_eigvals_t), R_MAX)
+                ne = min(len(top_eigvals_t), r_max)
                 eig_mm[t, :ne] = top_eigvals_t[:ne]
                 cond_mm[t]     = cond_num_t
 
@@ -950,7 +1055,7 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
     Y_proj_mm.flush()
     if T_actual < T_train:
         tmp_path = Yproj_path + ".tmp"
-        np.save(tmp_path, np.asarray(Y_proj_mm[:, :T_actual, :]))
+        np.save(tmp_path, np.asarray(Y_proj_mm[:, :T_actual, :r_max]))
         os.rename(tmp_path, Yproj_path)
 
     # Poisson inclusions compressed
@@ -1042,10 +1147,11 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
         "seed":             seed,
         "dataset":          dataset,
         "regime":           regime,
-        "architecture":     ("CLIP_ViT_B_32_linear" if is_clip
-                             else ("TinyCNN_GroupNorm" if arch == "tinycnn"
-                                   else ("ResNet-20_GroupNorm16" if arch == "resnet20"
-                                         else "WRN-28-2_GroupNorm16"))),
+        "architecture":     ("CLIP_ViT_B_32_linear"  if is_clip
+                             else ("PurchaseFC_256"      if arch == "purchase_fc"
+                                   else ("TinyCNN_GroupNorm"   if arch == "tinycnn"
+                                         else ("ResNet-20_GroupNorm16" if arch == "resnet20"
+                                               else "WRN-28-2_GroupNorm16")))),
         "n_train":          int(n_priv),
         "B_expected":       int(B_exp),
         "q":                float(q),
@@ -1059,7 +1165,7 @@ def train_run(run_id, cfg, seed, device, data_root, cache_dir, runs_dir, max_ste
         "T_train":          int(T_actual),
         "T_sigma_calibration": int(T_train),
         "steps_per_epoch":  int(steps_per_ep),
-        "r_max":            R_MAX,
+        "r_max":            r_max,
         "accountant":       "prv",
         "sampling":         "poisson_bernoulli",
         "augmentation":     "none" if not is_clip else "none_frozen_clip",
