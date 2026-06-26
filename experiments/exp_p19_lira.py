@@ -761,7 +761,7 @@ def main():
     elif args.lira_id:
         lira_ids = [args.lira_id]
     else:
-        print("[P19-LiRA] Specify --lira_id LF1/LF2/LF5 or --all"); return
+        print(f"[P19-LiRA] Specify --lira_id {'/'.join(LIRA_SETTINGS.keys())} or --all"); return
 
     os.makedirs(args.lira_dir, exist_ok=True)
 
