@@ -262,6 +262,17 @@ def compute_U_full_and_d2hat(
 # Per-step charge computation and filter replay
 # ---------------------------------------------------------------------------
 
+def _save_partial_ckpt(prefix, t_completed, C_norm, C_dir,
+                       fallback_total, mu_dir_max, mu_norm_max):
+    np.save(f"{prefix}_partial_C_norm.npy",   C_norm.astype(np.float64))
+    np.save(f"{prefix}_partial_C_dir100.npy", C_dir.astype(np.float64))
+    with open(f"{prefix}_partial_ckpt_meta.json", "w") as _f:
+        json.dump({"t_completed": t_completed,
+                   "fallback_total": int(fallback_total),
+                   "mu_dir_max":     float(mu_dir_max),
+                   "mu_norm_max":    float(mu_norm_max)}, _f)
+
+
 def compute_realized_cumulative(
     clipped_norms: np.ndarray,   # (n, T)
     B_matrices: np.ndarray,      # (T, r_max, r_max)
@@ -273,6 +284,14 @@ def compute_realized_cumulative(
     q: float,
     r: int,
     alpha_grid: np.ndarray,
+    start_t: int = 0,
+    C_norm_init: np.ndarray = None,
+    C_dir_init: np.ndarray = None,
+    fallback_total_init: int = 0,
+    mu_dir_max_init: float = 0.0,
+    mu_norm_max_init: float = 0.0,
+    ckpt_prefix: str = None,
+    ckpt_every: int = 100,
 ) -> tuple:
     """
     For all examples i and orders α, compute:
@@ -288,18 +307,23 @@ def compute_realized_cumulative(
       μ_dir_{i,t,r} = √(d̂²_{i,t,r})
 
     Both shifts must satisfy μ ≤ 1/σ (checked in sanity checks).
+
+    start_t / C_norm_init / C_dir_init / *_init allow resuming from a
+    partial checkpoint; ckpt_prefix/ckpt_every control mid-run saves.
     """
     n, T = clipped_norms.shape
     n_alpha = len(alpha_grid)
 
-    C_norm = np.zeros((n, n_alpha), dtype=np.float64)
-    C_dir  = np.zeros((n, n_alpha), dtype=np.float64)
+    C_norm = C_norm_init.copy() if C_norm_init is not None \
+             else np.zeros((n, n_alpha), dtype=np.float64)
+    C_dir  = C_dir_init.copy() if C_dir_init is not None \
+             else np.zeros((n, n_alpha), dtype=np.float64)
 
-    fallback_total = 0
-    mu_dir_max  = 0.0
-    mu_norm_max = 0.0
+    fallback_total = fallback_total_init
+    mu_dir_max  = mu_dir_max_init
+    mu_norm_max = mu_norm_max_init
 
-    for t in range(T):
+    for t in range(start_t, T):
         norms_t = clipped_norms[:, t]              # (n,)
         B_t     = B_matrices[t]
         YTY_t   = YTY_matrices[t]
@@ -329,6 +353,12 @@ def compute_realized_cumulative(
                   f"mu_norm_max={mu_norm.max():.5f}  "
                   f"mu_dir_max={mu_dir.max():.5f}  "
                   f"fallback={fallback_t.sum()}")
+
+        # Partial checkpoint every ckpt_every steps
+        if ckpt_prefix and (t + 1) % ckpt_every == 0 and (t + 1) < T:
+            _save_partial_ckpt(ckpt_prefix, t, C_norm, C_dir,
+                               fallback_total, mu_dir_max, mu_norm_max)
+            print(f"    [certify] partial checkpoint saved at step {t+1}/{T}")
 
     fallback_rate = fallback_total / (n * T) if T > 0 else 0.0
     return C_norm, C_dir, fallback_rate, mu_dir_max, mu_norm_max
@@ -496,6 +526,10 @@ def certify_run(run_dir: str, cert_dir: str, ranks=None,
     c_norm_ckpt    = os.path.join(cert_dir, f"{tag}_C_realized_norm.npy")
     c_dir100_ckpt  = os.path.join(cert_dir, f"{tag}_C_realized_dir_rank_{headline_rank}.npy")
 
+    partial_meta_path = os.path.join(cert_dir, f"{tag}_partial_ckpt_meta.json")
+    partial_norm_path = os.path.join(cert_dir, f"{tag}_partial_C_norm.npy")
+    partial_dir_path  = os.path.join(cert_dir, f"{tag}_partial_C_dir100.npy")
+
     if (os.path.exists(c_norm_ckpt) and os.path.exists(c_dir100_ckpt)
             and os.path.exists(ckpt_meta_path)):
         print(f"  [cert] Resuming: loading cached C_norm + C_dir_r{headline_rank}...")
@@ -507,11 +541,37 @@ def certify_run(run_dir: str, cert_dir: str, ranks=None,
         mu_dir_max    = _cm["mu_dir_max"]
         mu_norm_max   = _cm["mu_norm_max"]
     else:
-        print(f"  [cert] Computing norm + headline rank r={headline_rank} (T={T_use}, n={n})...")
+        # Check for a partial (mid-run) checkpoint from a previous killed run
+        start_t = 0
+        C_norm_init = C_dir_100_init = None
+        fallback_total_init = 0
+        mu_dir_max_init = mu_norm_max_init = 0.0
+        if (os.path.exists(partial_meta_path) and os.path.exists(partial_norm_path)
+                and os.path.exists(partial_dir_path)):
+            with open(partial_meta_path) as f:
+                _pm = json.load(f)
+            start_t             = _pm["t_completed"] + 1
+            C_norm_init         = np.load(partial_norm_path)
+            C_dir_100_init      = np.load(partial_dir_path)
+            fallback_total_init = int(_pm.get("fallback_total", 0))
+            mu_dir_max_init     = float(_pm.get("mu_dir_max",   0.0))
+            mu_norm_max_init    = float(_pm.get("mu_norm_max",  0.0))
+            print(f"  [cert] Resuming from step {start_t}/{T_use} "
+                  f"(partial checkpoint found)...")
+
+        print(f"  [cert] Computing norm + headline rank r={headline_rank} "
+              f"(T={T_use}, n={n}, start_t={start_t})...")
         C_norm, C_dir_100, fallback_rate, mu_dir_max, mu_norm_max = \
             compute_realized_cumulative(
                 clipped_norms, B_matrices, YTY_matrices, Y_projections,
-                a, rho, sigma, q, headline_rank, ALPHA_GRID)
+                a, rho, sigma, q, headline_rank, ALPHA_GRID,
+                start_t=start_t,
+                C_norm_init=C_norm_init, C_dir_init=C_dir_100_init,
+                fallback_total_init=fallback_total_init,
+                mu_dir_max_init=mu_dir_max_init,
+                mu_norm_max_init=mu_norm_max_init,
+                ckpt_prefix=os.path.join(cert_dir, tag),
+                ckpt_every=100)
         np.save(c_norm_ckpt,   C_norm.astype(np.float64))
         np.save(c_dir100_ckpt, C_dir_100.astype(np.float64))
         with open(ckpt_meta_path, "w") as f:
@@ -519,6 +579,10 @@ def certify_run(run_dir: str, cert_dir: str, ranks=None,
                        "mu_dir_max":    float(mu_dir_max),
                        "mu_norm_max":   float(mu_norm_max)}, f, indent=2)
         print(f"  [cert] Checkpoint saved: C_norm + C_dir_r{headline_rank}")
+        # Clean up partial checkpoint files now that final is written
+        for _p in [partial_meta_path, partial_norm_path, partial_dir_path]:
+            if os.path.exists(_p):
+                os.remove(_p)
 
     if verbose:
         print(f"  [cert] fallback_rate={fallback_rate:.6%}  "
