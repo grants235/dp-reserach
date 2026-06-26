@@ -125,7 +125,7 @@ def table_1(runs_dir=RUNS_DIR, out_dir=OUT_DIR):
     Rows: F1 seed 0, F2 seed 0, F5 seeds 0,1,2 (aggregated).
     Columns: mean norm, median norm, CV, fraction within 1% of C.
     """
-    rows = [("F1", [0]), ("F2", [0]), ("F5", [0, 1, 2])]
+    rows = [("F1", [0]), ("F2", [0]), ("F5", [0, 1, 2]), ("F7", [0, 1, 2])]
     C = 1.0
     print(f"\n{'='*72}")
     print(f"  Table 1: Norm Flatness (C={C})")
@@ -179,7 +179,7 @@ def table_2(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=OUT_DIR):
     print(hdr); print(f"  {'-'*len(hdr.lstrip())}")
 
     all_rows = []
-    for run_id in ["F1", "F2", "F5"]:
+    for run_id in ["F1", "F2", "F5", "F7"]:
         for seed in range(3):
             cert = _load_cert(run_id, seed, cert_dir)
             if "epsilon_cert_norm" not in cert: continue
@@ -216,10 +216,11 @@ def table_2(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=OUT_DIR):
 # ---------------------------------------------------------------------------
 
 def table_3(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR, out_dir=OUT_DIR,
-            lira_seeds=None):
+            lira_seeds=None, run_id="F1", lira_id="LF1"):
     """
-    Table 3: Headline LiRA correlation (F1/LF1), aggregated across all available seeds.
+    Table 3: Headline LiRA correlation, aggregated across all available seeds.
     Reports per-seed Spearman ρ and mean±std across seeds.
+    run_id/lira_id: e.g. "F1"/"LF1" (CLIP, headline) or "F7"/"LF7" (MNIST CNN).
     """
     try:
         from scipy.stats import spearmanr
@@ -230,10 +231,10 @@ def table_3(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR, out_dir=OUT
         HAS_SCIPY = False
 
     print(f"\n{'='*72}")
-    print(f"  Table 3: Headline LiRA Correlation (F1/LF1)")
+    print(f"  Table 3: Headline LiRA Correlation ({run_id}/{lira_id})")
     print(f"{'='*72}")
 
-    seeds_to_use = lira_seeds if lira_seeds is not None else _available_lira_seeds("LF1", lira_dir)
+    seeds_to_use = lira_seeds if lira_seeds is not None else _available_lira_seeds(lira_id, lira_dir)
     if not seeds_to_use:
         seeds_to_use = [0]
 
@@ -272,21 +273,21 @@ def table_3(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR, out_dir=OUT
     print(f"  {'Feature':52s}  {'Spearman ρ':10s}  {'95% CI':18s}  {'R²':6s}  {'n':5s}")
 
     for s in seeds_to_use:
-        lf1  = _load_lira("LF1", lira_dir, seed=s)
-        cert = _load_cert("F1", s, cert_dir)
-        run  = _load_run("F1", s, runs_dir)
+        lf_data = _load_lira(lira_id, lira_dir, seed=s)
+        cert    = _load_cert(run_id, s, cert_dir)
+        run     = _load_run(run_id, s, runs_dir)
 
-        if not lf1 or "D_lira_members" not in lf1:
-            print(f"  [Table 3] LiRA seed={s} not found, skipping.")
+        if not lf_data or "D_lira_members" not in lf_data:
+            print(f"  [Table 3] LiRA {lira_id} seed={s} not found, skipping.")
             continue
         if "epsilon_cert_dir_rank_100" not in cert:
-            print(f"  [Table 3] Certified ε seed={s} not found, skipping.")
+            print(f"  [Table 3] Certified ε {run_id} seed={s} not found, skipping.")
             continue
 
         print(f"\n  -- seed={s} --")
-        D_lira       = lf1["D_lira_members"]
+        D_lira       = lf_data["D_lira_members"]
         member_local = np.load(
-            os.path.join(runs_dir, "F1", f"seed_{s}", "lira_member_local_idx.npy"))
+            os.path.join(runs_dir, run_id, f"seed_{s}", "lira_member_local_idx.npy"))
 
         eps_dir_m  = cert["epsilon_cert_dir_rank_100"][member_local]
         eps_norm_m = cert["epsilon_cert_norm"][member_local]
@@ -374,9 +375,10 @@ def table_3(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR, out_dir=OUT
         return
 
     os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "table3_lira_correlation.json"), "w") as f:
+    out_fname = f"table3_lira_correlation_{run_id.lower()}.json"
+    with open(os.path.join(out_dir, out_fname), "w") as f:
         json.dump(all_rows, f, indent=2)
-    print(f"\n  [saved] {out_dir}/table3_lira_correlation.json")
+    print(f"\n  [saved] {out_dir}/{out_fname}")
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +395,7 @@ def table_4(cert_dir=CERT_DIR, out_dir=OUT_DIR):
     print(f"{'='*72}")
 
     rows = []
-    for run_id in ["F1", "F5"]:
+    for run_id in ["F1", "F5", "F7"]:
         for seed in [0]:
             cert = _load_cert(run_id, seed, cert_dir)
             if "Bcert_dir_rank_100" not in cert: continue
@@ -491,43 +493,46 @@ def table_5(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR, out_dir=OUT
     tier_names = {0: "head", 1: "mid", 2: "tail"}
     all_rows = []
 
-    for seed in [0, 1, 2]:
-        cert = _load_cert("F5", seed, cert_dir)
-        run  = _load_run("F5", seed, runs_dir)
-        if "epsilon_cert_norm" not in cert: continue
-        if "tier_labels" not in run: continue
+    for run_id_t5, seeds_t5 in [("F5", [0, 1, 2]), ("F7", [0, 1, 2])]:
+        for seed in seeds_t5:
+            cert = _load_cert(run_id_t5, seed, cert_dir)
+            run  = _load_run(run_id_t5, seed, runs_dir)
+            if "epsilon_cert_norm" not in cert: continue
+            if "tier_labels" not in run: continue
 
-        en = cert["epsilon_cert_norm"]
-        ed = cert["epsilon_cert_dir_rank_100"]
-        tier_labels = run["tier_labels"]
+            en = cert["epsilon_cert_norm"]
+            ed = cert["epsilon_cert_dir_rank_100"]
+            tier_labels = run["tier_labels"]
 
-        print(f"\n  F5 seed={seed}:")
-        hdr = f"    {'tier':6s}  {'n':5s}  {'ε^norm':7s}  {'ε^dir':6s}  {'masking%':9s}"
-        print(hdr)
-        row = {"seed": seed, "tiers": {}}
-        for t_id, t_name in tier_names.items():
-            mask = (tier_labels == t_id)
-            if mask.sum() == 0: continue
-            mn  = float(en[mask].mean())
-            md  = float(ed[mask].mean())
-            msk = 100.0 * (1.0 - md / max(mn, 1e-15))
-            print(f"    {t_name:6s}  {mask.sum():5d}  {mn:7.4f}  {md:6.4f}  {msk:9.2f}%")
-            row["tiers"][t_name] = {
-                "n": int(mask.sum()),
-                "eps_norm_mean": mn, "eps_dir_mean": md,
-                "masking_pct": float(msk),
-            }
-        all_rows.append(row)
+            print(f"\n  {run_id_t5} seed={seed}:")
+            hdr = f"    {'tier':6s}  {'n':5s}  {'ε^norm':7s}  {'ε^dir':6s}  {'masking%':9s}"
+            print(hdr)
+            row = {"run_id": run_id_t5, "seed": seed, "tiers": {}}
+            for t_id, t_name in tier_names.items():
+                mask = (tier_labels == t_id)
+                if mask.sum() == 0: continue
+                mn  = float(en[mask].mean())
+                md  = float(ed[mask].mean())
+                msk = 100.0 * (1.0 - md / max(mn, 1e-15))
+                print(f"    {t_name:6s}  {mask.sum():5d}  {mn:7.4f}  {md:6.4f}  {msk:9.2f}%")
+                row["tiers"][t_name] = {
+                    "n": int(mask.sum()),
+                    "eps_norm_mean": mn, "eps_dir_mean": md,
+                    "masking_pct": float(msk),
+                }
+            all_rows.append(row)
 
-    # Seed stability: compare tier means across seeds
-    if len(all_rows) >= 2:
-        print(f"\n  Seed stability (coefficient of variation across seeds):")
-        for t_id, t_name in tier_names.items():
-            dir_vals = [r["tiers"][t_name]["eps_dir_mean"]
-                        for r in all_rows if t_name in r["tiers"]]
-            if len(dir_vals) < 2: continue
-            cv = np.std(dir_vals) / max(np.mean(dir_vals), 1e-15)
-            print(f"    {t_name:6s}: ε^dir mean across seeds={np.mean(dir_vals):.4f}  CV={cv:.4f}")
+    # Seed stability: compare tier means across seeds (per run_id)
+    for run_id_t5 in ["F5", "F7"]:
+        run_rows = [r for r in all_rows if r.get("run_id") == run_id_t5]
+        if len(run_rows) >= 2:
+            print(f"\n  {run_id_t5} seed stability (CV across seeds):")
+            for t_id, t_name in tier_names.items():
+                dir_vals = [r["tiers"][t_name]["eps_dir_mean"]
+                            for r in run_rows if t_name in r["tiers"]]
+                if len(dir_vals) < 2: continue
+                cv = np.std(dir_vals) / max(np.mean(dir_vals), 1e-15)
+                print(f"    {t_name:6s}: ε^dir mean across seeds={np.mean(dir_vals):.4f}  CV={cv:.4f}")
 
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "table5_wrn_robustness.json"), "w") as f:
@@ -801,7 +806,7 @@ def table_6(cert_dir=CERT_DIR, out_dir=OUT_DIR):
     print(f"{'='*72}")
 
     all_rows = []
-    for run_id, seeds in [("F1", [0]), ("F5", [0, 1, 2])]:
+    for run_id, seeds in [("F1", [0]), ("F5", [0, 1, 2]), ("F7", [0, 1, 2])]:
         for seed in seeds:
             tag  = f"p19_{run_id}_seed{seed}"
             cert = _load_cert(run_id, seed, cert_dir)
@@ -3039,7 +3044,7 @@ def main():
     parser.add_argument("--figure",  type=str, default=None, choices=["1","2"],
                         help="Run specific figure")
     parser.add_argument("--gaussian_validation", action="store_true")
-    parser.add_argument("--run",      type=str, default="F1", choices=["F1","F2","F5"])
+    parser.add_argument("--run",      type=str, default="F1", choices=["F1","F2","F5","F7"])
     parser.add_argument("--seed",     type=int, default=0,
                         help="Seed for --gaussian_validation / --gaussian_lowvar")
     parser.add_argument("--lira_seeds", type=int, nargs="+", default=None,
@@ -3114,7 +3119,9 @@ def main():
         table_2(args.cert_dir, args.runs_dir, args.out_dir)
     if args.all or args.table == "3":
         table_3(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,
-                lira_seeds=lira_seeds)
+                lira_seeds=lira_seeds, run_id="F1", lira_id="LF1")
+        table_3(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,
+                lira_seeds=lira_seeds, run_id="F7", lira_id="LF7")
     if args.all or args.table == "4":
         table_4(args.cert_dir, args.out_dir)
     if args.all or args.table == "5":
