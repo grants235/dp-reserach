@@ -419,12 +419,33 @@ def _rank_worker(args):
     """
     Compute C_dir for one rank r, loading arrays via mmap to avoid pickling them.
     Returns (r, C_dir_r).
+    Checkpoints every 100 steps so a killed worker resumes from the last boundary.
     """
     run_dir, cert_dir, tag, r, a, rho, sigma, q, T_use = args
     c_dir_r_ckpt = os.path.join(cert_dir, f"{tag}_C_realized_dir_rank_{r}.npy")
     if os.path.exists(c_dir_r_ckpt):
-        print(f"  [cert] Resuming: loading cached C_dir rank r={r}...")
+        print(f"  [cert] r={r}: loading completed result (cached)...")
         return r, np.load(c_dir_r_ckpt)
+
+    # Per-rank partial checkpoint (prefix distinct per r so workers don't collide)
+    partial_prefix = os.path.join(cert_dir, f"{tag}_rankwrk_{r}")
+    partial_meta   = partial_prefix + "_partial_ckpt_meta.json"
+    partial_cdir   = partial_prefix + "_partial_C_dir100.npy"
+
+    start_t = 0
+    C_dir_init = None
+    fallback_total_init = 0
+    mu_dir_max_init = mu_norm_max_init = 0.0
+    if os.path.exists(partial_meta) and os.path.exists(partial_cdir):
+        with open(partial_meta) as f:
+            _pm = json.load(f)
+        start_t             = _pm["t_completed"] + 1
+        C_dir_init          = np.load(partial_cdir)
+        fallback_total_init = int(_pm.get("fallback_total", 0))
+        mu_dir_max_init     = float(_pm.get("mu_dir_max",   0.0))
+        mu_norm_max_init    = float(_pm.get("mu_norm_max",  0.0))
+        print(f"  [cert] r={r}: resuming from step {start_t}/{T_use} "
+              f"(partial checkpoint found)...")
 
     # mmap_mode='r' lets workers share the on-disk arrays without copying them
     clipped_norms = np.load(os.path.join(run_dir, "clipped_norms.npy"), mmap_mode='r')[:, :T_use]
@@ -434,10 +455,22 @@ def _rank_worker(args):
 
     _, C_dir_r, _, _, _ = compute_realized_cumulative(
         clipped_norms, B_matrices, YTY_matrices, Y_projections,
-        a, rho, sigma, q, r, ALPHA_GRID)
+        a, rho, sigma, q, r, ALPHA_GRID,
+        start_t=start_t,
+        C_dir_init=C_dir_init,
+        fallback_total_init=fallback_total_init,
+        mu_dir_max_init=mu_dir_max_init,
+        mu_norm_max_init=mu_norm_max_init,
+        ckpt_prefix=partial_prefix,
+        ckpt_every=100)
 
     np.save(c_dir_r_ckpt, C_dir_r.astype(np.float64))
-    print(f"  [cert] Checkpoint saved: C_dir_r{r}")
+    print(f"  [cert] r={r}: completed, result saved.")
+    # Clean up per-rank partial checkpoint files
+    for _p in [partial_meta, partial_cdir,
+               partial_prefix + "_partial_C_norm.npy"]:
+        if os.path.exists(_p):
+            os.remove(_p)
     return r, C_dir_r
 
 
