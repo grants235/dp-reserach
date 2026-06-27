@@ -2350,11 +2350,9 @@ def figure_mnist_distribution_f7(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=O
         return ed, en
 
     panels = [("F1", "CLIP linear head, CIFAR-10-LT(50)"),
-              ("F2", "CLIP linear head, balanced CIFAR-10"),
-              ("F7", "MNISTConvNet, MNIST-LT(10)"),
-              ("F8", "MNISTConvNet, balanced MNIST")]
+              ("F7", "MNISTConvNet, MNIST-LT(10)")]
 
-    fig, axes = plt.subplots(1, 4, figsize=(24, 4.5))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
 
     any_found = False
     for ax, (run_id, subtitle) in zip(axes, panels):
