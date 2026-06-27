@@ -55,9 +55,9 @@ RUNS = {
     "F5": dict(dataset="cifar10_lt50", regime="R2", arch="wrn28-2",     eps=8.0, B_expected=1400, n_seeds=3, epochs=60),
     "F6": dict(dataset="cifar10_lt10", regime="R2", arch="resnet20",    eps=8.0, B_expected=2000, n_seeds=3, epochs=60),
     "F7": dict(dataset="mnist_lt10", regime="R2", arch="dpconv", eps=8.0,
-               B_expected=512, n_seeds=3, epochs=80, lr=0.6, r_max=100),
+               B_expected=512, n_seeds=3, epochs=40, lr=0.6, r_max=100),
     "F8": dict(dataset="mnist",     regime="R2", arch="dpconv", eps=8.0,
-               B_expected=512, n_seeds=3, epochs=80, lr=0.6, r_max=100),
+               B_expected=512, n_seeds=3, epochs=40, lr=0.6, r_max=100),
 }
 
 # LiRA targets per run
