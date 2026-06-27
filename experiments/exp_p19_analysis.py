@@ -2060,50 +2060,65 @@ def rank_stability(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=OUT_DIR,
 # ===========================================================================
 
 def figure_degeneracy_s2(cert_dir=CERT_DIR, out_dir=OUT_DIR):
-    """Figure A (fig:degeneracy): S2=F2 seed 0. Strip rows for ε^norm vs ε^dir."""
+    """Figure A (fig:degeneracy): two-panel strip plot — F1 (left) and F7 (right), seed 0."""
     plt = _plt()
     os.makedirs(out_dir, exist_ok=True)
     if plt is None:
         return
 
-    cert = _load_cert("F2", 0, cert_dir)
-    if "epsilon_cert_norm" not in cert or "epsilon_cert_dir_rank_100" not in cert:
-        print("  [Fig A] F2 seed 0 cert arrays missing — skipping.")
-        return
+    panels = [
+        ("F1", "CLIP linear head, CIFAR-10-LT(50)"),
+        ("F7", "MNISTConvNet, MNIST-LT(10)"),
+    ]
 
-    en = cert["epsilon_cert_norm"]
-    ed = cert["epsilon_cert_dir_rank_100"]
-
-    med_norm = float(np.median(en))
-    cv_dir   = float(ed.std() / max(ed.mean(), 1e-15))
-    p5_dir   = float(np.percentile(ed, 5))
-    p95_dir  = float(np.percentile(ed, 95))
-    med_mask = float(np.median(1.0 - ed / np.maximum(en, 1e-15)))
-
-    print(f"\n  [Fig A] F2 seed 0:")
-    print(f"    median(ε^norm)            = {med_norm:.4f}")
-    print(f"    CV(ε^dir)                 = {cv_dir:.4f}")
-    print(f"    p5(ε^dir)                 = {p5_dir:.4f}")
-    print(f"    p95(ε^dir)                = {p95_dir:.4f}")
-    print(f"    median(1 − ε^dir/ε^norm)  = {med_mask:.4f}")
-
-    rng = np.random.default_rng(42)
+    rng    = np.random.default_rng(42)
     jitter = 0.04
 
-    fig, ax = plt.subplots(figsize=(8, 3.5))
-    y_norm = np.ones(len(en))  + rng.uniform(-jitter, jitter, len(en))
-    y_dir  = np.zeros(len(ed)) + rng.uniform(-jitter, jitter, len(ed))
-    ax.scatter(en, y_norm, s=3, alpha=0.25, color="steelblue", rasterized=True, label="ε^norm")
-    ax.scatter(ed, y_dir,  s=3, alpha=0.25, color="firebrick",  rasterized=True, label="ε^dir")
-    ax.axvline(med_norm, color="steelblue", linestyle="--", linewidth=1.2, alpha=0.8)
-    ax.annotate(f"median ε^norm = {med_norm:.2f}",
-                xy=(med_norm, 1.28), ha="center", fontsize=8, color="steelblue")
-    ax.set_yticks([0, 1])
-    ax.set_yticklabels(["ε^dir", "ε^norm"])
-    ax.set_ylim(-0.35, 1.55)
-    ax.set_xlabel("Certified ε value")
-    ax.set_title("S2 — CLIP linear head, balanced CIFAR-10")
-    ax.grid(True, axis="x", alpha=0.3)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 3.5))
+    any_found = False
+
+    for ax, (run_id, subtitle) in zip(axes, panels):
+        cert = _load_cert(run_id, 0, cert_dir)
+        if "epsilon_cert_norm" not in cert or "epsilon_cert_dir_rank_100" not in cert:
+            print(f"  [Fig A] {run_id} seed 0 cert arrays missing — skipping panel.")
+            ax.set_title(f"{run_id} — no data"); continue
+        any_found = True
+
+        en = cert["epsilon_cert_norm"]
+        ed = cert["epsilon_cert_dir_rank_100"]
+
+        med_norm = float(np.median(en))
+        cv_dir   = float(ed.std() / max(ed.mean(), 1e-15))
+        p5_dir   = float(np.percentile(ed, 5))
+        p95_dir  = float(np.percentile(ed, 95))
+        med_mask = float(np.median(1.0 - ed / np.maximum(en, 1e-15)))
+
+        print(f"\n  [Fig A] {run_id} seed 0:")
+        print(f"    median(ε^norm)            = {med_norm:.4f}")
+        print(f"    CV(ε^dir)                 = {cv_dir:.4f}")
+        print(f"    p5(ε^dir)                 = {p5_dir:.4f}")
+        print(f"    p95(ε^dir)                = {p95_dir:.4f}")
+        print(f"    median(1 − ε^dir/ε^norm)  = {med_mask:.4f}")
+
+        y_norm = np.ones(len(en))  + rng.uniform(-jitter, jitter, len(en))
+        y_dir  = np.zeros(len(ed)) + rng.uniform(-jitter, jitter, len(ed))
+        ax.scatter(en, y_norm, s=3, alpha=0.25, color="steelblue",
+                   rasterized=True, label="ε^norm")
+        ax.scatter(ed, y_dir,  s=3, alpha=0.25, color="firebrick",
+                   rasterized=True, label="ε^dir")
+        ax.axvline(med_norm, color="steelblue", linestyle="--", linewidth=1.2, alpha=0.8)
+        ax.annotate(f"median ε^norm = {med_norm:.2f}",
+                    xy=(med_norm, 1.28), ha="center", fontsize=8, color="steelblue")
+        ax.set_yticks([0, 1])
+        ax.set_yticklabels(["ε^dir", "ε^norm"])
+        ax.set_ylim(-0.35, 1.55)
+        ax.set_xlabel("Certified ε value")
+        ax.set_title(subtitle)
+        ax.grid(True, axis="x", alpha=0.3)
+
+    if not any_found:
+        plt.close(fig); print("  [Fig A] No data for F1 or F7 — skipping."); return
+
     fig.tight_layout()
     path = os.path.join(out_dir, "figure_s2_degeneracy.png")
     fig.savefig(path, dpi=150)
