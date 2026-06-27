@@ -2272,55 +2272,140 @@ def figure_wrn_distribution_s3(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=OUT
     print(f"  [Fig C] saved → {path}")
 
 
+def figure_mnist_distribution_f7(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=OUT_DIR):
+    """Figure D (fig:mnist): two-panel violin — F1 (left) and F7 (right), pooled seeds 0-2."""
+    plt = _plt()
+    os.makedirs(out_dir, exist_ok=True)
+    if plt is None:
+        return
+
+    tier_names  = {0: "head", 1: "mid", 2: "tail"}
+    tier_colors = {0: "steelblue", 1: "orange", 2: "firebrick"}
+
+    def _pool_tiers(run_id):
+        ed_by_tier = {0: [], 1: [], 2: []}
+        en_by_tier = {0: [], 1: [], 2: []}
+        found = False
+        for seed in [0, 1, 2]:
+            cert = _load_cert(run_id, seed, cert_dir)
+            run  = _load_run(run_id,  seed, runs_dir)
+            if ("epsilon_cert_norm" not in cert
+                    or "epsilon_cert_dir_rank_100" not in cert):
+                print(f"  [Fig D] {run_id} seed={seed} cert missing — skipping."); continue
+            if "tier_labels" not in run:
+                print(f"  [Fig D] {run_id} seed={seed} tier_labels missing — skipping."); continue
+            found = True
+            for t_id in [0, 1, 2]:
+                mask = (run["tier_labels"] == t_id)
+                ed_by_tier[t_id].append(cert["epsilon_cert_dir_rank_100"][mask])
+                en_by_tier[t_id].append(cert["epsilon_cert_norm"][mask])
+        if not found:
+            return None, None
+        ed = {t: np.concatenate(v) for t, v in ed_by_tier.items() if v}
+        en = {t: np.concatenate(v) for t, v in en_by_tier.items() if v}
+        return ed, en
+
+    panels = [("F1", "CLIP linear head, CIFAR-10-LT(50)"),
+              ("F7", "MNISTConvNet, MNIST-LT(10)")]
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+
+    any_found = False
+    for ax, (run_id, subtitle) in zip(axes, panels):
+        ed_pooled, en_pooled = _pool_tiers(run_id)
+        if ed_pooled is None:
+            ax.set_title(f"{run_id} — no data"); continue
+        any_found = True
+
+        all_en = np.concatenate(list(en_pooled.values())) if en_pooled else np.array([])
+        norm_ref = float(np.median(all_en)) if len(all_en) > 0 else float("nan")
+
+        print(f"\n  [Fig D] {run_id} per-tier summary (pooled seeds 0-2):")
+        for t_id, t_name in tier_names.items():
+            if t_id not in ed_pooled or len(ed_pooled[t_id]) == 0: continue
+            mean_dir  = float(ed_pooled[t_id].mean())
+            mean_norm = float(en_pooled.get(t_id, np.array([norm_ref])).mean())
+            masking   = 100.0 * (1.0 - mean_dir / max(mean_norm, 1e-15))
+            print(f"    {t_name:6s}: mean(ε^dir)={mean_dir:.4f}  "
+                  f"mean(ε^norm)={mean_norm:.4f}  masking={masking:.1f}%")
+
+        data = [ed_pooled.get(t, np.array([0.0])) for t in [0, 1, 2]]
+        parts = ax.violinplot(data, positions=[0, 1, 2],
+                              showmedians=True, showextrema=False)
+        for pc, t_id in zip(parts["bodies"], [0, 1, 2]):
+            pc.set_facecolor(tier_colors[t_id]); pc.set_alpha(0.6)
+        if np.isfinite(norm_ref):
+            ax.axhline(norm_ref, color="gray", linestyle="--", linewidth=1.2,
+                       alpha=0.8, label=f"ε^norm = {norm_ref:.2f}")
+        ax.set_xticks([0, 1, 2])
+        ax.set_xticklabels([tier_names[t] for t in [0, 1, 2]])
+        ax.set_xlabel("Tier"); ax.set_ylabel("ε^dir cert (r=100)")
+        ax.set_title(subtitle)
+        ax.legend(fontsize=9); ax.grid(True, axis="y", alpha=0.3)
+
+    if not any_found:
+        plt.close(fig); print("  [Fig D] No data found for F1 or F7 — skipping."); return
+
+    fig.tight_layout()
+    path = os.path.join(out_dir, "figure_f7_dir_distribution.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  [Fig D] saved → {path}")
+
+
 # ===========================================================================
 # Consolidated correlation table for paper (tab:lira)
 # ===========================================================================
 
-def table_lira_paper(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
-                     out_dir=OUT_DIR, seeds=(0, 1, 2),
-                     setting="F1", lira_id="LF1"):
-    """
-    Four rows (ε^dir, ε^norm, loss, gen-leverage) × four scopes (overall/head/mid/tail).
-    Mean Spearman across seeds 0,1,2; ε^norm constant in mid/tail → 'undef.'.
-    Outputs table_lira_paper[_<setting>].json and .tex.
+_LIRA_SCOPES   = ["overall", "head", "mid", "tail"]
+_LIRA_ROW_KEYS = ["eps_dir", "eps_norm", "loss", "gen_leverage"]
+_LIRA_ROW_LABELS = {
+    "eps_dir":      "ε^dir",
+    "eps_norm":     "ε^norm",
+    "loss":         "loss",
+    "gen_leverage": "gen-leverage",
+}
+_LIRA_ROW_TEX = {
+    "eps_dir":      r"$\varepsilon^{\mathrm{dir}}$",
+    "eps_norm":     r"$\varepsilon^{\mathrm{norm}}$",
+    "loss":         r"loss",
+    "gen_leverage": r"gen-leverage",
+}
 
-    setting: run ID for certs/runs (default "F1"; use "F5" for S3).
-    lira_id: LiRA run ID (default "LF1"; use "LF5" for S3).
-    """
-    tag_label  = f"{setting}×{lira_id}"
-    out_suffix = "" if setting == "F1" else f"_{setting.lower()}"
-    print(f"\n{'='*72}")
-    print(f"  table_lira_paper ({tag_label}): consolidated correlation table (tab:lira)")
-    print(f"{'='*72}")
 
+def _compute_lira_cells(setting, lira_id, cert_dir, lira_dir, runs_dir, seeds):
+    """
+    Compute the 4-row × 4-scope mean Spearman cells for one (setting, lira_id) pair.
+    Returns dict keyed by (row_key, scope).
+    """
     tier_names_map = {0: "head", 1: "mid", 2: "tail"}
-    scopes         = ["overall", "head", "mid", "tail"]
-    row_keys       = ["eps_dir", "eps_norm", "loss", "gen_leverage"]
-    accum          = {rk: {sc: [] for sc in scopes} for rk in row_keys}
+    accum = {rk: {sc: [] for sc in _LIRA_SCOPES} for rk in _LIRA_ROW_KEYS}
+
+    def _rho(arr, D, mask=None):
+        if arr is None: return float("nan")
+        a, d = np.asarray(arr, np.float64), np.asarray(D, np.float64)
+        if mask is not None: a, d = a[mask], d[mask]
+        rho, _, _ = _spearman_ci(a, d, n_boot=0)
+        return rho
 
     for seed in seeds:
-        lf1  = _load_lira(lira_id, lira_dir, seed=seed)
-        cert = _load_cert(setting, seed, cert_dir)
-        run  = _load_run(setting,  seed, runs_dir)
+        lf_data = _load_lira(lira_id, lira_dir, seed=seed)
+        cert    = _load_cert(setting, seed, cert_dir)
+        run     = _load_run(setting,  seed, runs_dir)
 
-        if not lf1 or "D_lira_members" not in lf1:
+        if not lf_data or "D_lira_members" not in lf_data:
             print(f"  [missing] D_lira_members {lira_id} seed={seed}"); continue
         if "epsilon_cert_dir_rank_100" not in cert or "epsilon_cert_norm" not in cert:
             print(f"  [missing] cert arrays {setting} seed={seed}"); continue
 
-        # Resolve target→cert-array index mapping.  Priority (most to least reliable):
-        #   1. targets_members.npy in LiRA output dir  (saved in same pass as D_lira)
-        #   2. lira_member_local_idx.npy in LiRA output dir  (same pass, older naming)
-        #   3. lira_member_local_idx.npy in run dir  (may have been written at train time
-        #      with a different target set or ordering than the actual LiRA run)
-        D_lira = lf1["D_lira_members"]
+        D_lira        = lf_data["D_lira_members"]
         lira_seed_dir = os.path.join(lira_dir, lira_id, f"seed_{seed}")
         lira_ml_path  = os.path.join(lira_seed_dir, "lira_member_local_idx.npy")
         run_ml_path   = os.path.join(runs_dir, setting, f"seed_{seed}",
                                      "lira_member_local_idx.npy")
 
-        if lf1.get("targets_members") is not None:
-            member_local = lf1["targets_members"].astype(int)
+        if lf_data.get("targets_members") is not None:
+            member_local = lf_data["targets_members"].astype(int)
             idx_src = f"targets_members in {lira_id} dir"
         elif os.path.exists(lira_ml_path):
             member_local = np.load(lira_ml_path).astype(int)
@@ -2329,7 +2414,7 @@ def table_lira_paper(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
             member_local = np.load(run_ml_path).astype(int)
             idx_src = f"lira_member_local_idx in {setting} run dir"
         else:
-            print(f"  [missing] no member-index file found for {setting}/{lira_id} "
+            print(f"  [missing] no member-index file for {setting}/{lira_id} "
                   f"seed={seed}"); continue
 
         n_cert = len(cert["epsilon_cert_dir_rank_100"])
@@ -2342,9 +2427,9 @@ def table_lira_paper(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
             print(f"  [WARN s{seed}] member_local.max()={member_local.max()} >= "
                   f"cert array len={n_cert} — index out of range, wrong source!")
 
-        n_m    = min(len(D_lira), len(member_local))
-        D_use  = D_lira[:n_m]
-        idx    = member_local[:n_m]
+        n_m      = min(len(D_lira), len(member_local))
+        D_use    = D_lira[:n_m]
+        idx      = member_local[:n_m]
         tier_all = run.get("tier_labels")
         tier_m   = tier_all[idx] if tier_all is not None else None
 
@@ -2368,21 +2453,10 @@ def table_lira_paper(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
         else:
             print(f"  [missing] Nystrom matrices {setting} seed={seed} — gen-leverage skipped.")
 
-        def _rho(arr, D, mask=None):
-            if arr is None: return float("nan")
-            a, d = (np.asarray(arr, np.float64),
-                    np.asarray(D,   np.float64))
-            if mask is not None: a, d = a[mask], d[mask]
-            rho, _, _ = _spearman_ci(a, d, n_boot=0)
-            return rho
-
         # Cross-consistency check: Spearman(ε^dir, loss_final) within member targets.
-        # If the cert and run are from the same model, this should be strongly
-        # positive (high training loss → large gradient → high ε^dir).
-        # Near-zero or negative means the cert was computed from a different model
-        # or checkpoint than the run (the most common source of S3 cert issues).
+        # Near-zero or negative → cert and run are likely from different checkpoints.
         if loss_m is not None:
-            rho_dir_loss = _rho(eps_dir_m, loss_m)
+            rho_dir_loss  = _rho(eps_dir_m,  loss_m)
             rho_norm_loss = _rho(eps_norm_m, loss_m)
             flag = ("  !! cert/run MISMATCH — check that certs/p19/{setting} "
                     "and runs/p19/{setting} are from the same training run !!"
@@ -2390,7 +2464,7 @@ def table_lira_paper(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
             print(f"  [consistency s{seed}] Spearman(ε^dir, loss)={rho_dir_loss:+.3f}  "
                   f"Spearman(ε^norm, loss)={rho_norm_loss:+.3f}{flag}")
 
-        for scope in scopes:
+        for scope in _LIRA_SCOPES:
             if scope == "overall":
                 mask = None
                 D_sc = D_use
@@ -2401,12 +2475,12 @@ def table_lira_paper(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
                 if mask.sum() < 5: continue
                 D_sc = D_use[mask]
 
-            def _apply(arr):
+            # Capture mask/D_sc by value to avoid closure-over-loop-variable bugs
+            def _apply(arr, _m=mask, _D=D_sc):
                 if arr is None: return float("nan")
                 a = np.asarray(arr, np.float64)
-                return _rho(a if mask is None else a[mask], D_sc)
+                return _rho(a if _m is None else a[_m], _D)
 
-            # ε^norm: undef. if constant within mid/tail
             en_sc = eps_norm_m if mask is None else eps_norm_m[mask]
             if scope in ("mid", "tail") and (en_sc.max() - en_sc.min()) < 0.01:
                 accum["eps_norm"][scope].append("undef.")
@@ -2426,23 +2500,12 @@ def table_lira_paper(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
         if not numeric: return float("nan")
         return float(np.mean(numeric))
 
-    cells = {(rk, sc): _mean_or_undef(accum[rk][sc])
-             for rk in row_keys for sc in scopes}
+    return {(rk, sc): _mean_or_undef(accum[rk][sc])
+            for rk in _LIRA_ROW_KEYS for sc in _LIRA_SCOPES}
 
-    # Print table
-    row_labels = {"eps_dir": "ε^dir", "eps_norm": "ε^norm",
-                  "loss": "loss", "gen_leverage": "gen-leverage"}
-    print(f"\n  {'Row':14s} | {'Overall':8s} | {'Head':8s} | {'Mid':8s} | {'Tail':8s}")
-    print(f"  {'-'*60}")
-    for rk in row_keys:
-        def _f(v):
-            if v == "undef.": return "undef.  "
-            if isinstance(v, float) and not np.isfinite(v): return "nan     "
-            return f"{float(v):8.3f}"
-        print(f"  {row_labels[rk]:14s} | " +
-              " | ".join(_f(cells[(rk, sc)]) for sc in scopes))
 
-    # Footnote scalars from existing outputs
+def _lira_footnotes(out_dir):
+    """Load tier-label ρ and LT-IQR ρ footnote scalars from existing JSON outputs."""
     ft_tier = float("nan")
     ft_ltiqr = float("nan")
     t3_path = os.path.join(out_dir, "table3_lira_correlation.json")
@@ -2464,10 +2527,42 @@ def table_lira_paper(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
                 and "AGGREGATE" in r["label"] and "LT-IQR" in r["label"]
                 and r.get("scope") == "overall" and "rho_mean" in r]
         if rhos: ft_ltiqr = float(np.mean(rhos))
+    return ft_tier, ft_ltiqr
 
+
+def table_lira_paper(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
+                     out_dir=OUT_DIR, seeds=(0, 1, 2),
+                     setting="F1", lira_id="LF1"):
+    """
+    Four rows (ε^dir, ε^norm, loss, gen-leverage) × four scopes (overall/head/mid/tail).
+    Mean Spearman across seeds 0,1,2; ε^norm constant in mid/tail → 'undef.'.
+    Outputs table_lira_paper[_<setting>].json and .tex.
+
+    setting: run ID for certs/runs (default "F1"; use "F5" for S3).
+    lira_id: LiRA run ID (default "LF1"; use "LF5" for S3).
+    """
+    tag_label  = f"{setting}×{lira_id}"
+    out_suffix = "" if setting == "F1" else f"_{setting.lower()}"
+    print(f"\n{'='*72}")
+    print(f"  table_lira_paper ({tag_label}): consolidated correlation table (tab:lira)")
+    print(f"{'='*72}")
+
+    cells = _compute_lira_cells(setting, lira_id, cert_dir, lira_dir, runs_dir, seeds)
+
+    def _f(v):
+        if v == "undef.": return "undef.  "
+        if isinstance(v, float) and not np.isfinite(v): return "nan     "
+        return f"{float(v):8.3f}"
+
+    print(f"\n  {'Row':14s} | {'Overall':8s} | {'Head':8s} | {'Mid':8s} | {'Tail':8s}")
+    print(f"  {'-'*60}")
+    for rk in _LIRA_ROW_KEYS:
+        print(f"  {_LIRA_ROW_LABELS[rk]:14s} | " +
+              " | ".join(_f(cells[(rk, sc)]) for sc in _LIRA_SCOPES))
+
+    ft_tier, ft_ltiqr = _lira_footnotes(out_dir)
     print(f"\n  Footnote: tier-label ρ={ft_tier:.3f}  LT-IQR ρ={ft_ltiqr:.3f}")
 
-    # Serialise
     cells_json = {f"{rk}|{sc}":
                   (v if isinstance(v, str) else
                    (None if isinstance(v, float) and not np.isfinite(v) else v))
@@ -2487,31 +2582,122 @@ def table_lira_paper(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
         json.dump(out_json, f, indent=2)
     print(f"  [saved] {out_dir}/{json_name}")
 
-    # LaTeX
     def _tex(v):
         if v == "undef.": return r"\text{undef.}"
         if v is None or (isinstance(v, float) and not np.isfinite(v)): return "--"
         return f"{float(v):.3f}"
 
-    row_tex = {
-        "eps_dir":      r"$\varepsilon^{\mathrm{dir}}$",
-        "eps_norm":     r"$\varepsilon^{\mathrm{norm}}$",
-        "loss":         r"loss",
-        "gen_leverage": r"gen-leverage",
-    }
     lines = [r"\begin{tabular}{lrrrr}", r"\toprule",
              r"Predictor & Overall & Head & Mid & Tail \\", r"\midrule"]
-    for rk in row_keys:
-        vals = " & ".join(_tex(cells[(rk, sc)]) for sc in scopes)
-        lines.append(f"{row_tex[rk]} & {vals} \\\\")
+    for rk in _LIRA_ROW_KEYS:
+        vals = " & ".join(_tex(cells[(rk, sc)]) for sc in _LIRA_SCOPES)
+        lines.append(f"{_LIRA_ROW_TEX[rk]} & {vals} \\\\")
     lines += [r"\bottomrule", r"\end{tabular}",
               f"% Footnote: tier-label ρ={ft_tier:.3f}; LT-IQR ρ={ft_ltiqr:.3f}"]
-    tex_name = f"table_lira_paper{out_suffix}.tex"
-    tex_path = os.path.join(out_dir, tex_name)
+    tex_path = os.path.join(out_dir, f"table_lira_paper{out_suffix}.tex")
     with open(tex_path, "w") as f:
         f.write("\n".join(lines) + "\n")
     print(f"  [saved] {tex_path}")
     return cells, ft_tier, ft_ltiqr
+
+
+def table_lira_paper_combined(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
+                               out_dir=OUT_DIR, seeds=(0, 1, 2),
+                               settings=(("F1", "LF1"), ("F7", "LF7"))):
+    """
+    Combined Spearman correlation table for multiple settings.
+
+    Rows: (Setting, Predictor) pairs; columns: Overall / Head / Mid / Tail.
+    Also saves per-setting JSON files (table_lira_paper[_<setting>].json) so that
+    emit_paper_numbers can still load them by name.
+    Outputs table_lira_paper_combined.json and .tex.
+    """
+    print(f"\n{'='*72}")
+    tag = "+".join(f"{s}×{l}" for s, l in settings)
+    print(f"  table_lira_paper_combined ({tag})")
+    print(f"{'='*72}")
+
+    all_cells = {}   # (setting, rk, sc) → value
+    for setting, lira_id in settings:
+        print(f"\n  -- {setting}×{lira_id} --")
+        cells = _compute_lira_cells(setting, lira_id, cert_dir, lira_dir, runs_dir, seeds)
+        for (rk, sc), v in cells.items():
+            all_cells[(setting, rk, sc)] = v
+
+        # Save individual JSON so emit_paper_numbers keeps working
+        out_suffix = "" if setting == "F1" else f"_{setting.lower()}"
+        cells_json = {f"{rk}|{sc}":
+                      (v if isinstance(v, str) else
+                       (None if isinstance(v, float) and not np.isfinite(v) else v))
+                      for (rk, sc), v in cells.items()}
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, f"table_lira_paper{out_suffix}.json"), "w") as f:
+            json.dump({"cells": cells_json,
+                       "provenance": f"{setting}×{lira_id} seeds {list(seeds)}"}, f, indent=2)
+
+    ft_tier, ft_ltiqr = _lira_footnotes(out_dir)
+
+    # ---- Console print ----
+    def _f(v):
+        if v == "undef.": return "undef.  "
+        if isinstance(v, float) and not np.isfinite(v): return "nan     "
+        return f"{float(v):8.3f}"
+
+    print(f"\n  {'Setting':8s}  {'Predictor':14s} | "
+          f"{'Overall':>10s} | {'Head':>8s} | {'Mid':>8s} | {'Tail':>8s}")
+    print(f"  {'-'*72}")
+    for setting, lira_id in settings:
+        for i, rk in enumerate(_LIRA_ROW_KEYS):
+            setting_lbl = setting if i == 0 else ""
+            print(f"  {setting_lbl:8s}  {_LIRA_ROW_LABELS[rk]:14s} | " +
+                  " | ".join(_f(all_cells[(setting, rk, sc)]) for sc in _LIRA_SCOPES))
+        print(f"  {'-'*72}")
+    print(f"  Footnote: tier-label ρ={ft_tier:.3f}  LT-IQR ρ={ft_ltiqr:.3f}")
+
+    # ---- JSON ----
+    combined_json = {
+        "settings": [{"setting": s, "lira_id": l} for s, l in settings],
+        "rows": [
+            {"setting": s, "predictor": rk,
+             **{sc: (all_cells[(s, rk, sc)] if isinstance(all_cells[(s, rk, sc)], str)
+                     else (None if isinstance(all_cells[(s, rk, sc)], float)
+                           and not np.isfinite(all_cells[(s, rk, sc)])
+                           else all_cells[(s, rk, sc)]))
+                for sc in _LIRA_SCOPES}}
+            for s, _ in settings for rk in _LIRA_ROW_KEYS
+        ],
+        "footnote_tier_label_spearman": float(ft_tier)  if np.isfinite(ft_tier)  else None,
+        "footnote_lt_iqr_spearman":     float(ft_ltiqr) if np.isfinite(ft_ltiqr) else None,
+    }
+    json_path = os.path.join(out_dir, "table_lira_paper_combined.json")
+    with open(json_path, "w") as f:
+        json.dump(combined_json, f, indent=2)
+    print(f"\n  [saved] {json_path}")
+
+    # ---- LaTeX ----
+    def _tex(v):
+        if v == "undef.": return r"\text{undef.}"
+        if v is None or (isinstance(v, float) and not np.isfinite(v)): return "--"
+        return f"{float(v):.3f}"
+
+    lines = [r"\begin{tabular}{llrrrr}", r"\toprule",
+             r"Setting & Predictor & Overall & Head & Mid & Tail \\", r"\midrule"]
+    for s_idx, (setting, lira_id) in enumerate(settings):
+        if s_idx > 0:
+            lines.append(r"\midrule")
+        n_rows = len(_LIRA_ROW_KEYS)
+        for i, rk in enumerate(_LIRA_ROW_KEYS):
+            setting_tex = (r"\multirow{" + str(n_rows) + r"}{*}{" + setting + r"}"
+                           if i == 0 else "")
+            vals = " & ".join(_tex(all_cells[(setting, rk, sc)]) for sc in _LIRA_SCOPES)
+            lines.append(f"{setting_tex} & {_LIRA_ROW_TEX[rk]} & {vals} \\\\")
+    lines += [r"\bottomrule", r"\end{tabular}",
+              f"% Footnote: tier-label ρ={ft_tier:.3f}; LT-IQR ρ={ft_ltiqr:.3f}"]
+    tex_path = os.path.join(out_dir, "table_lira_paper_combined.tex")
+    with open(tex_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"  [saved] {tex_path}")
+    return all_cells
 
 
 # ===========================================================================
@@ -3080,13 +3266,15 @@ def main():
     # Paper-mode flags (Section 4 / 5 rewrite artifacts)
     # ------------------------------------------------------------------
     parser.add_argument("--paper",         action="store_true",
-                        help="Produce all paper artifacts: figures A/B/C, tab:lira, paper_numbers.json")
+                        help="Produce all paper artifacts: figures A/B/C/D, tab:lira (F1/F5/F7), paper_numbers.json")
     parser.add_argument("--paper_figures", action="store_true",
-                        help="Figures A (fig:degeneracy), B (fig:withintier), C (fig:wrn)")
+                        help="Figures A (fig:degeneracy), B (fig:withintier), C (fig:wrn), D (fig:mnist/F7)")
     parser.add_argument("--paper_table",    action="store_true",
                         help="table_lira_paper() — consolidated 4×4 correlation table (S1/F1×LF1)")
     parser.add_argument("--paper_table_s3", action="store_true",
                         help="table_lira_paper(setting=F5,lira_id=LF5) — same table for S3")
+    parser.add_argument("--paper_table_f7", action="store_true",
+                        help="table_lira_paper(setting=F7,lira_id=LF7) — same table for F7 MNIST CNN")
     parser.add_argument("--paper_numbers", action="store_true",
                         help="emit_paper_numbers() — paper_numbers.json manifest")
     parser.add_argument("--paper_seed",    type=int, default=0,
@@ -3177,6 +3365,7 @@ def main():
     do_figures   = args.paper or args.paper_figures
     do_table     = args.paper or args.paper_table
     do_table_s3  = args.paper or args.paper_table_s3
+    do_table_f7  = args.paper or args.paper_table_f7
     do_numbers   = args.paper or args.paper_numbers
 
     if do_figures:
@@ -3184,10 +3373,20 @@ def main():
         figure_withintier_s1(args.cert_dir, args.lira_dir, args.runs_dir,
                               args.out_dir, paper_seed=args.paper_seed)
         figure_wrn_distribution_s3(args.cert_dir, args.runs_dir, args.out_dir)
+        figure_mnist_distribution_f7(args.cert_dir, args.runs_dir, args.out_dir)
 
-    if do_table:
-        table_lira_paper(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,
-                         setting="F1", lira_id="LF1")
+    # --paper (or both individual flags) → single combined F1+F7 table
+    if args.paper or (do_table and do_table_f7):
+        table_lira_paper_combined(
+            args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,
+            settings=(("F1", "LF1"), ("F7", "LF7")))
+    else:
+        if do_table:
+            table_lira_paper(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,
+                             setting="F1", lira_id="LF1")
+        if do_table_f7:
+            table_lira_paper(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,
+                             setting="F7", lira_id="LF7")
 
     if do_table_s3:
         table_lira_paper(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,
