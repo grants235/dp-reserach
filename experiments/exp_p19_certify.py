@@ -41,8 +41,12 @@ CERT_DIR = "./certs/p19"
 
 RANK_ABLATION = [10, 25, 50, 100, 200]
 
-# α grid: same structure as Phase 18 but using exact formula here
+# α grid: low end densified for small-shift regimes (F7/F8 barely-clipped MNIST).
+# Orders below 1.5 carry large log(1/δ)/(α-1) conversion penalties for δ≤1e-5 and
+# are never selected by the δ-penalized min; they are included to support future
+# tighter conversions (e.g. PRV or fixed-α comparison) that bypass that penalty.
 ALPHA_GRID = np.concatenate([
+    np.array([1.01, 1.05, 1.1, 1.2, 1.25, 1.35]),
     np.arange(1.5,  10,    0.5),
     np.arange(10,   100,   2.0),
     np.arange(100,  1000,  20.0),
@@ -144,7 +148,10 @@ def build_budget_grid(sigma: float, q: float, T: int,
     for j, alpha in enumerate(alpha_grid):
         eps_ceil = eps_sgm_scalar(alpha, q, mu_ceiling)
         bmax     = T * eps_ceil
-        delta_a  = max(1e-5, bmax / 5000.0)
+        # Grid step: B_max/100000 (was /5000) so that barely-clipped regimes
+        # (e.g. F7/F8 where μ_dir << 1/σ) land in distinct buckets rather than
+        # all collapsing to bucket-1 and producing a constant certified ε.
+        delta_a  = max(1e-7, bmax / 100000.0)
         m_a      = math.ceil(bmax / delta_a) if bmax > 0 else 0
         Bmax[j]  = bmax
         Delta[j] = delta_a
@@ -631,6 +638,22 @@ def certify_run(run_dir: str, cert_dir: str, ranks=None,
     eps_cert_norm,     best_alpha_norm     = certified_epsilon(B_cert_norm,    ALPHA_GRID, delta)
     eps_cert_dir_100,  best_alpha_dir_100  = certified_epsilon(B_cert_dir_100, ALPHA_GRID, delta)
 
+    if verbose:
+        # α* distribution — key floor-pinning diagnostic.
+        # If α* is railed at the grid minimum for most examples while ε^dir is
+        # constant, the log(1/δ)/(α-1) term is dominating; finer Δ or tighter
+        # conversion is needed.
+        _adir  = ALPHA_GRID[best_alpha_dir_100.astype(int)]
+        _anorm = ALPHA_GRID[best_alpha_norm.astype(int)]
+        _at_min_dir  = (best_alpha_dir_100  == 0).mean()
+        _at_min_norm = (best_alpha_norm     == 0).mean()
+        print(f"  [diag] α* (dir  r={headline_rank}): "
+              f"p5={np.percentile(_adir,5):.1f}  med={np.median(_adir):.1f}  "
+              f"p95={np.percentile(_adir,95):.1f}  at_grid_min={_at_min_dir:.1%}")
+        print(f"  [diag] α* (norm):         "
+              f"p5={np.percentile(_anorm,5):.1f}  med={np.median(_anorm):.1f}  "
+              f"p95={np.percentile(_anorm,95):.1f}  at_grid_min={_at_min_norm:.1%}")
+
     # ===================================================================
     # STEP 4: Rank ablation (parallel across ranks)
     # ===================================================================
@@ -729,6 +752,21 @@ def certify_run(run_dir: str, cert_dir: str, ranks=None,
         np.save(dhat2_ckpt,    dhat2_100.astype(np.float32))
         np.save(fallback_ckpt, fallback_100.astype(bool))
         print(f"  [cert] Checkpoint saved: Ufull/dhat2 diagnostics (r={headline_rank})")
+
+    if verbose:
+        # d_hat shift distribution — confirms whether μ_dir has genuine per-example
+        # spread or is uniformly near zero (which would floor-pin ε^dir regardless
+        # of grid resolution).
+        _dhat2 = np.load(dhat2_ckpt).astype(np.float64)
+        _mu    = np.sqrt(np.maximum(_dhat2, 0.0)).mean(axis=1)   # (n,) mean over T
+        _spread = np.percentile(_mu, 95) - np.percentile(_mu, 5)
+        print(f"  [diag] μ_dir per-example (mean over T steps):")
+        print(f"         p1={np.percentile(_mu,1):.6f}  p5={np.percentile(_mu,5):.6f}  "
+              f"p25={np.percentile(_mu,25):.6f}  med={np.median(_mu):.6f}  "
+              f"p75={np.percentile(_mu,75):.6f}  p95={np.percentile(_mu,95):.6f}  "
+              f"max={_mu.max():.6f}")
+        print(f"         spread(p95-p5)={_spread:.6f}  "
+              f"frac_near_zero(μ<1e-4)={((_mu < 1e-4).mean()):.1%}")
 
     # ===================================================================
     # STEP 6: Sanity checks (spec §13.1–13.5)
