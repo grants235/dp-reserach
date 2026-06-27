@@ -2060,21 +2060,27 @@ def rank_stability(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=OUT_DIR,
 # ===========================================================================
 
 def figure_degeneracy_s2(cert_dir=CERT_DIR, out_dir=OUT_DIR):
-    """Figure A (fig:degeneracy): two-panel strip plot — F1 (left) and F7 (right), seed 0."""
+    """Figure A (fig:degeneracy): three-panel strip plot — F1, F2, F7, seed 0.
+    Each panel: ε^norm row (y=1) and ε^dir row (y=0) as jittered scatter,
+    with horizontal IQR boxes overlaid to show mass distribution.
+    """
     plt = _plt()
     os.makedirs(out_dir, exist_ok=True)
     if plt is None:
         return
+    import matplotlib.patches as mpatches
 
     panels = [
         ("F1", "CLIP linear head, CIFAR-10-LT(50)"),
+        ("F2", "CLIP linear head, balanced CIFAR-10"),
         ("F7", "MNISTConvNet, MNIST-LT(10)"),
     ]
 
-    rng    = np.random.default_rng(42)
-    jitter = 0.04
+    rng      = np.random.default_rng(42)
+    jitter   = 0.04
+    box_h    = 0.18   # half-height of the IQR box on the y-axis
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 3.5))
+    fig, axes = plt.subplots(1, 3, figsize=(18, 3.5))
     any_found = False
 
     for ax, (run_id, subtitle) in zip(axes, panels):
@@ -2100,15 +2106,23 @@ def figure_degeneracy_s2(cert_dir=CERT_DIR, out_dir=OUT_DIR):
         print(f"    p95(ε^dir)                = {p95_dir:.4f}")
         print(f"    median(1 − ε^dir/ε^norm)  = {med_mask:.4f}")
 
+        # Scatter strips
         y_norm = np.ones(len(en))  + rng.uniform(-jitter, jitter, len(en))
         y_dir  = np.zeros(len(ed)) + rng.uniform(-jitter, jitter, len(ed))
-        ax.scatter(en, y_norm, s=3, alpha=0.25, color="steelblue",
-                   rasterized=True, label="ε^norm")
-        ax.scatter(ed, y_dir,  s=3, alpha=0.25, color="firebrick",
-                   rasterized=True, label="ε^dir")
-        ax.axvline(med_norm, color="steelblue", linestyle="--", linewidth=1.2, alpha=0.8)
-        ax.annotate(f"median ε^norm = {med_norm:.2f}",
-                    xy=(med_norm, 1.28), ha="center", fontsize=8, color="steelblue")
+        ax.scatter(en, y_norm, s=3, alpha=0.18, color="steelblue", rasterized=True)
+        ax.scatter(ed, y_dir,  s=3, alpha=0.18, color="firebrick",  rasterized=True)
+
+        # IQR boxes: Rectangle from Q25 to Q75, centred on y=1 (norm) and y=0 (dir)
+        for arr, yc, color in [(en, 1.0, "steelblue"), (ed, 0.0, "firebrick")]:
+            q25, med, q75 = (float(np.percentile(arr, p)) for p in [25, 50, 75])
+            rect = mpatches.Rectangle(
+                (q25, yc - box_h), q75 - q25, 2 * box_h,
+                linewidth=1.4, edgecolor=color, facecolor=color, alpha=0.25)
+            ax.add_patch(rect)
+            # Median tick inside the box
+            ax.plot([med, med], [yc - box_h, yc + box_h],
+                    color=color, linewidth=1.8, solid_capstyle="butt")
+
         ax.set_yticks([0, 1])
         ax.set_yticklabels(["ε^dir", "ε^norm"])
         ax.set_ylim(-0.35, 1.55)
@@ -2117,7 +2131,7 @@ def figure_degeneracy_s2(cert_dir=CERT_DIR, out_dir=OUT_DIR):
         ax.grid(True, axis="x", alpha=0.3)
 
     if not any_found:
-        plt.close(fig); print("  [Fig A] No data for F1 or F7 — skipping."); return
+        plt.close(fig); print("  [Fig A] No data found — skipping."); return
 
     fig.tight_layout()
     path = os.path.join(out_dir, "figure_s2_degeneracy.png")
@@ -2332,14 +2346,11 @@ def figure_mnist_distribution_f7(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=O
             ax.set_title(f"{run_id} — no data"); continue
         any_found = True
 
-        all_en = np.concatenate(list(en_pooled.values())) if en_pooled else np.array([])
-        norm_ref = float(np.median(all_en)) if len(all_en) > 0 else float("nan")
-
         print(f"\n  [Fig D] {run_id} per-tier summary (pooled seeds 0-2):")
         for t_id, t_name in tier_names.items():
             if t_id not in ed_pooled or len(ed_pooled[t_id]) == 0: continue
             mean_dir  = float(ed_pooled[t_id].mean())
-            mean_norm = float(en_pooled.get(t_id, np.array([norm_ref])).mean())
+            mean_norm = float(en_pooled.get(t_id, np.array([0.0])).mean())
             masking   = 100.0 * (1.0 - mean_dir / max(mean_norm, 1e-15))
             print(f"    {t_name:6s}: mean(ε^dir)={mean_dir:.4f}  "
                   f"mean(ε^norm)={mean_norm:.4f}  masking={masking:.1f}%")
@@ -2349,14 +2360,11 @@ def figure_mnist_distribution_f7(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=O
                               showmedians=True, showextrema=False)
         for pc, t_id in zip(parts["bodies"], [0, 1, 2]):
             pc.set_facecolor(tier_colors[t_id]); pc.set_alpha(0.6)
-        if np.isfinite(norm_ref):
-            ax.axhline(norm_ref, color="gray", linestyle="--", linewidth=1.2,
-                       alpha=0.8, label=f"ε^norm = {norm_ref:.2f}")
         ax.set_xticks([0, 1, 2])
         ax.set_xticklabels([tier_names[t] for t in [0, 1, 2]])
         ax.set_xlabel("Tier"); ax.set_ylabel("ε^dir cert (r=100)")
         ax.set_title(subtitle)
-        ax.legend(fontsize=9); ax.grid(True, axis="y", alpha=0.3)
+        ax.grid(True, axis="y", alpha=0.3)
 
     if not any_found:
         plt.close(fig); print("  [Fig D] No data found for F1 or F7 — skipping."); return
