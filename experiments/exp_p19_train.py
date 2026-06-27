@@ -56,7 +56,7 @@ RUNS = {
     "F6": dict(dataset="cifar10_lt10", regime="R2", arch="resnet20",    eps=8.0, B_expected=2000, n_seeds=3, epochs=60),
     "F7": dict(dataset="mnist_lt10", regime="R2", arch="dpconv", eps=8.0,
                B_expected=512, n_seeds=3, epochs=40, lr=0.6, r_max=100),
-    "F8": dict(dataset="mnist",     regime="R2", arch="dpconv", eps=8.0,
+    "F8": dict(dataset="mnist_balanced_lt10", regime="R2", arch="dpconv", eps=8.0,
                B_expected=512, n_seeds=3, epochs=40, lr=0.6, r_max=100),
 }
 
@@ -277,28 +277,53 @@ def _mnist_noaug(data_root, train=True):
 
 
 def build_dataset_mnist(dataset_name, data_root):
-    """Returns dataset for MNISTConvNet runs (F7). Matches Tramer-Boneh ICLR2021 setup.
+    """Returns dataset for MNISTConvNet runs (F7/F8).
 
-    No augmentation (Tanh CNN, from-scratch training; warm-start skipped via pub_x=None).
-    Returns same 12-tuple format as build_dataset_wrn for uniform downstream handling.
+    dataset_name variants:
+      "mnist_lt<IR>"           — long-tailed MNIST with imbalance ratio IR  (F7)
+      "mnist_balanced_lt<IR>"  — balanced MNIST subsampled to the same total
+                                  size as the LT(IR) variant (F8)
+      "mnist"                  — full balanced MNIST (~54k private)
+
+    No augmentation (Tanh CNN, from-scratch). pub_x=None → warm-start skipped.
+    Returns same 12-tuple format as build_dataset_wrn.
     """
-    is_lt = "lt" in dataset_name
-    lt_ir = _parse_lt_ir(dataset_name) if is_lt else 1
-    train_ds    = _mnist_noaug(data_root, train=True)
-    test_ds     = _mnist_noaug(data_root, train=False)
+    is_balanced_lt = "balanced_lt" in dataset_name
+    is_lt          = ("lt" in dataset_name) and not is_balanced_lt
+    lt_ir          = _parse_lt_ir(dataset_name) if (is_lt or is_balanced_lt) else 1
+
+    train_ds     = _mnist_noaug(data_root, train=True)
+    test_ds      = _mnist_noaug(data_root, train=False)
     full_targets = np.array(train_ds.targets)
-    lt_idx = make_lt_indices(full_targets, lt_ir, num_classes=10, seed=42) if is_lt \
-             else np.arange(len(train_ds))
+
+    if is_lt:
+        lt_idx = make_lt_indices(full_targets, lt_ir, num_classes=10, seed=42)
+    elif is_balanced_lt:
+        # Subsample each class equally to match the total size of LT(lt_ir).
+        lt_idx_ref  = make_lt_indices(full_targets, lt_ir, num_classes=10, seed=42)
+        n_per_class = len(lt_idx_ref) // 10
+        rng = np.random.default_rng(42)
+        parts = []
+        for c in range(10):
+            cls_idx = np.where(full_targets == c)[0]
+            chosen  = rng.choice(cls_idx, size=min(n_per_class, len(cls_idx)), replace=False)
+            parts.append(chosen)
+        lt_idx = np.sort(np.concatenate(parts))
+    else:
+        lt_idx = np.arange(len(train_ds))
+
     lt_targets = full_targets[lt_idx]
     pub_idx, priv_idx = make_public_private_split(lt_idx, lt_targets, public_frac=0.1, seed=42)
     priv_ds = _IndexedSubset(train_ds, priv_idx)
-    tier_labels = (np.array([class_to_tier(c) for c in full_targets[priv_idx]], dtype=np.int32)
-                   if is_lt else None)
-    class_counts = np.bincount(full_targets[priv_idx], minlength=10)
+
+    # Always assign tier labels so per-tier analysis works for both LT and balanced runs.
+    tier_labels = np.array([class_to_tier(c) for c in full_targets[priv_idx]], dtype=np.int32)
+
+    class_counts   = np.bincount(full_targets[priv_idx], minlength=10)
     priv_labels_np = full_targets[priv_idx].astype(np.int32)
     test_labels_np = np.array(test_ds.targets)
     print(f"  [MNIST] n_priv={len(priv_idx)}  n_pub={len(pub_idx)}  "
-          f"n_test={len(test_ds)}  lt_ir={lt_ir}")
+          f"n_test={len(test_ds)}  lt_ir={lt_ir}  balanced_lt={is_balanced_lt}")
     # pub_x=None → warm-start skipped automatically; pub_idx retained for metadata
     return (priv_ds, priv_idx, priv_labels_np, tier_labels, 10, 1e-5,
             class_counts, None, None, pub_idx, test_ds, test_labels_np)
