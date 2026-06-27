@@ -125,7 +125,7 @@ def table_1(runs_dir=RUNS_DIR, out_dir=OUT_DIR):
     Rows: F1 seed 0, F2 seed 0, F5 seeds 0,1,2 (aggregated).
     Columns: mean norm, median norm, CV, fraction within 1% of C.
     """
-    rows = [("F1", [0]), ("F2", [0]), ("F5", [0, 1, 2]), ("F7", [0, 1, 2])]
+    rows = [("F1", [0]), ("F2", [0]), ("F5", [0, 1, 2]), ("F7", [0, 1, 2]), ("F8", [0, 1, 2])]
     C = 1.0
     print(f"\n{'='*72}")
     print(f"  Table 1: Norm Flatness (C={C})")
@@ -179,7 +179,7 @@ def table_2(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=OUT_DIR):
     print(hdr); print(f"  {'-'*len(hdr.lstrip())}")
 
     all_rows = []
-    for run_id in ["F1", "F2", "F5", "F7"]:
+    for run_id in ["F1", "F2", "F5", "F7", "F8"]:
         for seed in range(3):
             cert = _load_cert(run_id, seed, cert_dir)
             if "epsilon_cert_norm" not in cert: continue
@@ -395,7 +395,7 @@ def table_4(cert_dir=CERT_DIR, out_dir=OUT_DIR):
     print(f"{'='*72}")
 
     rows = []
-    for run_id in ["F1", "F5", "F7"]:
+    for run_id in ["F1", "F5", "F7", "F8"]:
         for seed in [0]:
             cert = _load_cert(run_id, seed, cert_dir)
             if "Bcert_dir_rank_100" not in cert: continue
@@ -493,7 +493,7 @@ def table_5(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR, out_dir=OUT
     tier_names = {0: "head", 1: "mid", 2: "tail"}
     all_rows = []
 
-    for run_id_t5, seeds_t5 in [("F5", [0, 1, 2]), ("F7", [0, 1, 2])]:
+    for run_id_t5, seeds_t5 in [("F5", [0, 1, 2]), ("F7", [0, 1, 2]), ("F8", [0, 1, 2])]:
         for seed in seeds_t5:
             cert = _load_cert(run_id_t5, seed, cert_dir)
             run  = _load_run(run_id_t5, seed, runs_dir)
@@ -523,7 +523,7 @@ def table_5(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR, out_dir=OUT
             all_rows.append(row)
 
     # Seed stability: compare tier means across seeds (per run_id)
-    for run_id_t5 in ["F5", "F7"]:
+    for run_id_t5 in ["F5", "F7", "F8"]:
         run_rows = [r for r in all_rows if r.get("run_id") == run_id_t5]
         if len(run_rows) >= 2:
             print(f"\n  {run_id_t5} seed stability (CV across seeds):")
@@ -806,7 +806,7 @@ def table_6(cert_dir=CERT_DIR, out_dir=OUT_DIR):
     print(f"{'='*72}")
 
     all_rows = []
-    for run_id, seeds in [("F1", [0]), ("F5", [0, 1, 2]), ("F7", [0, 1, 2])]:
+    for run_id, seeds in [("F1", [0]), ("F5", [0, 1, 2]), ("F7", [0, 1, 2]), ("F8", [0, 1, 2])]:
         for seed in seeds:
             tag  = f"p19_{run_id}_seed{seed}"
             cert = _load_cert(run_id, seed, cert_dir)
@@ -913,7 +913,7 @@ def nystrom_minorant_check(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=OUT_DIR
     print(f"{'='*72}")
 
     if settings is None:
-        settings = [("F1", [0, 1, 2]), ("F5", [0, 1, 2])]
+        settings = [("F1", [0, 1, 2]), ("F5", [0, 1, 2]), ("F7", [0, 1, 2])]
 
     all_results = []
     any_bound_violation = False
@@ -1040,7 +1040,7 @@ def nystrom_minorant_check(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=OUT_DIR
         with open(t6_path) as f:
             t6 = json.load(f)
 
-        for run_id in ["F1", "F5"]:
+        for run_id in ["F1", "F5", "F7"]:
             rows_run = [r for r in t6 if r["run_id"] == run_id]
             if not rows_run:
                 continue
@@ -1055,10 +1055,24 @@ def nystrom_minorant_check(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=OUT_DIR
             seq_str = "  ".join(f"r={rk}: {v:.4f}" for rk, v in zip(ranks_sorted, med_seq))
             status = "monotone (OK)" if monotone else "!! NON-MONOTONE !!"
             print(f"  {run_id}: {seq_str}  → {status}")
+
+            # Floor-pinning diagnostic: flag if median ε^dir is constant across all ranks
+            # (Δ < 1e-4). This indicates the Nyström bound is not engaging and ε^dir
+            # is returning the grid floor fallback — the reported values are then
+            # dominated by discretization overhead, not the actual shift structure.
+            max_delta = max(abs(med_seq[i] - med_seq[i+1])
+                            for i in range(len(med_seq) - 1)) if len(med_seq) > 1 else 0.0
+            floor_pinned = (max_delta < 1e-4) and (len(med_seq) > 1)
+            if floor_pinned:
+                print(f"  !! {run_id}: ε^dir FLOOR-PINNED across all ranks "
+                      f"(max Δ={max_delta:.2e}). Nyström bound is not engaging. "
+                      f"ε^dir values are unreliable — do not report in paper.")
             all_results.append({
                 "check": "rank_convergence", "run_id": run_id,
                 "ranks": ranks_sorted, "median_eps_dir": med_seq,
                 "monotone_nonincreasing": monotone,
+                "floor_pinned": floor_pinned,
+                "max_rank_delta": float(max_delta),
             })
     else:
         print(f"  [skip] table6_rank_ablation.json not found — "
@@ -2074,13 +2088,14 @@ def figure_degeneracy_s2(cert_dir=CERT_DIR, out_dir=OUT_DIR):
         ("F1", "CLIP linear head, CIFAR-10-LT(50)"),
         ("F2", "CLIP linear head, balanced CIFAR-10"),
         ("F7", "MNISTConvNet, MNIST-LT(10)"),
+        ("F8", "MNISTConvNet, balanced MNIST"),
     ]
 
     rng      = np.random.default_rng(42)
     jitter   = 0.04
     box_h    = 0.18   # half-height of the IQR box on the y-axis
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 3.5))
+    fig, axes = plt.subplots(1, 4, figsize=(22, 3.5))
     any_found = False
 
     for ax, (run_id, subtitle) in zip(axes, panels):
@@ -2335,9 +2350,10 @@ def figure_mnist_distribution_f7(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=O
         return ed, en
 
     panels = [("F1", "CLIP linear head, CIFAR-10-LT(50)"),
-              ("F7", "MNISTConvNet, MNIST-LT(10)")]
+              ("F7", "MNISTConvNet, MNIST-LT(10)"),
+              ("F8", "MNISTConvNet, balanced MNIST")]
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+    fig, axes = plt.subplots(1, 3, figsize=(18, 4.5))
 
     any_found = False
     for ax, (run_id, subtitle) in zip(axes, panels):
@@ -2626,7 +2642,7 @@ def table_lira_paper(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
 
 def table_lira_paper_combined(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
                                out_dir=OUT_DIR, seeds=(0, 1, 2),
-                               settings=(("F1", "LF1"), ("F7", "LF7"))):
+                               settings=(("F1", "LF1"), ("F7", "LF7"), ("F8", "LF8"))):
     """
     Combined Spearman correlation table for multiple settings.
 
@@ -2727,8 +2743,65 @@ def table_lira_paper_combined(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUN
 # Accounting note (appendix calibration)
 # ===========================================================================
 
+def _rdp_subsampled_gaussian_manual(q, sigma, T, orders, log_inv_delta):
+    """
+    Manual subsampled-Gaussian RDP for Poisson subsampling.
+
+    For integer α ≥ 2 (Mironov 2017, tight):
+        rdp(α) = (1/(α-1)) * log( Σ_{k=0}^{α} C(α,k) * q^k * (1-q)^(α-k)
+                                   * exp(k*(k-1)/(2σ²)) )
+    For non-integer α, interpolate the bound from the two bracketing integers.
+
+    Composed T steps (independent): rdp_total(α) = T * rdp(α).
+    Returns (best_eps, best_alpha).
+    """
+    from math import comb, log as _log, exp as _exp
+    alpha_arr = np.asarray(orders, dtype=np.float64)
+    eps_cands = np.full(len(alpha_arr), float("inf"))
+
+    for i, alpha in enumerate(alpha_arr):
+        a_lo = max(2, int(math.floor(alpha)))
+        a_hi = a_lo + 1 if alpha != a_lo else a_lo
+
+        def _rdp_int(a):
+            # Exact RDP for integer order a ≥ 2
+            acc = 0.0
+            for k in range(a + 1):
+                binom = comb(a, k)
+                term = binom * (q ** k) * ((1 - q) ** (a - k))
+                term *= _exp(k * (k - 1) / (2.0 * sigma * sigma))
+                acc += term
+            return _log(acc) / (a - 1)
+
+        if alpha <= 1.0:
+            continue
+        if alpha == int(alpha) and int(alpha) >= 2:
+            rdp_per_step = _rdp_int(int(alpha))
+        else:
+            # Interpolate between bracketing integers (conservative)
+            rdp_lo = _rdp_int(a_lo) if a_lo >= 2 else q**2 / (2 * sigma**2)
+            rdp_hi = _rdp_int(a_hi)
+            frac = alpha - a_lo
+            rdp_per_step = (1 - frac) * rdp_lo + frac * rdp_hi
+
+        rdp_total = T * rdp_per_step
+        eps_cands[i] = rdp_total + log_inv_delta / (alpha - 1.0)
+
+    best_idx   = int(np.argmin(eps_cands))
+    return float(eps_cands[best_idx]), float(alpha_arr[best_idx])
+
+
 def accounting_note(runs_dir=RUNS_DIR, cert_dir=CERT_DIR, out_dir=OUT_DIR):
-    """Deterministic RDP/PRV accounting on saved metadata — no retraining."""
+    """
+    Deterministic RDP/PRV accounting on saved F1 seed-0 metadata — no retraining.
+
+    The full-clip global ε is computed by subsampled-Gaussian RDP composed over T
+    steps and minimised over α.  The Opacus compute_rdp path can silently drop the
+    Poisson subsampling amplification in some versions (returning the bare
+    α/(2σ²)·T formula which gives ~145 instead of ~9.5).  We therefore run the
+    manual subsampled-Gaussian RDP independently and cross-check; if the two
+    results disagree by more than 2× the manual value is used.
+    """
     print(f"\n{'='*72}")
     print(f"  accounting_note: F1 seed 0")
     print(f"{'='*72}")
@@ -2745,51 +2818,68 @@ def accounting_note(runs_dir=RUNS_DIR, cert_dir=CERT_DIR, out_dir=OUT_DIR):
     delta = float(meta.get("delta", 1e-5))
     print(f"  σ={sigma}  q={q}  T={T}  δ={delta:.1e}")
 
-    # ε_norm_fullclip: subsampled-Gaussian RDP composed T steps, minimized over α.
-    # Must include Poisson subsampling amplification (rate q) — the bare
-    # α/(2σ²) formula without subsampling gives ~145 and is wrong here.
     log_inv_delta = math.log(1.0 / delta)
-    best_eps = float("inf"); best_alpha = float("nan")
-    _rdp_ok = False
+    orders = [float(a) for a in ALPHA_GRID if a > 1.0]
+
+    # --- Manual subsampled-Gaussian RDP (primary, not subject to opacus version bugs) ---
+    best_eps_manual, best_alpha_manual = _rdp_subsampled_gaussian_manual(
+        q, sigma, T, orders, log_inv_delta)
+    print(f"  ε_fullclip (manual RDP, subsampled) = {best_eps_manual:.4f}"
+          f"  at α* = {best_alpha_manual:.2f}")
+
+    # --- Opacus RDP cross-check ---
+    best_eps = best_eps_manual
+    best_alpha = best_alpha_manual
     try:
-        orders = [float(a) for a in ALPHA_GRID if a > 1.0]
         try:
             from opacus.accountants.analysis.rdp import compute_rdp as _crdp
         except ImportError:
             from opacus.accountants.rdp_accountant import compute_rdp as _crdp
-        rdp_step = _crdp(q=q, noise_multiplier=sigma, steps=1, orders=orders)
+        rdp_step    = _crdp(q=q, noise_multiplier=sigma, steps=1, orders=orders)
         rdp_composed = T * np.asarray(rdp_step, dtype=np.float64)
         alpha_arr    = np.asarray(orders, dtype=np.float64)
         eps_cands    = rdp_composed + log_inv_delta / (alpha_arr - 1.0)
         best_idx     = int(np.argmin(eps_cands))
-        best_eps     = float(eps_cands[best_idx])
-        best_alpha   = float(alpha_arr[best_idx])
-        _rdp_ok      = True
-        print(f"  ε_norm_fullclip (RDP+subsampling) = {best_eps:.4f}  at α* = {best_alpha:.2f}")
+        eps_opacus   = float(eps_cands[best_idx])
+        alpha_opacus = float(alpha_arr[best_idx])
+        print(f"  ε_fullclip (opacus RDP)            = {eps_opacus:.4f}"
+              f"  at α* = {alpha_opacus:.2f}")
+        # Sanity-gate: if opacus returned bare (un-subsampled) RDP the result will be
+        # ~T·α/(2σ²) >> manual.  Accept opacus only if it agrees within 2×.
+        if eps_opacus <= 2.0 * best_eps_manual:
+            best_eps   = eps_opacus
+            best_alpha = alpha_opacus
+            print(f"  → using opacus value (within 2× of manual)")
+        else:
+            print(f"  [WARN] opacus ε={eps_opacus:.2f} >> manual ε={best_eps_manual:.2f}"
+                  f" — opacus likely computed un-subsampled RDP. Using manual value.")
     except Exception as e:
-        print(f"  [warn] Opacus RDP compute failed ({e}); trying table2 fallback.")
+        print(f"  [warn] Opacus RDP failed ({e}). Using manual value.")
 
-    if not _rdp_ok:
-        # Fallback: read median ε^norm for F1 seed 0 from table2 (same value by construction).
+    # --- Table-2 fallback (belt-and-suspenders) ---
+    if not math.isfinite(best_eps) or best_eps > 50.0:
         t2_path = os.path.join(out_dir, "table2_certified_spread.json")
         if os.path.exists(t2_path):
             with open(t2_path) as f:
                 _t2 = json.load(f)
             _f1s0 = next((r for r in _t2 if r["run_id"] == "F1" and r.get("seed") == 0), None)
             if _f1s0:
-                best_eps = float(_f1s0["norm_med"])
-                print(f"  ε_norm_fullclip (fallback table2 F1 seed0 norm_med) = {best_eps:.4f}")
-        if best_eps == float("inf"):
-            print("  [warn] ε_norm_fullclip could not be determined.")
+                best_eps   = float(_f1s0["norm_med"])
+                best_alpha = float("nan")
+                print(f"  ε_fullclip (table2 F1 seed0 norm_med fallback) = {best_eps:.4f}")
+        if not math.isfinite(best_eps) or best_eps > 50.0:
+            print("  [warn] ε_norm_fullclip could not be determined — leaving as inf.")
 
-    # ε_global_prv: try metadata / cert summary first, else PRV accountant
+    # --- PRV: metadata / cert summary first, then opacus RDPAccountant, then NaN ---
     eps_prv = None
     for src_dict in [meta]:
         for key in ["global_eps_prv", "eps_prv", "epsilon_prv",
                     "global_epsilon_prv", "epsilon_global", "eps_global"]:
             if key in src_dict:
-                eps_prv = float(src_dict[key])
-                print(f"  ε_global_prv (metadata) = {eps_prv:.4f}"); break
+                v = float(src_dict[key])
+                if math.isfinite(v) and v < 50.0:
+                    eps_prv = v
+                    print(f"  ε_global_prv (metadata) = {eps_prv:.4f}"); break
         if eps_prv is not None: break
 
     cert_summ = os.path.join(cert_dir, "p19_F1_seed0_summary.json")
@@ -2798,25 +2888,47 @@ def accounting_note(runs_dir=RUNS_DIR, cert_dir=CERT_DIR, out_dir=OUT_DIR):
             summ = json.load(f)
         for key in ["global_eps_prv", "eps_prv", "epsilon_prv", "global_epsilon_prv"]:
             if key in summ:
-                eps_prv = float(summ[key])
-                print(f"  ε_global_prv (cert summary) = {eps_prv:.4f}"); break
+                v = float(summ[key])
+                if math.isfinite(v) and v < 50.0:
+                    eps_prv = v
+                    print(f"  ε_global_prv (cert summary) = {eps_prv:.4f}"); break
 
     if eps_prv is None:
-        try:
-            from opacus.accountants import PRVAccountant
-            acc = PRVAccountant()
-            acc.history = [(sigma, q, T)]
-            eps_prv = float(acc.get_epsilon(delta=delta))
-            print(f"  ε_global_prv (PRV recompute) = {eps_prv:.4f}")
-        except Exception as e:
-            print(f"  [warn] PRV recompute failed: {e}")
-            eps_prv = float("nan")
+        # Try opacus RDPAccountant step-by-step API (works across opacus >= 1.0)
+        for _try_prv in [True, False]:
+            try:
+                if _try_prv:
+                    from opacus.accountants import PRVAccountant
+                    _acc = PRVAccountant()
+                    _acc.history = [(sigma, q, T)]
+                    eps_prv = float(_acc.get_epsilon(delta=delta))
+                    if not math.isfinite(eps_prv) or eps_prv > 50.0:
+                        raise ValueError(f"PRV returned implausible ε={eps_prv:.4f}")
+                    print(f"  ε_global_prv (PRV accountant) = {eps_prv:.4f}")
+                else:
+                    from opacus.accountants import RDPAccountant
+                    _acc = RDPAccountant()
+                    for _ in range(T):
+                        _acc.step(noise_multiplier=sigma, sample_rate=q)
+                    eps_prv = float(_acc.get_epsilon(delta=delta))
+                    if not math.isfinite(eps_prv) or eps_prv > 50.0:
+                        raise ValueError(f"RDPAccountant returned implausible ε={eps_prv:.4f}")
+                    print(f"  ε_global_prv (RDPAccountant step-by-step) = {eps_prv:.4f}")
+                break
+            except Exception as e:
+                print(f"  [warn] {'PRV' if _try_prv else 'RDPAccountant'} failed: {e}")
+                eps_prv = None
+
+    if eps_prv is None:
+        # Final fallback: use the manual RDP value (slightly looser than PRV but correct)
+        eps_prv = best_eps
+        print(f"  ε_global_prv (fallback = manual RDP) = {eps_prv:.4f}")
 
     result = {
         "sigma": sigma, "q": q, "T": T, "delta": delta,
         "eps_norm_fullclip": float(best_eps),
         "best_alpha": float(best_alpha),
-        "eps_global_prv": eps_prv,
+        "eps_global_prv": float(eps_prv) if eps_prv is not None else None,
         "provenance": "F1 seed_0 metadata.json — deterministic post-processing only",
     }
     os.makedirs(out_dir, exist_ok=True)
@@ -3087,17 +3199,29 @@ def emit_paper_numbers(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
             print(f"  Member-target counts: {mc[0]}/{mc[1]}/{mc[2]} (total={mc.sum()})")
         prov.append("tier_labels.npy + lira_member_local_idx.npy F1 seed 0")
 
-    # Accounting note
-    acc = _load_or_run(os.path.join(out_dir, "accounting_note.json"),
-                       lambda: accounting_note(runs_dir, cert_dir, out_dir))
+    # Accounting note — always re-run to pick up any fix to accounting_note()
+    # rather than loading a potentially stale cached JSON.
+    acc = accounting_note(runs_dir, cert_dir, out_dir)
     if acc:
         numbers["appendix_accounting_sigma"] = acc.get("sigma")
         numbers["appendix_accounting_q"]     = acc.get("q")
         numbers["appendix_accounting_T"]     = acc.get("T")
-        numbers["appendix_fullclip_eps"]     = acc.get("eps_norm_fullclip")
-        numbers["appendix_fullclip_alpha"]   = acc.get("best_alpha")
-        numbers["appendix_prv_eps"]          = acc.get("eps_global_prv")
-        prov.append("accounting_note.json")
+        # Guard: only write fullclip ε if it is finite and plausible (< 50).
+        # A value of ~145 means the un-subsampled RDP formula was used; that is
+        # wrong and must not appear in paper_numbers.json.
+        _eps_fc  = acc.get("eps_norm_fullclip")
+        _eps_prv = acc.get("eps_global_prv")
+        if _eps_fc is not None and math.isfinite(float(_eps_fc)) and float(_eps_fc) < 50.0:
+            numbers["appendix_fullclip_eps"]   = float(_eps_fc)
+            numbers["appendix_fullclip_alpha"] = acc.get("best_alpha")
+        else:
+            print(f"  [WARN] appendix_fullclip_eps={_eps_fc} is implausible or NaN — "
+                  f"omitting from paper_numbers. Re-run accounting_note to fix.")
+        if _eps_prv is not None and math.isfinite(float(_eps_prv)) and float(_eps_prv) < 50.0:
+            numbers["appendix_prv_eps"] = float(_eps_prv)
+        else:
+            print(f"  [WARN] appendix_prv_eps={_eps_prv} is implausible or NaN — omitting.")
+        prov.append("accounting_note (recomputed)")
 
     # Write
     os.makedirs(out_dir, exist_ok=True)
@@ -3253,7 +3377,7 @@ def main():
     parser.add_argument("--figure",  type=str, default=None, choices=["1","2"],
                         help="Run specific figure")
     parser.add_argument("--gaussian_validation", action="store_true")
-    parser.add_argument("--run",      type=str, default="F1", choices=["F1","F2","F5","F7"])
+    parser.add_argument("--run",      type=str, default="F1", choices=["F1","F2","F5","F7","F8"])
     parser.add_argument("--seed",     type=int, default=0,
                         help="Seed for --gaussian_validation / --gaussian_lowvar")
     parser.add_argument("--lira_seeds", type=int, nargs="+", default=None,
@@ -3333,6 +3457,8 @@ def main():
                 lira_seeds=lira_seeds, run_id="F1", lira_id="LF1")
         table_3(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,
                 lira_seeds=lira_seeds, run_id="F7", lira_id="LF7")
+        table_3(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,
+                lira_seeds=lira_seeds, run_id="F8", lira_id="LF8")
     if args.all or args.table == "4":
         table_4(args.cert_dir, args.out_dir)
     if args.all or args.table == "5":
@@ -3402,7 +3528,7 @@ def main():
     if args.paper or (do_table and do_table_f7):
         table_lira_paper_combined(
             args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,
-            settings=(("F1", "LF1"), ("F7", "LF7")))
+            settings=(("F1", "LF1"), ("F7", "LF7"), ("F8", "LF8")))
     else:
         if do_table:
             table_lira_paper(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,

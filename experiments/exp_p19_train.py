@@ -20,6 +20,7 @@ Run matrix:
       [~270k params — still too large for DP at ε=8 to converge]
   F7: MNISTConvNet (~26k params, Tramer-Boneh ICLR2021 SampleConvNet), from-scratch,
       MNIST-LT(10), ε=8, seeds 0,1,2  [Tanh CNN, no GroupNorm needed, B=512, LR=0.6]
+  F8: MNISTConvNet, from-scratch, MNIST (balanced), ε=8, seeds 0,1,2  [control for F7]
 
 Usage:
   python experiments/exp_p19_train.py --run F1 --seed 0 --gpu 0
@@ -55,10 +56,12 @@ RUNS = {
     "F6": dict(dataset="cifar10_lt10", regime="R2", arch="resnet20",    eps=8.0, B_expected=2000, n_seeds=3, epochs=60),
     "F7": dict(dataset="mnist_lt10", regime="R2", arch="dpconv", eps=8.0,
                B_expected=512, n_seeds=3, epochs=80, lr=0.6, r_max=100),
+    "F8": dict(dataset="mnist",     regime="R2", arch="dpconv", eps=8.0,
+               B_expected=512, n_seeds=3, epochs=80, lr=0.6, r_max=100),
 }
 
 # LiRA targets per run
-LIRA_N_TARGETS = {"F1": 1500, "F2": 1000, "F5": 300, "F6": 600, "F7": 600}
+LIRA_N_TARGETS = {"F1": 1500, "F2": 1000, "F5": 300, "F6": 600, "F7": 600, "F8": 600}
 
 # ---------------------------------------------------------------------------
 # Constants
