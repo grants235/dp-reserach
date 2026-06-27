@@ -2317,7 +2317,7 @@ def figure_wrn_distribution_s3(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=OUT
 
 
 def figure_mnist_distribution_f7(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=OUT_DIR):
-    """Figure D (fig:mnist): two-panel violin — F1 (left) and F7 (right), pooled seeds 0-2."""
+    """Figure D (fig:dir_dist): four-panel violin — F1, F2, F7, F8, pooled seeds 0-2."""
     plt = _plt()
     os.makedirs(out_dir, exist_ok=True)
     if plt is None:
@@ -2350,10 +2350,11 @@ def figure_mnist_distribution_f7(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=O
         return ed, en
 
     panels = [("F1", "CLIP linear head, CIFAR-10-LT(50)"),
+              ("F2", "CLIP linear head, balanced CIFAR-10"),
               ("F7", "MNISTConvNet, MNIST-LT(10)"),
               ("F8", "MNISTConvNet, balanced MNIST")]
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 4.5))
+    fig, axes = plt.subplots(1, 4, figsize=(24, 4.5))
 
     any_found = False
     for ax, (run_id, subtitle) in zip(axes, panels):
@@ -2383,7 +2384,7 @@ def figure_mnist_distribution_f7(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=O
         ax.grid(True, axis="y", alpha=0.3)
 
     if not any_found:
-        plt.close(fig); print("  [Fig D] No data found for F1 or F7 — skipping."); return
+        plt.close(fig); print("  [Fig D] No data found for any panel — skipping."); return
 
     fig.tight_layout()
     path = os.path.join(out_dir, "figure_f7_dir_distribution.png")
@@ -2642,7 +2643,8 @@ def table_lira_paper(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
 
 def table_lira_paper_combined(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR,
                                out_dir=OUT_DIR, seeds=(0, 1, 2),
-                               settings=(("F1", "LF1"), ("F7", "LF7"), ("F8", "LF8"))):
+                               settings=(("F1", "LF1"), ("F2", "LF2"),
+                                         ("F7", "LF7"), ("F8", "LF8"))):
     """
     Combined Spearman correlation table for multiple settings.
 
@@ -3468,6 +3470,8 @@ def main():
         table_3(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,
                 lira_seeds=lira_seeds, run_id="F1", lira_id="LF1")
         table_3(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,
+                lira_seeds=lira_seeds, run_id="F2", lira_id="LF2")
+        table_3(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,
                 lira_seeds=lira_seeds, run_id="F7", lira_id="LF7")
         table_3(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,
                 lira_seeds=lira_seeds, run_id="F8", lira_id="LF8")
@@ -3536,11 +3540,12 @@ def main():
         figure_wrn_distribution_s3(args.cert_dir, args.runs_dir, args.out_dir)
         figure_mnist_distribution_f7(args.cert_dir, args.runs_dir, args.out_dir)
 
-    # --paper (or both individual flags) → single combined F1+F7 table
+    # --paper (or both individual flags) → single combined F1+F2+F7+F8 table
     if args.paper or (do_table and do_table_f7):
         table_lira_paper_combined(
             args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,
-            settings=(("F1", "LF1"), ("F7", "LF7"), ("F8", "LF8")))
+            settings=(("F1", "LF1"), ("F2", "LF2"),
+                      ("F7", "LF7"), ("F8", "LF8")))
     else:
         if do_table:
             table_lira_paper(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,
