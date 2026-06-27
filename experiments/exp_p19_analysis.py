@@ -2755,23 +2755,35 @@ def _rdp_subsampled_gaussian_manual(q, sigma, T, orders, log_inv_delta):
     Composed T steps (independent): rdp_total(α) = T * rdp(α).
     Returns (best_eps, best_alpha).
     """
-    from math import comb, log as _log, exp as _exp
+    from scipy.special import gammaln as _gammaln, logsumexp as _logsumexp
     alpha_arr = np.asarray(orders, dtype=np.float64)
     eps_cands = np.full(len(alpha_arr), float("inf"))
+
+    log_q  = np.log(q)       if q > 0       else -np.inf
+    log_1q = np.log(1.0 - q) if (1.0 - q) > 0 else -np.inf
+
+    # Cache to avoid recomputing the same integer order twice (non-integer α
+    # interpolates between two bracketing integers, so each integer is used at most
+    # twice).
+    _rdp_int_cache: dict = {}
+
+    def _rdp_int(a: int) -> float:
+        if a in _rdp_int_cache:
+            return _rdp_int_cache[a]
+        # Vectorised log-space computation via gammaln (avoids overflow for large a)
+        k = np.arange(a + 1, dtype=np.float64)
+        log_binom  = _gammaln(a + 1) - _gammaln(k + 1) - _gammaln(a - k + 1)
+        log_terms  = (log_binom
+                      + k * log_q
+                      + (a - k) * log_1q
+                      + k * (k - 1) / (2.0 * sigma * sigma))
+        result = float(_logsumexp(log_terms)) / (a - 1)
+        _rdp_int_cache[a] = result
+        return result
 
     for i, alpha in enumerate(alpha_arr):
         a_lo = max(2, int(math.floor(alpha)))
         a_hi = a_lo + 1 if alpha != a_lo else a_lo
-
-        def _rdp_int(a):
-            # Exact RDP for integer order a ≥ 2
-            acc = 0.0
-            for k in range(a + 1):
-                binom = comb(a, k)
-                term = binom * (q ** k) * ((1 - q) ** (a - k))
-                term *= _exp(k * (k - 1) / (2.0 * sigma * sigma))
-                acc += term
-            return _log(acc) / (a - 1)
 
         if alpha <= 1.0:
             continue
