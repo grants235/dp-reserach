@@ -55,17 +55,17 @@ import torchvision.transforms as T
 
 LIRA_SETTINGS = {
     "LF1": dict(matched_run="F1", seeds=[0, 1, 2], dataset="cifar10_lt50", regime="R3",
-                n_targets=1500, n_shadows=128, shadow_epochs=20),
+                n_targets=1500, n_shadows=256, shadow_epochs=20),
     "LF2": dict(matched_run="F2", seeds=[0, 1, 2], dataset="cifar10",      regime="R3",
-                n_targets=1000, n_shadows=64,  shadow_epochs=20),
+                n_targets=1000, n_shadows=256, shadow_epochs=20),
     "LF5": dict(matched_run="F5", seeds=[0, 1, 2], dataset="cifar10_lt50", regime="R2",
                 n_targets=300,  n_shadows=128, shadow_epochs=30),
     "LF7": dict(matched_run="F7", seeds=[0, 1, 2], dataset="mnist_lt10", regime="R2",
                 arch="dpconv", num_classes=10,
-                n_targets=600,  n_shadows=64,  shadow_epochs=20),
+                n_targets=600,  n_shadows=256, shadow_epochs=30),
     "LF8": dict(matched_run="F8", seeds=[0, 1, 2], dataset="mnist_balanced_lt10", regime="R2",
                 arch="dpconv", num_classes=10,
-                n_targets=600,  n_shadows=64,  shadow_epochs=20),
+                n_targets=600,  n_shadows=256, shadow_epochs=30),
 }
 
 DATA_ROOT  = "./data"
@@ -625,19 +625,30 @@ def run_scoring(lira_id, cfg, device, runs_dir, lira_dir, seed=None):
     np.save(os.path.join(out_dir, "shadow_logit_scores.npy"),     shadow_logit_scores)
     np.save(os.path.join(out_dir, "shadow_in_mask_combined.npy"), shadow_in_mask_combined)
 
-    # Compute global score variance as a data-driven variance floor.
-    # A hard 1e-6 floor inflates |D_lira| for easy (head) examples where var_in
-    # and var_out both collapse to near zero: pooled_std → 1e-3 and D_lira explodes.
-    # Since ε_dir also correlates with tier, this creates an artifactual component
-    # in the headline ρ. Using global_var (across all shadow scores, all targets)
-    # as the floor matches the Carlini et al. 2022 global-variance offline variant.
-    all_scores_flat = []
+    # Variance floor: use the median within-example pooled variance across targets.
+    # The previous approach (np.var over all scores from all targets) captured
+    # between-example heterogeneity (easy vs. hard examples differ enormously in
+    # logit magnitude), which swamped the within-example sampling variance and
+    # caused 100% floor hits — reducing D_lira to a scaled copy of (μ_in − μ_out).
+    # The within-example median floor preserves per-example variance information
+    # for examples with genuine signal while still preventing exploding D_lira on
+    # examples with near-zero sampling variance and near-zero mean difference.
+    per_example_pooled_vars = []
     for i in range(n_m):
-        all_scores_flat.extend(shadow_scores_m_in[i])
-        all_scores_flat.extend(shadow_scores_m_out[i])
-    global_var = float(np.var(all_scores_flat)) if len(all_scores_flat) > 1 else 1.0
-    VAR_FLOOR = max(global_var, 1e-6)
-    print(f"  [LiRA {lira_id}] global_var={global_var:.6f}  VAR_FLOOR={VAR_FLOOR:.6f}")
+        s_in  = np.array(shadow_scores_m_in[i])
+        s_out = np.array(shadow_scores_m_out[i])
+        if len(s_in) >= 4 and len(s_out) >= 4:
+            pooled = np.concatenate([s_in, s_out])
+            per_example_pooled_vars.append(float(pooled.var()))
+    if per_example_pooled_vars:
+        within_example_median_var = float(np.median(per_example_pooled_vars))
+    else:
+        within_example_median_var = 1.0
+    # Use 10% of the within-example median as the floor — well below typical signal
+    # but prevents division by zero on the rare exactly-constant example.
+    VAR_FLOOR = max(within_example_median_var * 0.1, 1e-6)
+    print(f"  [LiRA {lira_id}] within_example_median_var={within_example_median_var:.6f}  "
+          f"VAR_FLOOR={VAR_FLOOR:.6f}")
 
     D_lira_members = np.zeros(n_m)
     n_floor_hits_in = 0; n_floor_hits_out = 0
@@ -723,7 +734,8 @@ def run_scoring(lira_id, cfg, device, runs_dir, lira_dir, seed=None):
         "split_half_stability": split_half_corr,
         "min_in_shadows":  int(min_in),
         "min_out_shadows": int(min_out),
-        "global_var_floor": float(VAR_FLOOR),
+        "within_example_median_var": float(within_example_median_var),
+        "var_floor": float(VAR_FLOOR),
         "floor_hit_rate_in":  float(floor_hit_rate_in),
         "floor_hit_rate_out": float(floor_hit_rate_out),
         "note_nonmembers": "D_lira_nonmembers saved as zeros; Table 3 uses members only",
