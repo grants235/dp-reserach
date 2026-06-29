@@ -125,7 +125,7 @@ def table_1(runs_dir=RUNS_DIR, out_dir=OUT_DIR):
     Rows: F1 seed 0, F2 seed 0, F5 seeds 0,1,2 (aggregated).
     Columns: mean norm, median norm, CV, fraction within 1% of C.
     """
-    rows = [("F1", [0]), ("F2", [0]), ("F5", [0, 1, 2]), ("F7", [0, 1, 2]), ("F8", [0, 1, 2])]
+    rows = [("F1", [0]), ("F2", [0]), ("F5", [0, 1, 2]), ("F7", [0, 1, 2]), ("F8", [0, 1, 2]), ("F9", [0, 1, 2])]
     C = 1.0
     print(f"\n{'='*72}")
     print(f"  Table 1: Norm Flatness (C={C})")
@@ -179,7 +179,7 @@ def table_2(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=OUT_DIR):
     print(hdr); print(f"  {'-'*len(hdr.lstrip())}")
 
     all_rows = []
-    for run_id in ["F1", "F2", "F5", "F7", "F8"]:
+    for run_id in ["F1", "F2", "F5", "F7", "F8", "F9"]:
         for seed in range(3):
             cert = _load_cert(run_id, seed, cert_dir)
             if "epsilon_cert_norm" not in cert: continue
@@ -395,7 +395,7 @@ def table_4(cert_dir=CERT_DIR, out_dir=OUT_DIR):
     print(f"{'='*72}")
 
     rows = []
-    for run_id in ["F1", "F5", "F7", "F8"]:
+    for run_id in ["F1", "F5", "F7", "F8", "F9"]:
         for seed in [0]:
             cert = _load_cert(run_id, seed, cert_dir)
             if "Bcert_dir_rank_100" not in cert: continue
@@ -493,7 +493,7 @@ def table_5(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR, out_dir=OUT
     tier_names = {0: "head", 1: "mid", 2: "tail"}
     all_rows = []
 
-    for run_id_t5, seeds_t5 in [("F5", [0, 1, 2]), ("F7", [0, 1, 2]), ("F8", [0, 1, 2])]:
+    for run_id_t5, seeds_t5 in [("F5", [0, 1, 2]), ("F7", [0, 1, 2]), ("F8", [0, 1, 2]), ("F9", [0, 1, 2])]:
         for seed in seeds_t5:
             cert = _load_cert(run_id_t5, seed, cert_dir)
             run  = _load_run(run_id_t5, seed, runs_dir)
@@ -523,7 +523,7 @@ def table_5(cert_dir=CERT_DIR, lira_dir=LIRA_DIR, runs_dir=RUNS_DIR, out_dir=OUT
             all_rows.append(row)
 
     # Seed stability: compare tier means across seeds (per run_id)
-    for run_id_t5 in ["F5", "F7", "F8"]:
+    for run_id_t5 in ["F5", "F7", "F8", "F9"]:
         run_rows = [r for r in all_rows if r.get("run_id") == run_id_t5]
         if len(run_rows) >= 2:
             print(f"\n  {run_id_t5} seed stability (CV across seeds):")
@@ -806,7 +806,7 @@ def table_6(cert_dir=CERT_DIR, out_dir=OUT_DIR):
     print(f"{'='*72}")
 
     all_rows = []
-    for run_id, seeds in [("F1", [0]), ("F5", [0, 1, 2]), ("F7", [0, 1, 2]), ("F8", [0, 1, 2])]:
+    for run_id, seeds in [("F1", [0]), ("F5", [0, 1, 2]), ("F7", [0, 1, 2]), ("F8", [0, 1, 2]), ("F9", [0, 1, 2])]:
         for seed in seeds:
             tag  = f"p19_{run_id}_seed{seed}"
             cert = _load_cert(run_id, seed, cert_dir)
@@ -913,7 +913,7 @@ def nystrom_minorant_check(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=OUT_DIR
     print(f"{'='*72}")
 
     if settings is None:
-        settings = [("F1", [0, 1, 2]), ("F5", [0, 1, 2]), ("F7", [0, 1, 2])]
+        settings = [("F1", [0, 1, 2]), ("F5", [0, 1, 2]), ("F7", [0, 1, 2]), ("F9", [0, 1, 2])]
 
     all_results = []
     any_bound_violation = False
@@ -1040,7 +1040,7 @@ def nystrom_minorant_check(cert_dir=CERT_DIR, runs_dir=RUNS_DIR, out_dir=OUT_DIR
         with open(t6_path) as f:
             t6 = json.load(f)
 
-        for run_id in ["F1", "F5", "F7"]:
+        for run_id in ["F1", "F5", "F7", "F9"]:
             rows_run = [r for r in t6 if r["run_id"] == run_id]
             if not rows_run:
                 continue
@@ -3389,7 +3389,7 @@ def main():
     parser.add_argument("--figure",  type=str, default=None, choices=["1","2"],
                         help="Run specific figure")
     parser.add_argument("--gaussian_validation", action="store_true")
-    parser.add_argument("--run",      type=str, default="F1", choices=["F1","F2","F5","F7","F8"])
+    parser.add_argument("--run",      type=str, default="F1", choices=["F1","F2","F5","F7","F8","F9"])
     parser.add_argument("--seed",     type=int, default=0,
                         help="Seed for --gaussian_validation / --gaussian_lowvar")
     parser.add_argument("--lira_seeds", type=int, nargs="+", default=None,
@@ -3473,6 +3473,8 @@ def main():
                 lira_seeds=lira_seeds, run_id="F7", lira_id="LF7")
         table_3(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,
                 lira_seeds=lira_seeds, run_id="F8", lira_id="LF8")
+        table_3(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,
+                lira_seeds=lira_seeds, run_id="F9", lira_id="LF9")
     if args.all or args.table == "4":
         table_4(args.cert_dir, args.out_dir)
     if args.all or args.table == "5":
@@ -3538,12 +3540,12 @@ def main():
         figure_wrn_distribution_s3(args.cert_dir, args.runs_dir, args.out_dir)
         figure_mnist_distribution_f7(args.cert_dir, args.runs_dir, args.out_dir)
 
-    # --paper (or both individual flags) → single combined F1+F2+F7+F8 table
+    # --paper (or both individual flags) → single combined F1+F2+F7+F8+F9 table
     if args.paper or (do_table and do_table_f7):
         table_lira_paper_combined(
             args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,
             settings=(("F1", "LF1"), ("F2", "LF2"),
-                      ("F7", "LF7"), ("F8", "LF8")))
+                      ("F7", "LF7"), ("F8", "LF8"), ("F9", "LF9")))
     else:
         if do_table:
             table_lira_paper(args.cert_dir, args.lira_dir, args.runs_dir, args.out_dir,

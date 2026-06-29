@@ -21,6 +21,7 @@ Run matrix:
   F7: MNISTConvNet (~26k params, Tramer-Boneh ICLR2021 SampleConvNet), from-scratch,
       MNIST-LT(10), ε=8, seeds 0,1,2  [Tanh CNN, no GroupNorm needed, B=512, LR=0.6]
   F8: MNISTConvNet, from-scratch, MNIST (balanced), ε=8, seeds 0,1,2  [control for F7]
+  F9: MNISTConvNet, from-scratch, MNIST-LT(10), ε=2, seeds 0,1,2  [high-clipping control for F7]
 
 Usage:
   python experiments/exp_p19_train.py --run F1 --seed 0 --gpu 0
@@ -58,10 +59,12 @@ RUNS = {
                B_expected=512, n_seeds=3, epochs=40, lr=0.6, r_max=100),
     "F8": dict(dataset="mnist_balanced_lt10", regime="R2", arch="dpconv", eps=8.0,
                B_expected=512, n_seeds=3, epochs=40, lr=0.6, r_max=100),
+    "F9": dict(dataset="mnist_lt10", regime="R2", arch="dpconv", eps=2.0,
+               B_expected=512, n_seeds=3, epochs=40, lr=0.6, r_max=100),
 }
 
 # LiRA targets per run
-LIRA_N_TARGETS = {"F1": 1500, "F2": 1000, "F5": 300, "F6": 600, "F7": 600, "F8": 600}
+LIRA_N_TARGETS = {"F1": 1500, "F2": 1000, "F5": 300, "F6": 600, "F7": 600, "F8": 600, "F9": 600}
 
 # ---------------------------------------------------------------------------
 # Constants

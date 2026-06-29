@@ -66,6 +66,9 @@ LIRA_SETTINGS = {
     "LF8": dict(matched_run="F8", seeds=[0, 1, 2], dataset="mnist_balanced_lt10", regime="R2",
                 arch="dpconv", num_classes=10,
                 n_targets=600,  n_shadows=256, shadow_epochs=30),
+    "LF9": dict(matched_run="F9", seeds=[0, 1, 2], dataset="mnist_lt10", regime="R2",
+                arch="dpconv", num_classes=10,
+                n_targets=600,  n_shadows=256, shadow_epochs=30),
 }
 
 DATA_ROOT  = "./data"

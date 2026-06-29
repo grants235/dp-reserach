@@ -1059,7 +1059,7 @@ def aggregate_seeds(run_id, cert_dir, n_seeds):
     return agg
 
 
-SEEDS_PER_RUN = {"F1": 3, "F2": 3, "F5": 3, "F6": 3, "F7": 3, "F8": 3}
+SEEDS_PER_RUN = {"F1": 3, "F2": 3, "F5": 3, "F6": 3, "F7": 3, "F8": 3, "F9": 3}
 ALL_RUNS      = list(SEEDS_PER_RUN.keys())
 
 
