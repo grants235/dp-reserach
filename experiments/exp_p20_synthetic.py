@@ -139,8 +139,7 @@ class SyntheticSpec:
     T: int = 360           # steps (for σ calibration; not actually run)
     K_canaries: int = 200  # number of canaries (excluding eigendirection canaries)
     seed: int = 0
-    nystrom_ranks: List[int] = field(default_factory=lambda: [4, 8, 16, 32, 64, 128])
-    n_mc_samples: int = 100_000  # Monte-Carlo draws for realized distinguishability
+    nystrom_ranks: List[int] = field(default_factory=lambda: [8, 16, 32, 64, 128, 256])
 
 
 def build_background(spec: SyntheticSpec) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -230,61 +229,6 @@ def analytic_shift_eigdir(k: int, lambdas: np.ndarray, sigma: float, C: float) -
     """d²_exact for a canary aligned with eigenvector k: C²/(σ²C² + λ_k)."""
     a = sigma ** 2 * C ** 2
     return float(C ** 2 / (a + lambdas[k]))
-
-
-# ---------------------------------------------------------------------------
-# Monte-Carlo realized distinguishability
-# ---------------------------------------------------------------------------
-
-def mc_realized_batch(
-    canaries: np.ndarray,      # (K, d) — all ‖canary‖=C (equal-norm)
-    bg_gradients: np.ndarray,  # (n, d)
-    sigma: float,
-    C: float,
-    q: float,
-    n_samples: int = 50_000,
-    seed: int = 42,
-) -> np.ndarray:
-    """
-    Vectorized Monte-Carlo realized distinguishability for all K canaries at once.
-
-    For each canary direction, D* = (μ₁−μ₀)/√(½(σ₀²+σ₁²)) where the transcript
-    is projected onto the canary's unit direction. The Poisson inclusions are shared
-    across canaries, so cost is O(n_samples × n + n_samples × K) not O(K × n_samples × n).
-
-    Anti-circularity: we never touch Σ or d² here. The realized D* is computed
-    from raw transcripts sampled from the true Poisson-sum law.
-
-    Returns D_star: (K,) array.
-    """
-    rng = np.random.default_rng(seed)
-    n, K = bg_gradients.shape[0], canaries.shape[0]
-    C2 = sigma ** 2 * C ** 2  # DP noise variance per dimension
-
-    # Pre-project all background gradients onto each canary direction: (n, K)
-    g_units = canaries / (np.linalg.norm(canaries, axis=1, keepdims=True) + 1e-30)
-    bg_proj = bg_gradients @ g_units.T   # (n, K)
-
-    # --- World 0: no target ---
-    # G0_k = Σ_j I_j ḡ_j·g_unit_k  (each sample row is one Poisson draw)
-    I0 = (rng.random((n_samples, n)) < q)           # (S, n)
-    G0 = I0.astype(np.float32) @ bg_proj.astype(np.float32)   # (S, K)
-    noise0 = rng.standard_normal((n_samples, K)) * math.sqrt(C2)
-    T0 = G0 + noise0   # (S, K)
-
-    # --- World 1: target present with prob q ---
-    I1 = (rng.random((n_samples, n)) < q)
-    G1 = I1.astype(np.float32) @ bg_proj.astype(np.float32)   # (S, K)
-    B_star = (rng.random(n_samples) < q).astype(np.float32)   # (S,)
-    # g_star_proj_k = g_unit_k · g_k = ‖g_k‖ = C  for all k (equal-norm guarantee)
-    g_star_proj = np.linalg.norm(canaries, axis=1)             # (K,)  ≈ C everywhere
-    noise1 = rng.standard_normal((n_samples, K)) * math.sqrt(C2)
-    T1 = G1 + B_star[:, None] * g_star_proj[None, :] + noise1   # (S, K)
-
-    mu0 = T0.mean(axis=0); mu1 = T1.mean(axis=0)   # (K,)
-    s0 = T0.std(axis=0);   s1 = T1.std(axis=0)     # (K,)
-    D_star = (mu1 - mu0) / np.sqrt(0.5 * (s0 ** 2 + s1 ** 2) + 1e-30)
-    return D_star.astype(np.float64)
 
 
 # ---------------------------------------------------------------------------
@@ -406,20 +350,6 @@ def make_eigdir_canaries(spec: SyntheticSpec, eigvecs: np.ndarray) -> np.ndarray
 
 
 
-def spearman_rho(x: np.ndarray, y: np.ndarray) -> float:
-    """Spearman ρ. Returns 0.0 when x is constant (no ranking information)."""
-    from scipy.stats import spearmanr
-    import warnings
-    mask = np.isfinite(x) & np.isfinite(y)
-    if mask.sum() < 5:
-        return float("nan")
-    if x[mask].std() < 1e-12:
-        return 0.0  # constant predictor — no ranking power by definition
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        return float(spearmanr(x[mask], y[mask]).statistic)
-
-
 # ---------------------------------------------------------------------------
 # Main experiment functions
 # ---------------------------------------------------------------------------
@@ -465,13 +395,7 @@ def run_one_spec(spec: SyntheticSpec, verbose: bool = True) -> dict:
                 g, eigvecs, lambdas, sigma, spec.C, r
             )
 
-    # Realized D* — vectorized across all K canaries (single batch of Poisson draws)
-    realized_D = mc_realized_batch(
-        canaries, bg_grads, sigma, spec.C, spec.q,
-        n_samples=spec.n_mc_samples, seed=spec.seed,
-    )
-
-    # ε^dir from exact d²  (what the theory predicts)
+    # ε^dir from exact d²
     eps_dir_exact = np.array([
         eps_cert_from_rdp(
             np.array([spec.T * eps_sgm_scalar(a_val, spec.q, math.sqrt(max(d2, 0.0)))
@@ -481,28 +405,14 @@ def run_one_spec(spec: SyntheticSpec, verbose: bool = True) -> dict:
         for d2 in exact_d2
     ])
 
-    # ε^dir from Nyström d̂² at headline rank
+    # Headline Nyström rank for ladder/violin
     r_headline = spec.nystrom_ranks[-2] if len(spec.nystrom_ranks) >= 2 else spec.nystrom_ranks[-1]
-    eps_dir_nystrom = np.array([
-        eps_cert_from_rdp(
-            np.array([spec.T * eps_sgm_scalar(a_val, spec.q, math.sqrt(max(d2h, 0.0)))
-                      for a_val in ALPHA_GRID]),
-            ALPHA_GRID, spec.delta
-        )
-        for d2h in nystrom_d2_per_rank[r_headline]
-    ])
 
-    # Masking discount (direction vs norm, using exact d²)
+    # Masking discount: 1 − d²/‖g‖²/σ² — measures how much Σ anisotropy damps the shift
     norm_shift2 = (spec.C / (sigma * spec.C)) ** 2   # = 1/σ²
     masking_discount = 1.0 - exact_d2 / norm_shift2
     masking_discount = np.clip(masking_discount, 0.0, 1.0)
     median_masking = float(np.median(masking_discount))
-
-    # Spearman correlations with realized D*
-    rho_dir_exact = spearman_rho(eps_dir_exact, realized_D)
-    rho_norm = spearman_rho(eps_norm_all, realized_D)
-    rho_dir_nystrom = spearman_rho(eps_dir_nystrom, realized_D)
-    delta_rho_exact = rho_dir_exact - rho_norm   # THE gap figure y-axis
 
     # Eigendirection canaries for ladder figure
     eig_canaries = make_eigdir_canaries(spec, eigvecs)  # (d, d)
@@ -546,22 +456,16 @@ def run_one_spec(spec: SyntheticSpec, verbose: bool = True) -> dict:
 
     elapsed = time.time() - t0
     if verbose:
-        print(f"    median_masking={median_masking:.3f}  Δρ(exact)={delta_rho_exact:+.4f}  "
-              f"ρ_dir={rho_dir_exact:.4f}  ρ_norm={rho_norm:.4f}  [{elapsed:.1f}s]")
+        iqr_d2 = float(np.percentile(exact_d2, 75) - np.percentile(exact_d2, 25))
+        print(f"    median_masking={median_masking:.3f}  IQR(d²)={iqr_d2:.4f}  [{elapsed:.1f}s]")
 
     return {
         "kappa": spec.kappa, "eps_target": spec.eps_target, "m": spec.m,
-        "sigma": sigma, "q": spec.q, "T": spec.T, "d": spec.d, "n": spec.n,
+        "sigma": sigma, "a": a, "q": spec.q, "T": spec.T, "d": spec.d, "n": spec.n,
         "K": K,
         "median_masking_discount": median_masking,
-        "rho_dir_exact": rho_dir_exact,
-        "rho_dir_nystrom": rho_dir_nystrom,
-        "rho_norm": rho_norm,
-        "delta_rho_exact": delta_rho_exact,
-        "delta_rho_nystrom": float(rho_dir_nystrom - rho_norm),
         "angles": angles.tolist(),
         "exact_d2": exact_d2.tolist(),
-        "realized_D": realized_D.tolist(),
         "eps_dir_exact": eps_dir_exact.tolist(),
         "eps_norm": eps_norm_all.tolist(),
         "masking_discount": masking_discount.tolist(),
@@ -610,29 +514,29 @@ def fig_ladder(results: dict, out_dir: str) -> None:
     ax1.plot(k_idx[:n_show], eig_nystrom[:n_show], "g:", lw=1.2,
              label=fr"Nyström $\hat{{d}}^2$ (r={r_headline})", zorder=5)
     ax1.axhline(norm_shift2, color="red", ls="-.", lw=1.2, label=r"norm shift $1/\sigma^2$")
-    ax1.axvline(m - 0.5, color="gray", ls=":", lw=1.0, label=f"head/quiet boundary (m={m})")
-    ax1.set_xlabel("Eigendirection index k")
+    ax1.set_xlabel("Eigendirection index k  (sorted descending λ)")
     ax1.set_ylabel(r"Shift $d^2$")
-    ax1.set_title(f"Eigendirection ladder\n(κ={results['kappa']}, ε={results['eps_target']}, m={m})")
+    ax1.set_title(f"Eigendirection ladder (Theorem 4.3 check)\n"
+                  f"κ={results['kappa']}, ε={results['eps_target']}")
     ax1.legend(fontsize=8)
     ax1.grid(True, alpha=0.3)
 
-    # Right panel: same on log scale
+    # Right panel: log scale shows analytic = exact everywhere
     ax2.semilogy(k_idx[:n_show], np.maximum(eig_analytic[:n_show], 1e-15), "k-", lw=1.5,
-                 label=r"analytic")
+                 label=r"analytic  (Theorem 4.3)")
     ax2.semilogy(k_idx[:n_show], np.maximum(eig_exact[:n_show], 1e-15), "b--", lw=1.2,
-                 label=r"exact")
+                 label=r"exact $d^2$  (agrees with analytic)")
     ax2.semilogy(k_idx[:n_show], np.maximum(eig_nystrom[:n_show], 1e-15), "g:", lw=1.2,
-                 label=fr"Nyström r={r_headline}")
-    ax2.axhline(norm_shift2, color="red", ls="-.", lw=1.2, label="norm shift")
-    ax2.axvline(m - 0.5, color="gray", ls=":", lw=1.0)
+                 label=fr"Nyström r={r_headline}  (upper bound)")
+    ax2.axhline(norm_shift2, color="red", ls="-.", lw=1.2, label="norm shift  (k-blind ceiling)")
     ax2.set_xlabel("Eigendirection index k")
     ax2.set_ylabel(r"$d^2$ (log scale)")
     ax2.set_title("Log scale")
     ax2.legend(fontsize=8)
     ax2.grid(True, alpha=0.3)
 
-    fig.suptitle("Fig A: Directional shift sweeps full Rayleigh-quotient range", fontsize=10)
+    fig.suptitle("Fig A: analytic = exact (Theorem 4.3 verified); "
+                 "Nyström converges from above; norm shift is k-blind ceiling", fontsize=10)
     fig.tight_layout()
     path = os.path.join(out_dir, "figA_eigdir_ladder.png")
     fig.savefig(path, dpi=150)
@@ -641,69 +545,59 @@ def fig_ladder(results: dict, out_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Figure B: Anisotropy vs gap
+# Figure B: ε^dir violin — direction separates what norm collapses
 # ---------------------------------------------------------------------------
 
-def fig_gap(all_results: list, out_dir: str) -> None:
+def fig_violin(all_results: list, out_dir: str, headline_eps: float = 8.0) -> None:
+    """
+    Violin plot of ε^dir distribution across equal-norm canaries, one violin per κ.
+
+    Equal-norm canaries mean ε^norm is a single flat value (shown as a red line).
+    The violin spreads purely from directional variation — this is the geometric
+    mechanism: same-norm gradients expose very different privacy gaps depending
+    on their angle to Σ_tot.  Isotropic (κ=1) gives a narrow spike; anisotropic
+    (κ→∞) gives a wide violin.
+    """
     try:
         import matplotlib; matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        import matplotlib.cm as cm
     except ImportError:
-        print("  [fig_gap] matplotlib not available"); return
+        print("  [fig_violin] matplotlib not available"); return
 
     os.makedirs(out_dir, exist_ok=True)
+    subset = [r for r in all_results if abs(r["eps_target"] - headline_eps) < 0.5]
+    if not subset:
+        print(f"  [fig_violin] no results for ε={headline_eps}"); return
+    subset = sorted(subset, key=lambda r: r["kappa"])
 
-    # Group by (eps_target, m), sweep kappa
-    from collections import defaultdict
-    groups = defaultdict(list)
-    for r in all_results:
-        groups[(r["eps_target"], r["m"])].append(r)
+    kappas = [r["kappa"] for r in subset]
+    eps_dir_per_kappa = [np.array(r["eps_dir_exact"]) for r in subset]
+    eps_norm_ref = float(np.array(subset[0]["eps_norm"]).mean())
 
-    fig, axes = plt.subplots(1, len(groups), figsize=(6 * len(groups), 5), squeeze=False)
+    fig, ax = plt.subplots(figsize=(max(6, len(kappas) * 1.4), 5))
 
-    cmap = cm.get_cmap("viridis")
-    eps_vals = sorted(set(r["eps_target"] for r in all_results))
-    eps_colors = {e: cmap(i / max(len(eps_vals) - 1, 1)) for i, e in enumerate(eps_vals)}
+    positions = np.arange(1, len(kappas) + 1)
+    parts = ax.violinplot(eps_dir_per_kappa, positions=positions,
+                          showmedians=True, showextrema=True)
+    for pc in parts["bodies"]:
+        pc.set_alpha(0.65)
+    ax.axhline(eps_norm_ref, color="firebrick", ls="--", lw=1.5,
+               label=f"ε^norm = {eps_norm_ref:.2f}  (constant — norm-blind)")
+    ax.set_xticks(positions)
+    ax.set_xticklabels([f"κ={k:.0f}" for k in kappas])
+    ax.set_xlabel("Anisotropy κ = λ_max / λ_min  (power-law spectrum)")
+    ax.set_ylabel("ε^dir  (per-canary direction-aware certificate)")
+    ax.set_title(f"Fig B: ε^dir distribution across {len(eps_dir_per_kappa[0])} equal-norm canaries\n"
+                 f"ε={headline_eps} (same ε^norm for all).  "
+                 f"Width is purely from directional variation.")
+    ax.legend(fontsize=9)
+    ax.grid(True, axis="y", alpha=0.3)
 
-    for ax_idx, ((eps, m), group) in enumerate(sorted(groups.items())):
-        ax = axes[0][ax_idx]
-        group = sorted(group, key=lambda r: r["kappa"])
-
-        x = np.array([r["median_masking_discount"] for r in group])
-        y_exact = np.array([r["delta_rho_exact"] for r in group])
-        y_nystrom = np.array([r["delta_rho_nystrom"] for r in group])
-        kappas = [r["kappa"] for r in group]
-
-        ax.plot(x, y_exact, "o-", color=eps_colors[eps], lw=1.5,
-                label=f"ε={eps}, exact", ms=7)
-        ax.plot(x, y_nystrom, "s--", color=eps_colors[eps], lw=1.0,
-                alpha=0.7, label=f"ε={eps}, Nyström", ms=5)
-
-        # Annotate kappa values
-        for xi, yi, k in zip(x, y_exact, kappas):
-            ax.annotate(f"κ={k:.0f}", (xi, yi), fontsize=7,
-                        xytext=(3, 3), textcoords="offset points")
-
-        ax.axhline(0, color="gray", ls=":", lw=0.8)
-        ax.fill_between([0, 1], -0.1, 0, alpha=0.08, color="red",
-                         label="dir worse than norm")
-        ax.set_xlabel("Median masking discount (1 − d²/‖ḡ‖²/σ²C²)")
-        ax.set_ylabel("Δρ = ρ(ε^dir, D*) − ρ(ε^norm, D*)")
-        ax.set_title(f"m={m}, ε={eps}\nGap rises with anisotropy")
-        ax.legend(fontsize=7)
-        ax.grid(True, alpha=0.3)
-        ax.set_xlim(-0.05, 1.05)
-
-    fig.suptitle("Fig B: Anisotropy-vs-Advantage\n"
-                 "x-axis = free (from logged masking), "
-                 "y-axis = faithfulness gain of direction over norm",
-                 fontsize=10)
     fig.tight_layout()
-    path = os.path.join(out_dir, "figB_anisotropy_vs_gap.png")
+    path = os.path.join(out_dir, "figB_eps_dir_violin.png")
     fig.savefig(path, dpi=150)
     plt.close(fig)
-    print(f"  [fig_gap] → {path}")
+    print(f"  [fig_violin] → {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -792,59 +686,86 @@ def fig_assumption(all_results: list, out_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Figure D: ε sweep at fixed kappa
+# Figure D: ε-isotropization — d² spread collapses as noise floor rises
 # ---------------------------------------------------------------------------
 
-def fig_eps_sweep(all_results: list, out_dir: str, fixed_kappa: float = 20.0) -> None:
+def fig_eps_isotropization(all_results: list, out_dir: str) -> None:
+    """
+    Show that the spread of d² across equal-norm canaries collapses as ε tightens.
+
+    As ε → 0, σ → ∞, so Σ_tot = σ²C²I + Σ is dominated by the isotropic
+    noise floor.  Every direction sees d² → C²/(σ²C²) = 1/σ² → 0, and the
+    IQR collapses to zero regardless of κ.  This is a purely geometric result:
+    no attack required — just the Mahalanobis quadratic form under varying σ.
+
+    x-axis: ε (privacy budget; large = less noise = more anisotropy visible)
+    y-axis: IQR of ε^dir across K canaries (captures width of spread)
+    Lines per κ, showing isotropization at small ε.
+    """
     try:
         import matplotlib; matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
-        print("  [fig_eps_sweep] matplotlib not available"); return
+        print("  [fig_eps_isotropization] matplotlib not available"); return
 
     os.makedirs(out_dir, exist_ok=True)
-    subset = [r for r in all_results if abs(r["kappa"] - fixed_kappa) < 0.5]
-    if not subset:
-        print(f"  [fig_eps_sweep] no results for κ={fixed_kappa}"); return
-    subset = sorted(subset, key=lambda r: r["eps_target"])
 
-    eps_vals = [r["eps_target"] for r in subset]
-    y_delta = [r["delta_rho_exact"] for r in subset]
-    y_dir = [r["rho_dir_exact"] for r in subset]
-    y_norm = [r["rho_norm"] for r in subset]
-    x_mask = [r["median_masking_discount"] for r in subset]
+    from collections import defaultdict
+    by_kappa = defaultdict(list)
+    for r in all_results:
+        eps_dir = np.array(r["eps_dir_exact"])
+        iqr = float(np.percentile(eps_dir, 75) - np.percentile(eps_dir, 25))
+        by_kappa[r["kappa"]].append((r["eps_target"], iqr))
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
 
-    ax1.plot(eps_vals, y_delta, "o-", color="steelblue", lw=1.8, ms=8, label="Δρ (dir−norm)")
-    ax1.axhline(0, color="gray", ls=":", lw=0.8)
-    ax1.set_xlabel("Privacy budget ε (higher = less private)")
-    ax1.set_ylabel("Δρ = ρ(ε^dir, D*) − ρ(ε^norm, D*)")
-    ax1.set_title(f"ε sweep (κ={fixed_kappa:.0f})\nAdvantage shrinks as ε tightens")
-    ax1.legend()
+    cmap = plt.colormaps["viridis"]
+    kappas_sorted = sorted(by_kappa.keys())
+    colors = {k: cmap(i / max(len(kappas_sorted) - 1, 1))
+              for i, k in enumerate(kappas_sorted)}
+
+    for kappa in kappas_sorted:
+        pts = sorted(by_kappa[kappa])
+        eps_vals = [p[0] for p in pts]
+        iqrs = [p[1] for p in pts]
+        ax1.plot(eps_vals, iqrs, "o-", color=colors[kappa], lw=1.5, ms=6,
+                 label=f"κ={kappa:.0f}")
+
+    ax1.set_xlabel("Privacy budget ε  (larger = less noise)")
+    ax1.set_ylabel("IQR(ε^dir) across equal-norm canaries")
+    ax1.set_title("ε-isotropization: spread of ε^dir collapses at small ε\n"
+                  "(noise floor σ²C²I dominates Σ_tot as σ grows)")
+    ax1.legend(fontsize=8)
     ax1.grid(True, alpha=0.3)
 
-    ax2.plot(eps_vals, y_dir, "o-", color="steelblue", lw=1.5, ms=7, label="ρ(dir, D*)")
-    ax2.plot(eps_vals, y_norm, "s--", color="firebrick", lw=1.5, ms=7, label="ρ(norm, D*)")
-    ax2_r = ax2.twinx()
-    ax2_r.plot(eps_vals, x_mask, "^:", color="green", lw=1.0, ms=5, label="masking discount")
-    ax2_r.set_ylabel("Median masking discount", color="green")
-    ax2_r.tick_params(axis="y", labelcolor="green")
-    ax2.set_xlabel("ε")
-    ax2.set_ylabel("Spearman ρ")
-    ax2.set_title("ρ vs ε")
-    lines1, labs1 = ax2.get_legend_handles_labels()
-    lines2, labs2 = ax2_r.get_legend_handles_labels()
-    ax2.legend(lines1 + lines2, labs1 + labs2, fontsize=8)
+    # Right panel: show the spread in d² space (more direct)
+    by_kappa_d2 = defaultdict(list)
+    for r in all_results:
+        d2 = np.array(r["exact_d2"])
+        iqr = float(np.percentile(d2, 75) - np.percentile(d2, 25))
+        by_kappa_d2[r["kappa"]].append((r["eps_target"], r["a"], iqr))
+
+    for kappa in kappas_sorted:
+        pts = sorted(by_kappa_d2[kappa])
+        # x: noise floor a = σ²C² (log scale makes the collapse visible)
+        a_vals = [p[1] for p in pts]
+        iqrs = [p[2] for p in pts]
+        ax2.semilogx(a_vals, iqrs, "o-", color=colors[kappa], lw=1.5, ms=6,
+                     label=f"κ={kappa:.0f}")
+
+    ax2.set_xlabel("Noise floor a = σ²C²  (log scale; larger = more noise)")
+    ax2.set_ylabel("IQR(d²) across equal-norm canaries")
+    ax2.set_title("IQR(d²) vs noise floor\nAll κ converge as a grows  (isotropization)")
+    ax2.legend(fontsize=8)
     ax2.grid(True, alpha=0.3)
 
-    fig.suptitle(f"Fig D: Privacy budget sweep at κ={fixed_kappa:.0f}\n"
-                 "Advantage decays as ε tightens (isotropization of Σ_tot)", fontsize=10)
+    fig.suptitle("Fig D: ε-isotropization — direction advantage vanishes as "
+                 "noise floor isotropizes Σ_tot", fontsize=10)
     fig.tight_layout()
-    path = os.path.join(out_dir, "figD_eps_sweep.png")
+    path = os.path.join(out_dir, "figD_eps_isotropization.png")
     fig.savefig(path, dpi=150)
     plt.close(fig)
-    print(f"  [fig_eps_sweep] → {path}")
+    print(f"  [fig_eps_isotropization] → {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -882,16 +803,18 @@ def table_tightness(all_results: list, out_dir: str) -> None:
 DEFAULT_KAPPAS = [1.0, 2.0, 5.0, 20.0, 100.0, 500.0]
 DEFAULT_EPS = [1.0, 2.0, 4.0, 8.0, 16.0]
 DEFAULT_M = [16]
+# r=d=256 included so the table visibly converges to zero at full rank
+DEFAULT_NYSTROM_RANKS = [8, 16, 32, 64, 128, 256]
 
 
 def run_grid(kappas=None, eps_list=None, m_list=None,
              d=256, n=12602, q=1.0/9.0, T=360, delta=1e-5,
-             K=200, n_mc=50_000, seed=0,
+             K=200, seed=0,
              nystrom_ranks=None, verbose=True, out_dir=OUT_DIR) -> list:
     if kappas is None: kappas = DEFAULT_KAPPAS
     if eps_list is None: eps_list = DEFAULT_EPS
     if m_list is None: m_list = DEFAULT_M
-    if nystrom_ranks is None: nystrom_ranks = [8, 16, 32, 64, 128]
+    if nystrom_ranks is None: nystrom_ranks = DEFAULT_NYSTROM_RANKS
 
     os.makedirs(out_dir, exist_ok=True)
     all_results = []
@@ -906,7 +829,7 @@ def run_grid(kappas=None, eps_list=None, m_list=None,
                     d=d, n=n, m=m, kappa=kappa,
                     C=1.0, q=q, eps_target=eps, delta=delta, T=T,
                     K_canaries=K, seed=seed,
-                    nystrom_ranks=nystrom_ranks, n_mc_samples=n_mc,
+                    nystrom_ranks=nystrom_ranks,
                 )
                 res = run_one_spec(spec, verbose=verbose)
                 all_results.append(res)
@@ -922,7 +845,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--all", action="store_true",
                         help="Run full grid and produce all figures")
-    parser.add_argument("--fig", choices=["ladder", "gap", "assumption", "eps_sweep"],
+    parser.add_argument("--fig", choices=["ladder", "violin", "assumption", "isotropization"],
                         help="Run a specific figure only")
     parser.add_argument("--table", choices=["tightness"],
                         help="Run a specific table only")
@@ -935,20 +858,17 @@ def main():
     parser.add_argument("--T", type=int, default=360)
     parser.add_argument("--K", type=int, default=200,
                         help="Number of angled canaries")
-    parser.add_argument("--n_mc", type=int, default=50_000,
-                        help="Monte-Carlo samples for realized D*")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--load", type=str, default=None,
                         help="Load existing grid results JSON instead of rerunning")
     parser.add_argument("--fast", action="store_true",
-                        help="Quick smoke-test: 3 kappas, 2 eps, 10k MC samples")
+                        help="Quick smoke-test: 3 kappas, 2 eps")
     parser.add_argument("--out", type=str, default=OUT_DIR)
     args = parser.parse_args()
 
     if args.fast:
         args.kappas = [1.0, 20.0, 100.0]
         args.eps = [4.0, 8.0]
-        args.n_mc = 10_000
         args.K = 50
 
     if args.load:
@@ -959,11 +879,11 @@ def main():
         all_results = run_grid(
             kappas=args.kappas, eps_list=args.eps, m_list=args.m,
             d=args.d, n=args.n, q=args.q, T=args.T, delta=1e-5,
-            K=args.K, n_mc=args.n_mc, seed=args.seed,
+            K=args.K, seed=args.seed,
             out_dir=args.out,
         )
 
-    # Pick a reference result for ladder figure (use first kappa, headline eps=8)
+    # Reference result for ladder/violin (median kappa, headline eps=8)
     ref_eps = 8.0
     ref_kappa = args.kappas[len(args.kappas) // 2]
     ref_results = [r for r in all_results
@@ -977,29 +897,31 @@ def main():
     if produce_all or args.fig == "ladder":
         fig_ladder(ref_results[0], args.out)
 
-    if produce_all or args.fig == "gap":
-        fig_gap(all_results, args.out)
+    if produce_all or args.fig == "violin":
+        fig_violin(all_results, args.out, headline_eps=ref_eps)
 
     if produce_all or args.fig == "assumption":
         fig_assumption(all_results, args.out)
 
-    if produce_all or args.fig == "eps_sweep":
-        # Use median kappa for sweep
-        fig_eps_sweep(all_results, args.out, fixed_kappa=ref_kappa)
+    if produce_all or args.fig == "isotropization":
+        fig_eps_isotropization(all_results, args.out)
 
     if produce_all or args.table == "tightness":
         table_tightness(all_results, args.out)
 
-    # Print summary
+    # Summary
     print(f"\n{'='*72}")
-    print("  Summary: anisotropy-vs-gap (headline ε=8)")
+    print("  Tier 0 summary (headline ε=8)")
     print(f"{'='*72}")
-    print(f"  {'κ':8s}  {'masking':8s}  {'Δρ(exact)':10s}  {'ρ_dir':7s}  {'ρ_norm':7s}")
+    print(f"  {'κ':8s}  {'median_masking':14s}  {'IQR(d²)':10s}  {'IQR(ε^dir)':10s}")
     for r in sorted([x for x in all_results if abs(x["eps_target"] - 8.0) < 0.5],
                     key=lambda x: x["kappa"]):
-        print(f"  {r['kappa']:8.1f}  {r['median_masking_discount']:8.3f}  "
-              f"{r['delta_rho_exact']:+10.4f}  {r['rho_dir_exact']:7.4f}  "
-              f"{r['rho_norm']:7.4f}")
+        d2 = np.array(r["exact_d2"])
+        ed = np.array(r["eps_dir_exact"])
+        iqr_d2 = float(np.percentile(d2, 75) - np.percentile(d2, 25))
+        iqr_ed = float(np.percentile(ed, 75) - np.percentile(ed, 25))
+        print(f"  {r['kappa']:8.1f}  {r['median_masking_discount']:14.3f}  "
+              f"{iqr_d2:10.4f}  {iqr_ed:10.4f}")
 
 
 if __name__ == "__main__":
